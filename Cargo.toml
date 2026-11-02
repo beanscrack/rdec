@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/arch-x86", "crates/verify", "crates/cli"]
+members = ["crates/core", "crates/arch-x86", "crates/verify", "crates/demangle", "crates/cli"]
 
 [workspace.package]
 version = "0.1.0"
@@ -16,6 +16,7 @@ goblin = "0.10"
 rdec-core = { path = "crates/core" }
 rdec-arch-x86 = { path = "crates/arch-x86" }
 rdec-verify = { path = "crates/verify" }
+rdec-demangle = { path = "crates/demangle" }
 
 [profile.release]
 debug = 1

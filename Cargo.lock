@@ -31,12 +31,20 @@ version = "0.1.0"
 dependencies = [
  "rdec-arch-x86",
  "rdec-core",
+ "rdec-demangle",
  "rdec-verify",
 ]
 
 [[package]]
 name = "rdec-core"
 version = "0.1.0"
+
+[[package]]
+name = "rdec-demangle"
+version = "0.1.0"
+dependencies = [
+ "rdec-arch-x86",
+]
 
 [[package]]
 name = "rdec-verify"

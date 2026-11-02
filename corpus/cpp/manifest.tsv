@@ -1,0 +1,19 @@
+# clang: clang version 22.1.8 (https://github.com/llvm/llvm-project ca7933e47d3a3451d81e72ac174dcb5aa28b59d1)
+# target: x86_64-pc-windows-msvc (objects built -target x86_64-pc-windows-msvc)
+# normalized: COFF TimeDateStamp zeroed at object offset 4
+name	opt	obj	bytes	fnv1a64
+struct_methods	O0	corpus/cpp\obj\struct_methods.O0.obj	1016	8f644de52fad34f2
+class_ctor_dtor	O0	corpus/cpp\obj\class_ctor_dtor.O0.obj	1291	862b0b190a926b8c
+const_overloads	O0	corpus/cpp\obj\const_overloads.O0.obj	1141	9618ee707dbd9e8b
+namespaces	O0	corpus/cpp\obj\namespaces.O0.obj	1096	7b9450f1b7bb4e21
+nested_class	O0	corpus/cpp\obj\nested_class.O0.obj	1187	6a02c3694117ffa8
+free_overloads	O0	corpus/cpp\obj\free_overloads.O0.obj	1247	a7b7c37953fb0476
+static_members	O0	corpus/cpp\obj\static_members.O0.obj	1266	7f172e6d50bb58b9
+builtin_params	O0	corpus/cpp\obj\builtin_params.O0.obj	2544	a013d6549cc539fc
+ref_ptr_params	O0	corpus/cpp\obj\ref_ptr_params.O0.obj	1538	224b1d0c4f1cdecc
+default_args	O0	corpus/cpp\obj\default_args.O0.obj	919	331433e63cecc7a4
+calling_conventions	O0	corpus/cpp\obj\calling_conventions.O0.obj	1142	20255d0d62645dcf
+virtual_inherit	O0	corpus/cpp\obj\virtual_inherit.O0.obj	2383	78cee15aa49430e5
+vcall_thunk	O0	corpus/cpp\obj\vcall_thunk.O0.obj	1373	2cbb36c886a1d186
+scoped_enum	O0	corpus/cpp\obj\scoped_enum.O0.obj	1180	4419be011e9abb85
+template_gap	O0	corpus/cpp\obj\template_gap.O0.obj	1311	0dfa573fbbe2b972

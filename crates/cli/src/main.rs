@@ -11,6 +11,7 @@ use rdec_verify::{hw, model_shim, Sabotage};
 
 mod m1;
 mod m4;
+mod m8;
 mod t2;
 
 fn main() {
@@ -19,7 +20,20 @@ fn main() {
     let rc = match cmd {
         "flags" => cmd_flags(&args),
         "selftest" => cmd_selftest(),
-        "corpus" => cmd_corpus(&args[1..]),
+        "corpus" => {
+            if args.iter().any(|a| a == "--cpp") {
+                m8::cmd_corpus_cpp(&args[1..])
+            } else {
+                cmd_corpus(&args[1..])
+            }
+        }
+        "demangle" => match m8::cmd_demangle(&args) {
+            Ok(rc) => rc,
+            Err(e) => {
+                eprintln!("{e}");
+                1
+            }
+        },
         "disasm" => m1::cmd_disasm(&args),
         "c" => match m4::cmd_c(&args) {
             Ok(code) => code,
@@ -80,6 +94,8 @@ fn print_help() {
          \x20 probe <op> <w> <a> <b>          print model+hardware flags for one case\n\
          \x20 selftest                        prove the IR verifier rejects broken IR\n\
          \x20 corpus [--out DIR] [--opt O0,O2]  build the clang corpus + hashed manifest\n\
+         \x20 corpus --cpp [--out DIR]         build the C++ corpus (M8, clang++ MSVC ABI)\n\
+         \x20 demangle --cpp                  M8 gate: MSVC C++ names vs llvm-nm\n\
          \x20 t2 [--corpus] [--limit N]        T2 differential gate: decompiled C vs\n\
          \x20                                   the machine code, same inputs, RAX\n\
          \x20 status                          roadmap section 9's table, from commands\n\
@@ -459,6 +475,27 @@ fn cmd_status() -> i32 {
         "objdump-check (M1: boundaries vs llvm-objdump)".into(),
         ob.1.lines().last().unwrap_or("").trim().into(),
         ob.0,
+    ));
+    // M8's first dependency: our from-scratch MSVC demangler vs llvm-nm.
+    // The gate owns the exit code; this row reports its verdict line.
+    let dm_cmd: Vec<String> = if self_cmd[0] == "run" {
+        vec![
+            "run".into(),
+            "-q".into(),
+            "-p".into(),
+            "rdec-cli".into(),
+            "--".into(),
+            "demangle".into(),
+            "--cpp".into(),
+        ]
+    } else {
+        vec!["demangle".into(), "--cpp".into()]
+    };
+    let dm = sh(&exe, &dm_cmd);
+    rows.push((
+        "demangle --cpp (M8: MSVC C++ names vs llvm-nm)".into(),
+        dm.1.lines().last().unwrap_or("").trim().into(),
+        dm.0,
     ));
     // T2 is the only row that RUNS both sides: `rdec c` proves the emitted C
     // compiles, this proves it computes the same values as the machine code.

@@ -1,0 +1,14 @@
+[package]
+name = "rdec-demangle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "From-scratch MSVC x64 C++ decorated-name demangler (M8 dependency)."
+
+[dependencies]
+
+[dev-dependencies]
+# The llvm-nm comparison test enumerates COFF symbols with the repo loader;
+# a dev-dependency, so this crate keeps zero production dependencies and the
+# dependency graph stays a DAG (arch-x86 -> core; demangle -> nothing).
+rdec-arch-x86 = { workspace = true }
