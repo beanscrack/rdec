@@ -297,7 +297,7 @@ measured by `rdec status`:
 | Verifier forwards messages, checks operand types, escalates | B7 test + `verifier_rejects_a_mixed_width_binop`, `verifier_rejects_a_select_with_an_integer_condition`, branch-on-non-bool as a hard error |
 | §9 bugs fixed test-first | §9's "Closed" table: B1–B7, each with the test that pins it |
 | `rdec status` prints §9 from commands | `rdec status` — tree, toolchain, fmt, clippy, test counts, selftest, T1 grid, corpus (120 objects, every COFF `Machine` re-parsed from the bytes, not trusted from clang's exit code) |
-| CI | `.github/workflows/ci.yml` runs exactly the commands above, plus a manifest-diff determinism check. **Written, not yet observed green**: no runner is registered for this repo from this machine, so the first real run is the proof. |
+| CI | `.github/workflows/ci.yml`, GitHub-hosted `windows-latest`, on `github.com/beanscrack/rdec` (private). First green run: **41398695697** at a5b675c — all 11 steps: toolchain, fmt, clippy `-D warnings`, test (24), selftest, T1 grid, corpus determinism, status. Runner toolchain rustc 1.99.1 / clang 20.1.8; local is 1.99.0 / clang 22.1.8, and the corpus row records that drift (66,593 bytes on clang 20 vs 93,928 on clang 22) instead of failing on it. Nightly/dispatch adds the 9.7e9-probe `flags --full` sweep. |
 
 Pipeline determinism is now a test (`pipeline_is_deterministic`), because every
 TV result depends on it.
@@ -659,7 +659,13 @@ commit, so the measured T1 result (9.7 × 10⁹ probes, 0 mismatches) still stan
 
 After the fix: two builds into the same directory produce byte-identical
 manifests, every object stamp is 0, and the corpus is a fingerprint of codegen
-rather than of the clock.
+rather than of the clock. Run 41398695697 (a5b675c) is green on all 11 steps.
+
+One consequence to keep in mind: `status` measures the objects on disk, which the
+corpus step just rebuilt with the runner's clang, so byte counts and hashes are
+toolchain-specific by design. The committed manifest is the clang-22 fingerprint;
+comparing them is a toolchain comparison, not a RDec check, which is exactly the
+confusion that produced the failing gate.
 
 ### Found by reading
 
