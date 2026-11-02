@@ -34,6 +34,16 @@ jobs:
       - name: clippy (deny warnings)
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: "corpus --cpp (fixtures the demangle tests read)"
+        # Generated, not committed (`*.obj` is gitignored) - so it has to exist
+        # BEFORE the test step: the demangle integration tests read
+        # corpus/cpp/obj/*.obj, and CI failed with "The system cannot find the path
+        # specified" when the generation step sat after them (run 41415743892).
+        # The C++ gate itself, and the two-build manifest check, stay in the later
+        # "cpp corpus + demangle" step.
+        shell: powershell
+        run: cargo run -q -p rdec-cli -- corpus --cpp
+
       - name: test (B1-B7 fixtures, TV, T1 grid, sabotage)
         run: cargo test --no-fail-fast
 
@@ -65,6 +75,26 @@ jobs:
       - name: "objdump-check (M1 instruction boundaries vs llvm-objdump, whole corpus)"
         shell: powershell
         run: cargo run -q -p rdec-cli -- objdump-check --corpus
+
+      - name: "cpp corpus + demangle (M8: MSVC C++ names vs llvm-nm)"
+        # corpus/cpp/obj/*.obj are GENERATED, not committed (`*.obj` is gitignored),
+        # exactly like the C corpus: what is committed is the sources and the
+        # manifest. CI therefore has to build the C++ corpus before the demangle
+        # tests and gate run - without this step CI failed with "corpus/cpp/obj: The
+        # system cannot find the path specified" (run 41415743892).
+        # The manifest check is the SAME-TOOLCHAIN two-build comparison used for the C
+        # corpus, NOT `git diff` against the committed manifest: the committed one was
+        # written by clang 22.1.8 and the runner has 20.1.8, so a diff compares
+        # compilers, not RDec.
+        shell: powershell
+        run: |
+          cargo run -q -p rdec-cli -- corpus --cpp
+          cargo run -q -p rdec-cli -- corpus --cpp --out cpp-a
+          Copy-Item cpp-a/manifest.tsv c1.tsv
+          cargo run -q -p rdec-cli -- corpus --cpp --out cpp-a
+          Copy-Item cpp-a/manifest.tsv c2.tsv
+          fc.exe /b c1.tsv c2.tsv
+          cargo run -q -p rdec-cli -- demangle --cpp
 
       - name: status (prints section 9's table from the commands above)
         run: cargo run -q -p rdec-cli -- status
