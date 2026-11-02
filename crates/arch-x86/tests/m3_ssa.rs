@@ -17,8 +17,8 @@
 // dangling rename or an unrewritten register placeholder faults as MissingOperand.
 use rdec_arch_x86::discover::{discover_all, Code};
 use rdec_arch_x86::lift::lift_one;
-use rdec_core::ir::{Function, Op};
 use rdec_core::interp::{run_budget, Fault, Outcome};
+use rdec_core::ir::{Function, Op};
 use rdec_core::verify::verify_ssa;
 
 fn lift_one_fn(bytes: &[u8]) -> Function {

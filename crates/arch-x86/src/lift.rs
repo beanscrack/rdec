@@ -251,12 +251,27 @@ pub struct BlockInsns {
 
 /// Split a proven instruction stream into blocks at the proven block starts.
 pub fn split_blocks(plan: &Plan, start: u64, end: u64) -> Vec<BlockInsns> {
-    let starts: Vec<u64> = plan
+    // Block starts are the union of what discovery recorded and every branch
+    // destination in range. The second set is what makes loops liftable: a
+    // backward `jmp` to the middle of an already-decoded block claims no bytes,
+    // so discovery cannot record a block there - but the header must be a block
+    // of its own, or the back edge has nowhere to land, the header is not a join,
+    // and the loop-carried value never gets a phi.
+    let mut starts: Vec<u64> = plan
         .blocks
         .iter()
+        .chain(plan.targets.iter())
         .copied()
         .filter(|a| *a >= start && *a < end)
         .collect();
+    starts.push(start);
+    starts.sort_unstable();
+    starts.dedup();
+    // A destination that is not an instruction boundary (it points into the middle
+    // of one, which the decoder says cannot happen for a real jump) would produce
+    // an empty block and a split that is not a split. Drop it, say nothing:
+    // `objdump-check` is the gate on instruction boundaries.
+    starts.retain(|a| *a == start || plan.insns.iter().any(|(ia, _)| ia == a));
     starts
         .iter()
         .enumerate()

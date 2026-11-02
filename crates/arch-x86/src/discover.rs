@@ -49,6 +49,13 @@ pub struct Plan {
     pub blocks: Vec<u64>,
     /// Bytes proven to be instructions: (address, length), sorted.
     pub insns: Vec<(u64, usize)>,
+    /// Every direct branch destination inside the code, sorted - including ones
+    /// that land *inside* a block the sweep already built, which is why this is
+    /// not the same set as `blocks`. A backward `jmp` to the middle of a decoded
+    /// block claims no new bytes (the claim invariant forbids re-decoding them),
+    /// so it never reaches `blocks`; yet a basic block must end there, or the loop
+    /// header has no identity, no join, and no phi. Lifting splits on these.
+    pub targets: Vec<u64>,
     pub gaps: Vec<Site>,
 }
 
@@ -109,6 +116,9 @@ pub fn discover_into(
     // claiming the same byte twice.
     let mut known: HashSet<u64> = functions.clone();
     let mut queue: VecDeque<u64> = functions.iter().copied().collect();
+    // Branch destinations, kept even when the bytes were already claimed. See
+    // `Plan::targets`: the set that decides where a basic block must end.
+    let mut targets: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
 
     while let Some(start) = queue.pop_front() {
         if !seen.insert(start) || !code.contains(start) {
@@ -175,6 +185,7 @@ pub fn discover_into(
             if i.is_jmp {
                 match i.target {
                     Some(t) if code.contains(t) => {
+                        targets.insert(t);
                         if known.insert(t) {
                             queue.push_back(t);
                         }
@@ -193,6 +204,7 @@ pub fn discover_into(
             if i.is_jcc {
                 if let Some(t) = i.target {
                     if code.contains(t) {
+                        targets.insert(t);
                         if known.insert(t) {
                             queue.push_back(t);
                         }
@@ -227,6 +239,9 @@ pub fn discover_into(
     plan.blocks.sort_unstable();
     plan.blocks.dedup();
     plan.insns.sort_unstable_by_key(|&(a, _)| a);
+    plan.targets.extend(targets);
+    plan.targets.sort_unstable();
+    plan.targets.dedup();
     plan.gaps.sort_by_key(|g| g.va);
     plan
 }
@@ -238,6 +253,7 @@ pub fn discover_all(ranges: &[Code<'_>], seeds: &HashMap<usize, (Vec<u64>, Vec<u
         let (entries, calls) = seeds.get(&idx).cloned().unwrap_or_default();
         let p = discover(*r, &entries, &calls);
         acc.functions.extend(p.functions);
+        acc.targets.extend(p.targets);
         acc.blocks.extend(p.blocks);
         acc.insns.extend(p.insns);
         acc.gaps.extend(p.gaps);

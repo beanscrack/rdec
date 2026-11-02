@@ -436,6 +436,40 @@ left the gate printing counters it never computed (all zeros, one wrapped negati
 Every patch in this repo now asserts its anchor matches exactly once.
 
 
+### M3 step 2 - measured (2026-11-02): split basic blocks at branch destinations
+
+The hermetic loop fixture named the defect: a backward `jmp` into the middle of an
+already-decoded block lands on an address that is not a block start, so the back edge
+has nowhere to land, the header is not a join, no phi is created, and the function
+returns the register's value from *before* the loop. Discovery's byte-claim invariant
+(M1) makes that target claim no new bytes, so it cannot appear in `blocks` at all.
+
+Fix: `Plan::targets` records every direct branch destination inside the code - kept
+even when the bytes were already claimed - and lifting builds blocks from
+`blocks | targets | {start}`, restricted to instruction boundaries.
+
+Before -> after, same 141 corpus functions:
+
+| measure | step 1 | step 2 |
+|---|---|---|
+| pass `verify_ssa` | 141 | 141 |
+| functions with no gaps and no exits | 63 | 85 |
+| `Exit` terminators | 64 | 27 |
+| loud gaps | 153 | 126 |
+| unreachable blocks dropped | 18 | 8 |
+| interpreter: returned | 115 | 119 |
+| interpreter: used a value nothing defines | 0 | 0 |
+| `cargo test` | 38 | 41 |
+
+`objdump-check` 124/124 and `discover` coverage 97.88% unchanged, so M1's gates did
+not move. `clippy -D warnings` clean.
+
+Remaining `Exit` terminators (27) and the largest remaining gap class are named, not
+counted vaguely: a function entry reading a register the 4 modelled parameters do not
+cover (r8, r9, bp, ...) gets an `opaque "live-in RXX"`, which is honest - the ABI does
+not promise those are arguments - and is what a type/ABI inference pass must resolve.
+
+
 ## M4 — Calls, signatures, UB-free C, T2 · 4–5 wk (v1: 3)
 
 - Call lifting: arguments and returns per ABI, clobbers, stack arguments, SysV
