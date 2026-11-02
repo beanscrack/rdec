@@ -50,7 +50,7 @@ fn cmd_flags(args: &[String]) -> i32 {
             .unwrap_or(20_000)
     });
     let sabotage = args.iter().any(|a| a == "--sabotage");
-    let sab = sabotage.then(|| Sabotage {
+    let sab = sabotage.then_some(Sabotage {
         op: "add",
         w: Width::W32,
         flag: rdec_core::ir::Flag::OF,
@@ -115,10 +115,7 @@ fn cmd_probe(args: &[String]) -> i32 {
             Some(v) => format!("{v}"),
             None => "undef".into(),
         };
-        println!(
-            "  {fl}      model={model:<5}  hw={}",
-            hw::bit(hflags, mask)
-        );
+        println!("  {fl}      model={model:<5}  hw={}", hw::bit(hflags, mask));
     }
     0
 }
@@ -139,7 +136,8 @@ fn cmd_selftest() -> i32 {
     }
 
     // 2. Each sabotage must be caught, by name.
-    let cases: Vec<(&str, fn() -> Function)> = vec![
+    type BrokenCase = (&'static str, fn() -> Function);
+    let cases: Vec<BrokenCase> = vec![
         ("use of an undefined value", broken_undef_use),
         ("value defined twice", broken_double_def),
         ("branch to a missing block", broken_bad_target),
@@ -155,7 +153,11 @@ fn cmd_selftest() -> i32 {
             Err(errs) => {
                 let hit = errs.iter().any(|e| !e.starts_with("warn:"));
                 if hit {
-                    println!("ok    verifier rejected: {name}  ({}: {})", errs.len(), errs[0]);
+                    println!(
+                        "ok    verifier rejected: {name}  ({}: {})",
+                        errs.len(),
+                        errs[0]
+                    );
                 } else {
                     println!("FAIL  only warnings for: {name}: {errs:?}");
                     rc = 1;
@@ -174,7 +176,10 @@ fn cmd_selftest() -> i32 {
 fn cmd_corpus(args: &[String]) -> i32 {
     use std::path::Path;
     let mut out = "corpus".to_string();
-    let mut opts: Vec<String> = rdec_verify::corpus::OPTS.iter().map(|s| s.to_string()).collect();
+    let mut opts: Vec<String> = rdec_verify::corpus::OPTS
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -183,7 +188,10 @@ fn cmd_corpus(args: &[String]) -> i32 {
                 i += 2;
             }
             "--opt" if i + 1 < args.len() => {
-                opts = args[i + 1].split(',').map(|s| s.trim().to_string()).collect();
+                opts = args[i + 1]
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .collect();
                 i += 2;
             }
             other => {
@@ -245,7 +253,8 @@ fn broken_double_def() -> Function {
     let (a, b) = (f.params[0], f.params[1]);
     let s = f.block(bb).instrs[2].dest;
     // Define %s a second time: not single-assignment.
-    f.block_mut(bb).push(Instr::new(s, Op::Bin(BinOp::Sub, a, b), Ty::u32(), 0x1003));
+    f.block_mut(bb)
+        .push(Instr::new(s, Op::Bin(BinOp::Sub, a, b), Ty::u32(), 0x1003));
     f
 }
 

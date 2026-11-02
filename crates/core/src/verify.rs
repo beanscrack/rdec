@@ -23,7 +23,12 @@ pub fn verify(f: &Function) -> Verdict {
         e.hard("entry block id out of range");
     }
     for b in &f.blocks {
-        if b.id as usize != f.blocks.iter().position(|x| x.id == b.id).unwrap_or(usize::MAX) {
+        if b.id as usize
+            != f.blocks
+                .iter()
+                .position(|x| x.id == b.id)
+                .unwrap_or(usize::MAX)
+        {
             e.soft(format!("block id {} is not at index {}", b.id, b.id));
         }
     }
@@ -85,7 +90,10 @@ pub fn verify(f: &Function) -> Verdict {
                 // an integer, emitted C (`if (x)` on an int32) still *compiles*,
                 // so the type model has lied and a pass bug hides behind legal C.
                 if !f.ty_of(*cond).map(|t| t.is_bool()).unwrap_or(false) {
-                    e.hard(format!("bb{}: branch condition %{} is not bool", b.id, cond));
+                    e.hard(format!(
+                        "bb{}: branch condition %{} is not bool",
+                        b.id, cond
+                    ));
                 }
             }
             _ => {}
@@ -96,7 +104,9 @@ pub fn verify(f: &Function) -> Verdict {
             e.hard(format!("value %{v} is used but never defined"));
         }
         if *c > 1 {
-            e.hard(format!("value %{v} is defined {c} times (not single-assignment)"));
+            e.hard(format!(
+                "value %{v} is defined {c} times (not single-assignment)"
+            ));
         }
     }
     for v in 0..f.next_value {
@@ -150,7 +160,10 @@ pub fn verify_ssa(f: &Function) -> Verdict {
                     if !defined(f, *v) {
                         e.hard(format!("bb{}: phi %{} takes undefined %{v}", b.id, i.dest));
                     } else if !cfg.is_reachable(*from) {
-                        e.hard(format!("bb{}: phi %{} from unreachable bb{from}", b.id, i.dest));
+                        e.hard(format!(
+                            "bb{}: phi %{} from unreachable bb{from}",
+                            b.id, i.dest
+                        ));
                     }
                 }
             }

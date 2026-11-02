@@ -249,11 +249,13 @@ pub fn generate(out: &Path, opts: &[&str], clang: &str) -> Report {
             match status {
                 Ok(s) if s.success() => {}
                 Ok(s) => {
-                    rep.failures.push(format!("{} -{}: clang exit {}", sn.name, opt, s));
+                    rep.failures
+                        .push(format!("{} -{}: clang exit {}", sn.name, opt, s));
                     continue;
                 }
                 Err(e) => {
-                    rep.failures.push(format!("{} -{}: spawn {clang}: {e}", sn.name, opt));
+                    rep.failures
+                        .push(format!("{} -{}: spawn {clang}: {e}", sn.name, opt));
                     continue;
                 }
             }
@@ -273,7 +275,9 @@ pub fn generate(out: &Path, opts: &[&str], clang: &str) -> Report {
                         (obj, bytes.len() as u64, h),
                     );
                 }
-                Err(e) => rep.failures.push(format!("{} -{}: read obj: {e}", sn.name, opt)),
+                Err(e) => rep
+                    .failures
+                    .push(format!("{} -{}: read obj: {e}", sn.name, opt)),
             }
         }
     }

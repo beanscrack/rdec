@@ -91,7 +91,11 @@ pub fn format_instr(f: &Function, i: &Instr) -> String {
                 Callee::Indirect(v) => format!("<{}>", vname(f, *v)),
             };
             let a: Vec<String> = args.iter().map(|v| vname(f, *v)).collect();
-            format!("call {t}({}){} : {ret_ty}", a.join(", "), if *pure { " [pure]" } else { "" })
+            format!(
+                "call {t}({}){} : {ret_ty}",
+                a.join(", "),
+                if *pure { " [pure]" } else { "" }
+            )
         }
         Op::Opaque(msg) => format!("opaque \"{msg}\""),
     };
@@ -121,7 +125,9 @@ pub fn format_term(f: &Function, t: &Terminator) -> String {
 fn format_flags(f: &Function, fl: FlagsOp) -> String {
     let (n, a, b) = match fl {
         FlagsOp::Add { a, b, carry } => (if carry { "flags.adc" } else { "flags.add" }, a, Some(b)),
-        FlagsOp::Sub { a, b, borrow } => (if borrow { "flags.sbb" } else { "flags.sub" }, a, Some(b)),
+        FlagsOp::Sub { a, b, borrow } => {
+            (if borrow { "flags.sbb" } else { "flags.sub" }, a, Some(b))
+        }
         FlagsOp::And { a, b } => ("flags.and", a, Some(b)),
         FlagsOp::Or { a, b } => ("flags.or", a, Some(b)),
         FlagsOp::Xor { a, b } => ("flags.xor", a, Some(b)),
@@ -131,7 +137,9 @@ fn format_flags(f: &Function, fl: FlagsOp) -> String {
         FlagsOp::Neg { a } => ("flags.neg", a, None),
         FlagsOp::Inc { a } => ("flags.inc", a, None),
         FlagsOp::Dec { a } => ("flags.dec", a, None),
-        FlagsOp::Mul { a, b, signed } => (if signed { "flags.imul" } else { "flags.mul" }, a, Some(b)),
+        FlagsOp::Mul { a, b, signed } => {
+            (if signed { "flags.imul" } else { "flags.mul" }, a, Some(b))
+        }
     };
     match b {
         Some(b) => format!("{n} {}, {}", vname(f, a), vname(f, b)),

@@ -27,7 +27,7 @@ macro_rules! binop_fn {
     ($name:ident, $mnem:literal) => {
         /// Returns `(result_of_a, eflags_after)`.
         pub fn $name(w: Width, a: u64, b: u64, seed: u64) -> (u64, u64) {
-            let mut res: u64;
+            let res: u64;
             let mut flags: u64;
             unsafe {
                 match w {
@@ -105,7 +105,7 @@ binop_fn!(xor, "xor");
 macro_rules! shift_fn {
     ($name:ident, $mnem:literal) => {
         pub fn $name(w: Width, a: u64, count: u64, seed: u64) -> (u64, u64) {
-            let mut res: u64;
+            let res: u64;
             let mut flags: u64;
             unsafe {
                 match w {
@@ -177,7 +177,7 @@ shift_fn!(sar, "sar");
 macro_rules! unary_fn {
     ($name:ident, $mnem:literal) => {
         pub fn $name(w: Width, a: u64, seed: u64) -> (u64, u64) {
-            let mut res: u64;
+            let res: u64;
             let mut flags: u64;
             unsafe {
                 match w {
@@ -252,7 +252,7 @@ macro_rules! mul_fn {
             unsafe {
                 match w {
                     Width::W8 => {
-                        let mut al_v: u8 = a as u8;
+                        let al_v: u8 = a as u8;
                         // `ah` is not addressable as an asm operand on x86-64, so
                         // read the whole 16-bit accumulator: al = lo, ah = hi.
                         let mut ax_out: u16 = 0;

@@ -18,6 +18,7 @@ use crate::ty::{Sx, Ty, Width};
 ///    where a block feeds its own value back),
 ///  * self-only phis (reads before any write),
 ///  * dead phis.
+///
 /// Runs to fixpoint: collapsing one phi can degenerate another.
 pub fn prune_phis(f: &mut Function) -> bool {
     let mut changed_any = false;
@@ -142,7 +143,11 @@ enum FlagClass {
 
 fn ctx_of(f: &Function, fop: FlagsOp, res: VId) -> Option<FlagCtx> {
     let (kind, a, b) = match fop {
-        FlagsOp::Sub { a, b, borrow: false } => (FlagClass::Cmp, a, b),
+        FlagsOp::Sub {
+            a,
+            b,
+            borrow: false,
+        } => (FlagClass::Cmp, a, b),
         FlagsOp::And { a, b } | FlagsOp::Or { a, b } | FlagsOp::Xor { a, b } => {
             (FlagClass::Test, a, b)
         }
@@ -152,7 +157,14 @@ fn ctx_of(f: &Function, fop: FlagsOp, res: VId) -> Option<FlagCtx> {
     let ty = f.ty_of(a).unwrap_or(Ty::u64());
     let w = ty.width().unwrap_or(Width::W64);
     let signed = ty.sx() == Some(Sx::Signed);
-    Some(FlagCtx { kind, a, b, res, w, signed })
+    Some(FlagCtx {
+        kind,
+        a,
+        b,
+        res,
+        w,
+        signed,
+    })
 }
 
 /// Rewrite the `get_flag` at (`bb`, `ii`) - as the root of its boolean tree -
@@ -428,7 +440,11 @@ fn lower_flag_expr_exact(
         (false, true) => "__rdec_sbb_cf",
         (false, false) => "__rdec_sub_cf",
     };
-    let of_name = if is_add { "__rdec_add_of" } else { "__rdec_sub_of" };
+    let of_name = if is_add {
+        "__rdec_add_of"
+    } else {
+        "__rdec_sub_of"
+    };
     let helper = |n: &str, args: Vec<VId>| Op::Call {
         callee: Callee::Symbol(n.to_string()),
         ret_ty: Ty::Bool,
@@ -823,9 +839,7 @@ pub(crate) fn redirect(t: &mut Terminator, from: BbId, to: BbId) {
             }
         }
         Terminator::Branch {
-            then_bb,
-            else_bb,
-            ..
+            then_bb, else_bb, ..
         } => {
             if *then_bb == from {
                 *then_bb = to;
@@ -894,7 +908,10 @@ fn block_key(f: &Function, b: &Block) -> String {
     let mut succ = Vec::new();
     b.term.successors(&mut succ);
     let succ: Vec<String> = succ.iter().map(|x| enc(*x, &mut ids)).collect();
-    s.push_str(&format!("term {:?} {succ:?}", std::mem::discriminant(&b.term)));
+    s.push_str(&format!(
+        "term {:?} {succ:?}",
+        std::mem::discriminant(&b.term)
+    ));
     s
 }
 
@@ -1081,9 +1098,7 @@ impl Op {
                     | FlagsOp::Shr { a, b }
                     | FlagsOp::Sar { a, b }
                     | FlagsOp::Mul { a, b, .. } => (Some(a), Some(b)),
-                    FlagsOp::Neg { a } | FlagsOp::Inc { a } | FlagsOp::Dec { a } => {
-                        (Some(a), None)
-                    }
+                    FlagsOp::Neg { a } | FlagsOp::Inc { a } | FlagsOp::Dec { a } => (Some(a), None),
                 };
                 if let Some(a) = a {
                     g(a);

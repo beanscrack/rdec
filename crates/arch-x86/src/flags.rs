@@ -11,6 +11,14 @@
 //! there instead of inventing a value: the lifter must not depend on undefined
 //! flags, and the verifier is allowed to assert it.
 
+// Every op below starts from `FlagDef::default()` — "no flag is defined" — and
+// assigns only the flags that instruction architecturally defines. That
+// per-op-assignment shape *is* the model; a struct literal would force writing
+// `None` for the undefined flags and would hide which op leaves what undefined.
+#![allow(clippy::field_reassign_with_default)]
+// `is_multiple_of` is newer than this workspace's MSRV.
+#![allow(clippy::manual_is_multiple_of)]
+
 use rdec_core::ir::Flag;
 use rdec_core::ty::Width;
 
@@ -164,8 +172,10 @@ pub fn sbb(w: Width, a: u64, b: u64, bin: bool) -> (u64, FlagDef) {
     let bin = bin as u64;
     let res = as_u(w, a.wrapping_sub(b).wrapping_sub(bin));
     let mut d = FlagDef::default();
-    d.cf = Some(((a as u128).wrapping_sub(b as u128 + bin as u128) & !w.mask() as u128) != 0
-        || (a as u128) < (b as u128 + bin as u128));
+    d.cf = Some(
+        ((a as u128).wrapping_sub(b as u128 + bin as u128) & !w.mask() as u128) != 0
+            || (a as u128) < (b as u128 + bin as u128),
+    );
     d.pf = Some(pf(res));
     d.af = Some(af_add(a, b ^ bin, res));
     d.zf = Some(zf(w, res));
@@ -247,7 +257,7 @@ pub fn shr(w: Width, a: u64, count: u64) -> (u64, FlagDef) {
     let res = as_u(w, a >> n);
     // The last bit shifted out is bit n-1 of the operand; for n beyond the
     // width there is nothing left, so CF is 0.
-    d.cf = Some(if n - 1 >= w.bits() as u32 {
+    d.cf = Some(if n > w.bits() {
         false
     } else {
         (a >> (n - 1)) & 1 == 1
@@ -269,11 +279,11 @@ pub fn sar(w: Width, a: u64, count: u64) -> (u64, FlagDef) {
         d.unchanged = &FlagDef::ALL;
         return (a, d);
     }
-    let res = as_u(w, (as_i(w, a) >> n as u32) as u64);
+    let res = as_u(w, (as_i(w, a) >> n) as u64);
     // SAR shifts in the sign bit, so for n-1 at or beyond the width the last
     // bit out is the sign bit. Evaluating on the sign-extended value covers
     // every n uniformly.
-    d.cf = Some((as_i(w, a) >> (n - 1) as u32) & 1 == 1);
+    d.cf = Some((as_i(w, a) >> (n - 1)) & 1 == 1);
     d.pf = Some(pf(res));
     d.af = None;
     d.zf = Some(zf(w, res));

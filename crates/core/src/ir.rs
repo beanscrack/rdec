@@ -193,27 +193,63 @@ pub enum Flag {
 pub enum FlagsOp {
     /// a + b (+ carry_in). CF = carry out, OF = signed overflow,
     /// ZF/SF/PF/AF from the result.
-    Add { a: VId, b: VId, carry: bool },
+    Add {
+        a: VId,
+        b: VId,
+        carry: bool,
+    },
     /// a - b (- borrow_in). CF = borrow out.
-    Sub { a: VId, b: VId, borrow: bool },
+    Sub {
+        a: VId,
+        b: VId,
+        borrow: bool,
+    },
     /// a & b: CF=OF=0
-    And { a: VId, b: VId },
-    Or { a: VId, b: VId },
-    Xor { a: VId, b: VId },
+    And {
+        a: VId,
+        b: VId,
+    },
+    Or {
+        a: VId,
+        b: VId,
+    },
+    Xor {
+        a: VId,
+        b: VId,
+    },
     /// a << b: CF = last bit shifted out, OF = MSB changed (count 1 only)
-    Shl { a: VId, b: VId },
+    Shl {
+        a: VId,
+        b: VId,
+    },
     /// a >> b logical
-    Shr { a: VId, b: VId },
+    Shr {
+        a: VId,
+        b: VId,
+    },
     /// a >> b arithmetic
-    Sar { a: VId, b: VId },
+    Sar {
+        a: VId,
+        b: VId,
+    },
     /// ~a + 1 (neg): CF = (a != 0)
-    Neg { a: VId },
+    Neg {
+        a: VId,
+    },
     /// a + 1: CF unchanged
-    Inc { a: VId },
+    Inc {
+        a: VId,
+    },
     /// a - 1: CF unchanged
-    Dec { a: VId },
+    Dec {
+        a: VId,
+    },
     /// a * b, full width: CF/OF = high word != sign-extension of low
-    Mul { a: VId, b: VId, signed: bool },
+    Mul {
+        a: VId,
+        b: VId,
+        signed: bool,
+    },
 }
 
 /// A call target.
@@ -391,7 +427,9 @@ impl Terminator {
         out.clear();
         match *self {
             Terminator::Jump(b) => out.push(b),
-            Terminator::Branch { then_bb, else_bb, .. } => {
+            Terminator::Branch {
+                then_bb, else_bb, ..
+            } => {
                 out.push(then_bb);
                 out.push(else_bb);
             }

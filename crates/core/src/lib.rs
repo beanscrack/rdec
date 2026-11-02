@@ -47,7 +47,8 @@ pub fn run_pipeline(f: &mut Function) -> PipelineReport {
         changed |= passes::merge_blocks(f);
         changed |= passes::dedup_blocks(f);
         if !changed || iter > 32 {
-            rep.passes_run.push(format!("converged after {iter} rounds"));
+            rep.passes_run
+                .push(format!("converged after {iter} rounds"));
             break;
         }
     }

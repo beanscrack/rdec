@@ -134,7 +134,10 @@ impl Ty {
     }
 
     pub const fn uint(w: Width) -> Ty {
-        Ty::Int { w, sx: Sx::Unsigned }
+        Ty::Int {
+            w,
+            sx: Sx::Unsigned,
+        }
     }
 
     pub const fn sint(w: Width) -> Ty {

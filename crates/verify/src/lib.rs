@@ -44,7 +44,12 @@ impl std::fmt::Display for Mismatch {
             None => write!(
                 f,
                 "{}.{} a={:#x} b={:#x}: result model={:#x} hw={:#x}",
-                self.op, self.w.bits(), self.a, self.b, self.model, self.hw
+                self.op,
+                self.w.bits(),
+                self.a,
+                self.b,
+                self.model,
+                self.hw
             ),
         }
     }
@@ -160,17 +165,34 @@ fn sabotage_bit(s: Option<Sabotage>, op: &str, w: Width, flag: Flag, d: &mut mod
     }
 }
 
+/// Shift op signatures: (model, hardware) pairs share one shape.
+type ShiftModel = fn(Width, u64, u64) -> (u64, model::FlagDef);
+type ShiftHw = fn(Width, u64, u64, u64) -> (u64, u64);
+
+/// One probe: the instruction, its operands, and the EFLAGS seed.
+#[derive(Clone, Copy)]
+pub struct Probe {
+    pub op: &'static str,
+    pub w: Width,
+    pub a: u64,
+    pub b: u64,
+    pub seed: u64,
+}
+
+impl Probe {
+    pub const fn new(op: &'static str, w: Width, a: u64, b: u64, seed: u64) -> Self {
+        Self { op, w, a, b, seed }
+    }
+}
+
 fn cmp_flags(
     r: &mut Report,
-    op: &'static str,
-    w: Width,
-    a: u64,
-    b: u64,
-    seed: u64,
+    p: &Probe,
     m: &model::FlagDef,
     hw_flags: u64,
     sabotage: Option<Sabotage>,
 ) {
+    let Probe { op, w, a, b, seed } = *p;
     for &fl in model::FlagDef::ALL.iter() {
         // "Unchanged" flags must equal the seeded value, and the model must not
         // claim to define them.
@@ -228,27 +250,25 @@ pub fn flag_mask(fl: Flag) -> u64 {
     }
 }
 
-fn check_bin(
-    r: &mut Report,
-    w: Width,
-    a: u64,
-    b: u64,
-    s: Option<Sabotage>,
-) {
+fn check_bin(r: &mut Report, w: Width, a: u64, b: u64, s: Option<Sabotage>) {
     let seed = hw::ALL_SEED;
     r.probes += 6;
 
     let (mr, md) = model::add(w, a, b);
     let (hr, hf) = hw::add(w, a, b, seed);
     cmp_result(r, "add", w, a, b, mr, hr);
-    cmp_flags(r, "add", w, a, b, seed, &md, hf, s);
+    cmp_flags(r, &Probe::new("add", w, a, b, seed), &md, hf, s);
 
     let (mr, md) = model::sub(w, a, b);
     let (hr, hf) = hw::sub(w, a, b, seed);
     cmp_result(r, "sub", w, a, b, mr, hr);
-    cmp_flags(r, "sub", w, a, b, seed, &md, hf, s);
+    cmp_flags(r, &Probe::new("sub", w, a, b, seed), &md, hf, s);
 
-    for (name, op) in [("and", model::LogicOp::And), ("or", model::LogicOp::Or), ("xor", model::LogicOp::Xor)] {
+    for (name, op) in [
+        ("and", model::LogicOp::And),
+        ("or", model::LogicOp::Or),
+        ("xor", model::LogicOp::Xor),
+    ] {
         let (mr, md) = model::logic(w, a, b, op);
         let (hr, hf) = match op {
             model::LogicOp::And => hw::and(w, a, b, seed),
@@ -256,55 +276,55 @@ fn check_bin(
             model::LogicOp::Xor => hw::xor(w, a, b, seed),
         };
         cmp_result(r, name, w, a, b, mr, hr);
-        cmp_flags(r, name, w, a, b, seed, &md, hf, s);
+        cmp_flags(r, &Probe::new(name, w, a, b, seed), &md, hf, s);
     }
 
     let (mr, md) = model::adc(w, a, b, true);
     let (hr, hf) = hw::adc(w, a, b, true, seed);
     cmp_result(r, "adc", w, a, b, mr, hr);
-    cmp_flags(r, "adc", w, a, b, seed, &md, hf, s);
+    cmp_flags(r, &Probe::new("adc", w, a, b, seed), &md, hf, s);
 
     let (mr, md) = model::sbb(w, a, b, true);
     let (hr, hf) = hw::sbb(w, a, b, true, seed);
     cmp_result(r, "sbb", w, a, b, mr, hr);
-    cmp_flags(r, "sbb", w, a, b, seed, &md, hf, s);
+    cmp_flags(r, &Probe::new("sbb", w, a, b, seed), &md, hf, s);
 
     let (mlo, mhi, md) = model::mul(w, a, b);
     let (hlo, hhi, hf) = hw::mul(w, a, b, seed);
     cmp_result(r, "mul", w, a, b, mlo, hlo);
     cmp_result(r, "mul", w, a, b, mhi, hhi);
-    cmp_flags(r, "mul", w, a, b, seed, &md, hf, s);
+    cmp_flags(r, &Probe::new("mul", w, a, b, seed), &md, hf, s);
 
     let (mlo, mhi, md) = model::imul(w, a, b);
     let (hlo, hhi, hf) = hw::imul(w, a, b, seed);
     cmp_result(r, "imul", w, a, b, mlo, hlo);
     cmp_result(r, "imul", w, a, b, mhi, hhi);
-    cmp_flags(r, "imul", w, a, b, seed, &md, hf, s);
+    cmp_flags(r, &Probe::new("imul", w, a, b, seed), &md, hf, s);
 }
 
 fn check_unary(r: &mut Report, w: Width, a: u64, s: Option<Sabotage>) {
     let seed = hw::ALL_SEED;
     r.probes += 3;
     for (name, mfn, hfn) in [
-        ("inc", model::inc as fn(Width, u64) -> (u64, model::FlagDef), hw::inc as fn(Width, u64, u64) -> (u64, u64)),
+        (
+            "inc",
+            model::inc as fn(Width, u64) -> (u64, model::FlagDef),
+            hw::inc as fn(Width, u64, u64) -> (u64, u64),
+        ),
         ("dec", model::dec, hw::dec),
         ("neg", model::neg, hw::neg),
     ] {
         let (mr, md) = mfn(w, a);
         let (hr, hf) = hfn(w, a, seed);
         cmp_result(r, name, w, a, 0, mr, hr);
-        cmp_flags(r, name, w, a, 0, seed, &md, hf, s);
+        cmp_flags(r, &Probe::new(name, w, a, 0, seed), &md, hf, s);
     }
 }
 
 fn check_shift(r: &mut Report, w: Width, a: u64, count: u64, s: Option<Sabotage>) {
     let seed = hw::ALL_SEED;
     r.probes += 3;
-    let cases: [(
-        &str,
-        fn(Width, u64, u64) -> (u64, model::FlagDef),
-        fn(Width, u64, u64, u64) -> (u64, u64),
-    ); 3] = [
+    let cases: [(&str, ShiftModel, ShiftHw); 3] = [
         ("shl", model::shl, hw::shl),
         ("shr", model::shr, hw::shr),
         ("sar", model::sar, hw::sar),
@@ -313,7 +333,7 @@ fn check_shift(r: &mut Report, w: Width, a: u64, count: u64, s: Option<Sabotage>
         let (mr, md) = mfn(w, a, count);
         let (hr, hf) = hfn(w, a, count, seed);
         cmp_result(r, name, w, a, count, mr, hr);
-        cmp_flags(r, name, w, a, count, seed, &md, hf, s);
+        cmp_flags(r, &Probe::new(name, w, a, count, seed), &md, hf, s);
     }
 }
 
@@ -361,10 +381,7 @@ mod tests {
             w: Width::W32,
             flag: Flag::OF,
         };
-        let r = check(
-            Some(sab),
-            0,
-        );
+        let r = check(Some(sab), 0);
         assert!(!r.ok(), "sabotaged model passed the oracle");
         let bad: Vec<&Mismatch> = r
             .mismatches

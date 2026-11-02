@@ -83,18 +83,23 @@ semantic loss is the failure mode that kills credibility and this project.
 Strict one-way layering; the middle-end must link against no x86 type.
 
 ```
-rdec-bin     loader: PE/COFF + ELF via goblin. sections, symbols, relocations,
-             PLT/IAT/thunk recognition, function discovery, linear sweep.
-rdec-x86     decoder glue (iced), per-instruction semantics → IR, calling
-             conventions (Win64 + SysV), frame analysis, idiom recognizers.
-rdec-core    IR, CFG, dominators, loops, SSA, passes, structuring, C emission.
-             Knows nothing about x86.
-rdec-cli     disasm / lift / ir / cfg / decompile / verify / diff
-rdec-verify  T1 flag-table harness, T2 differential runner, fuzz targets
+crates/verify   T1 flag-table harness (hardware probes), corpus generator,
+                T2 differential runner (M4), fuzz targets
+crates/arch-x86 decoder glue (`iced-x86`), per-instruction semantics → IR,
+                calling conventions (Win64 + SysV), frame analysis, idioms.
+                `flags.rs` is the EFLAGS model T1 measures.
+crates/core     IR, CFG, dominators, loops, SSA, passes, structuring, C emission.
+                Knows nothing about x86 — enforced by the Cargo dependency graph.
+crates/cli      disasm / lift / ir / cfg / decompile / verify / diff
+                (`rdec` binary; `flags`, `selftest`, `corpus` exist today)
 ```
 
-Dependency licenses checked before use: `iced` (MIT), `goblin` (BSD-3), `clang`
-(shell, test-only). No LLVM in the product — LLVM is a test-time tool only.
+Loader (PE/COFF + ELF via `goblin`) lands with M1 as `crates/bin`.
+
+Dependency licenses checked before use: `iced-x86` (MIT), `goblin` (BSD-3),
+`clang` (shell, test-only). No LLVM in the product — LLVM is a test-time tool only.
+Note: the decoder crate is `iced-x86`; `iced` on crates.io is an unrelated GUI
+toolkit.
 
 The IR is typed three-address code:
 
@@ -271,28 +276,46 @@ and every milestone above advances it.
 
 ## 5. State of the tree right now
 
-Verified by running, not by inspection:
+**M0 is closed.** Every gate below was run; the numbers are output, not estimates.
 
-| Item | State |
+| Gate | Result |
 |---|---|
-| `crates/core/{ty,ir,cfg,fmt_ir,passes,verify}.rs` | compiles; SSA/IR verifier runs after every pass |
-| `crates/arch-x86/src/flags.rs` | EFLAGS model, all widths, defined + undefined cases |
-| `crates/verify/src/hw.rs` | inline-asm probes: seed flags via `pushfq`/`popfq`, run one op, read EFLAGS back |
-| T1 grid (`cargo test -p rdec-verify`) | **3 passed** — model matches hardware over the boundary grid, counts 0..70, all widths |
-| Sabotage test | **passes** — one injected bad OF bit is caught, and reported confined to the injected op/width |
-| `rdec flags --full N` | runs the oracle at volume (N random operand pairs per op/width) |
-| Toolchain | rustc 1.99 `x86_64-pc-windows-msvc`; clang 22.1.8 targeting MSVC; `clang -O1 -c` emits real COFF — the T2 corpus is buildable on this host |
+| `cargo test` | 5 passed, 0 failed |
+| T1 grid vs hardware | 3 passed — model == real EFLAGS over the boundary grid, all widths, shift counts 0..70 |
+| T1 full volume (`rdec flags --full 20000`) | **9,728,273,400 probes, 69,666,730,981 flag comparisons, 17,835,591,539 undefined-skips, 0 mismatches**, 331 s |
+| Sabotage test | passes — one injected bad OF bit is caught, reported confined to the injected op/width |
+| M0 verifier self-test (`rdec selftest`) | 5/5 — valid function verifies; 4 hand-broken functions each rejected for the *right* reason |
+| Corpus (`rdec corpus`) | 30 snippets × 4 opt levels → **120/120 objects, 93,928 bytes**, all headers = `IMAGE_FILE_MACHINE_AMD64` (verified by parsing the COFF machine field, not by trusting clang's exit code) |
+| `cargo fmt --check` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| Toolchain | rustc 1.99 `x86_64-pc-windows-msvc`; clang 22.1.8 → MSVC COFF |
 
-**What T1 already bought.** The grid found five genuine semantics bugs in the
-first run, all of which would have produced silently wrong decompilations later:
+**What T1 already bought.** The grid found five genuine semantics bugs on first
+contact. Every one would have been a silent miscompile in the output:
 
-1. `add` OF and 2. `sub` OF — Rust precedence (`&` vs `>>`) made the sign tests
-   compute garbage. Fixed with an explicit `bit()` helper.
-3. `shl` CF at count == width — the last bit out is bit 0, so CF=1, not 0.
+1. `add` OF and 2. `sub` OF — Rust precedence (`&` binds tighter than `>>` in the
+   expression as written) made the sign tests compute garbage. Fixed with an
+   explicit `bit()` helper so intent can't hide.
+3. `shl` CF at count == width — the last bit out is bit 0, so CF = 1, not 0.
 4. `inc`/`dec` OF — INT_MAX and INT_MIN were swapped.
 5. **Shift-count mask is 6 bits for 64-bit operands, 5 bits otherwise** —
-   `shl rax, 36` was being modeled as `shl rax, 4`. This is the kind of detail
-   that no amount of reading your own code catches.
+   `shl rax, 36` was being modeled as `shl rax, 4`. No amount of reading your own
+   code finds this; only the hardware does.
 
-M0's remaining items are the corpus generator (clang `-O0/-O1/-O2/-Oz` over C
-snippets → `.obj`) and CI wiring. M1 (decode + disassembly) is next.
+The verifier self-test also earned its keep immediately: it had been *soft*-warning
+on a non-bool branch condition. That is a hard error — emitted C (`if (x)` on an
+int32) still compiles, so the type model would have been lying and a pass bug
+would have hidden behind legal C.
+
+Corpus is generated, not hand-written assembly: the only honest corpus for a
+decompiler is real compiler output over known source. `corpus/manifest.tsv`
+(name, opt, obj, size, fnv1a64) is the contract — gates consume the manifest, so a
+corpus change shows up as a diff instead of a silent behavior change. The 30
+snippets are chosen per milestone: flag fusion (signed/unsigned compares, setcc,
+cmov, carry chains), div/mul wide, loops (reducible, bottom-tested, nested-break,
+gcd), switch dense/sparse/fallthrough, address-taken locals, struct offsets,
+recursion, calls, and one two-entry loop to force the irreducible-CFG path.
+
+**Next: M1** — goblin PE/COFF load, recursive-descent function discovery, decode
+via `iced-x86`, gated on `rdec disasm` matching `objdump -d` on all 120 objects
+plus zero panics on 10 MB of random bytes.

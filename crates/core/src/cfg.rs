@@ -219,8 +219,7 @@ impl Cfg {
                         }
                     }
                     body.sort();
-                    let back_edges: Vec<(BbId, BbId)> = self
-                        .preds[h as usize]
+                    let back_edges: Vec<(BbId, BbId)> = self.preds[h as usize]
                         .iter()
                         .filter(|p| self.dominates(h, **p))
                         .map(|p| (*p, h))
@@ -245,15 +244,14 @@ impl Cfg {
         for i in 0..loops.len() {
             let h = loops[i].header;
             let mut best: Option<(usize, usize)> = None;
-            for j in 0..loops.len() {
+            for (j, lp) in loops.iter().enumerate() {
                 if i == j {
                     continue;
                 }
-                if loops[j].body.contains(&h) {
-                    let sz = loops[j].body.len();
-                    match best {
-                        Some((bs, _)) if sz >= bs => {}
-                        _ => best = Some((sz, j)),
+                if lp.body.contains(&h) {
+                    let sz = lp.body.len();
+                    if best.map(|(bs, _)| sz < bs).unwrap_or(true) {
+                        best = Some((sz, j));
                     }
                 }
             }
@@ -278,7 +276,6 @@ impl Cfg {
                 b.id,
                 dot_escape(&body)
             ));
-            b.term.successors(&mut { let mut v = Vec::new(); v });
             let mut succ = Vec::new();
             b.term.successors(&mut succ);
             for t in succ {
