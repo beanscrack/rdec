@@ -693,6 +693,8 @@ pub fn cmd_lift(args: &[String]) -> Result<i32, String> {
     let mut scaffolding = 0usize;
     let mut ret_w32 = 0usize;
     let mut self_idioms = 0usize;
+    // Named, not counted: where a register read resolved to `undef`.
+    let mut undef_sites: Vec<(u64, rdec_arch_x86::lift::Grp)> = Vec::new();
     let (mut ret_n, mut no_ret, mut step_budget, mut holes, mut unmodeled_load, mut fault) =
         (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
     let mut opaque = 0usize;
@@ -799,6 +801,7 @@ pub fn cmd_lift(args: &[String]) -> Result<i32, String> {
             scaffolding += rep.scaffolding_removed;
             ret_w32 += rep.ret_w32;
             self_idioms += rep.self_idioms;
+            undef_sites.extend(rep.undef_sites.iter().copied());
             // M3's semantic check, on top of the structural one: run the IR
             // interpreter over the lifted function. It is strict - every operand
             // it consumes must already be defined - so a renaming that leaves a

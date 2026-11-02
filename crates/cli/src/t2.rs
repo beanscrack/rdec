@@ -136,7 +136,7 @@ fn address_is_static(f: &Function, addr: u32) -> bool {
 /// `*lo = l` stores through a pointer *reloaded from its own frame slot*, so a
 /// taint check that stops at the load lets it through, and the native side then
 /// takes an access fault on every argument vector.
-fn touches_memory_outside_the_frame(f: &Function) -> bool {
+pub(crate) fn touches_memory_outside_the_frame(f: &Function) -> bool {
     f.blocks
         .iter()
         .flat_map(|b| b.instrs.iter())
@@ -159,7 +159,7 @@ fn loop_shaped(f: &Function) -> bool {
 /// The returned value is (partly) `Undef`: the machine code reaches `ret` with
 /// RAX unwritten on some path. Whatever the real chip leaves there is not a
 /// value, and the C model's `0` is not the same non-value.
-fn returns_undef(f: &Function) -> bool {
+pub(crate) fn returns_undef(f: &Function) -> bool {
     f.blocks.iter().any(|b| match &b.term {
         Terminator::Return(v) => ancestors(f, *v)
             .iter()
@@ -168,13 +168,65 @@ fn returns_undef(f: &Function) -> bool {
     })
 }
 
-fn has_exit(f: &Function) -> bool {
+pub(crate) fn has_exit(f: &Function) -> bool {
     f.blocks.iter().any(|b| matches!(b.term, Terminator::Exit))
+}
+
+/// Per-return-path RAX definedness: `(paths, defined paths, notes)`.
+///
+/// A path is undefined when the value it returns is (partly) `Undef`, and the
+/// note names every instruction that reads the undefined value with the address
+/// of the machine instruction it came from - the line a reader can find in
+/// `llvm-objdump` and check. A bucket counted but not named is a comparison set
+/// that shrank while reading as a win.
+///
+/// This is a REPORT. T2 runs a function only when EVERY path is defined, so the
+/// comparison is per function and never per path: no vector is dropped, no bit
+/// is masked, and the count of compared runs is untouched by this function.
+pub(crate) fn rax_paths(f: &Function) -> (usize, usize, Vec<String>) {
+    let reach = reachable(f);
+    let mut paths = 0usize;
+    let mut notes = Vec::new();
+    for b in &f.blocks {
+        if !reach.contains(&b.id) {
+            continue;
+        }
+        let Terminator::Return(v) = b.term else {
+            continue;
+        };
+        paths += 1;
+        let anc = ancestors(f, v);
+        let mut sites: Vec<String> = Vec::new();
+        for &x in &anc {
+            if !matches!(def_op(f, x), Some(Op::Undef)) {
+                continue;
+            }
+            for u in f.uses_of(x) {
+                sites.push(if u.instr == usize::MAX {
+                    format!("0x{:x}: return", f.block(u.bb).addr)
+                } else {
+                    let i = &f.block(u.bb).instrs[u.instr];
+                    format!("0x{:x}: {}", i.addr, rdec_core::fmt_ir::format_instr(f, i))
+                });
+            }
+        }
+        sites.sort();
+        sites.dedup();
+        if !sites.is_empty() {
+            notes.push(format!(
+                "ret bb{}@0x{:x} reads unwritten: {}",
+                b.id,
+                b.addr,
+                sites.join(" ; ")
+            ));
+        }
+    }
+    (paths, paths - notes.len(), notes)
 }
 
 /// Discovery's synthetic name for code no symbol names. It is not a link name:
 /// the object has nothing to resolve, so there is no machine-code side to run.
-fn synthetic(sym: &str, start: u64) -> bool {
+pub(crate) fn synthetic(sym: &str, start: u64) -> bool {
     sym == format!("fn_{start:x}")
 }
 
@@ -654,6 +706,11 @@ pub fn cmd_t2(args: &[String]) -> Result<i32, String> {
     let mut refused = 0usize;
     let mut broken = 0usize;
     let mut undef_dumps = 0usize;
+    // Per-return-path RAX definedness over every lifted function. A report, so
+    // the "returns RAX unwritten" bucket can be read as paths, not just names.
+    let mut path_tot = 0usize;
+    let mut path_def = 0usize;
+    let mut undef_notes: Vec<String> = Vec::new();
     // reason -> the functions it names. A skipped function is counted AND
     // named, so a shrunk comparison set reads as a work item, not as a win.
     let mut skipped: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -672,6 +729,9 @@ pub fn cmd_t2(args: &[String]) -> Result<i32, String> {
             broken += 1;
             continue;
         }
+        let (n_paths, n_def, _) = rax_paths(&s.f);
+        path_tot += n_paths;
+        path_def += n_def;
         let Ok(out) = emit_c(&s.f) else {
             // `rdec c` counts and names these; T2 does not re-count an emitter
             // refusal as a T2 gap.
@@ -705,6 +765,14 @@ pub fn cmd_t2(args: &[String]) -> Result<i32, String> {
             continue;
         }
         if returns_undef(&s.f) {
+            // Name the paths, not just the function: which return, at what
+            // address, and which instruction reads the register that no modelled
+            // path writes. The IR dump is the same evidence in full.
+            let (p, d, notes) = rax_paths(&s.f);
+            undef_notes.push(format!("{tag}: RAX defined on {d} of {p} return paths"));
+            for n in notes {
+                undef_notes.push(format!("      {n}"));
+            }
             // The post-pass IR is the diagnosis: this bucket is only trustworthy
             // if a reader can check that the undef really reaches the return, so
             // the first few are written out, exactly as `rdec c` dumps refusals.
@@ -893,6 +961,12 @@ pub fn cmd_t2(args: &[String]) -> Result<i32, String> {
             .join(" | ")
     );
     println!(
+        "paths: RAX defined on {path_def} of {path_tot} return paths over the {lifted} lifted functions; a function is runnable only when EVERY path is defined, so the comparison is per function, never per path"
+    );
+    for n in &undef_notes {
+        println!("  RAX unwritten: {n}");
+    }
+    println!(
         "inputs: {n_vec} small vectors for every function, {} for the {loop_free} loop-free ones -> {} comparisons",
         vecs.len(),
         jobs.len()
@@ -1030,7 +1104,7 @@ pub fn cmd_t2(args: &[String]) -> Result<i32, String> {
             top.join(" | ")
         );
     }
-    for m in mismatch.iter().take(10) {
+    for m in mismatch.iter().take(200) {
         println!("  MISMATCH {m}");
     }
     if mismatch.len() > 10 {

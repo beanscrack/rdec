@@ -325,6 +325,12 @@ pub struct Report {
     /// what makes `RAX` defined on paths that used to read an undefined
     /// register, and a reader must be able to ask how many paths moved.
     pub self_idioms: usize,
+    /// Where a register read resolved to `undef`: the address of the read and
+    /// which register. `undef_live_ins` counts them; this names them, because
+    /// "13 undef live-ins" is not a work item and "`0x29` reads RDX, which no
+    /// modelled path writes" is. Same rule as the self-idiom count: a gap a
+    /// reader cannot check is a gap that gets quietly believed.
+    pub undef_sites: Vec<(u64, Grp)>,
 }
 
 /// `op reg, reg` where both operands name the SAME register group. Each variant
@@ -418,10 +424,19 @@ impl<'a> Lifter<'a> {
         let entry = f.entry;
         let mut regs = HashMap::new();
         for g in ARG_REGS {
-            let v = f.new_value(Ty::i64());
+            // The four argument registers are REGISTER values, and a register is
+            // one unsigned W64 word in this model. Typed `int64_t` (the earlier
+            // spelling) makes the entry's params the only signed values in the
+            // register model, so as soon as they flow past the entry block -
+            // which they now do - every `and`/`add` that reads one reports
+            // "op type int64_t != recorded uint64_t": the verifier is right, the
+            // register model was inconsistent. Signedness is a property of a
+            // *read* (`movsx` asks for it, `sar` asks for it), and the emitter
+            // spells both; it is not a property of the bits in a register.
+            let v = f.new_value(Ty::u64());
             f.params.push(v);
             f.block_mut(f.entry)
-                .push(Instr::new(v, Op::Param, Ty::i64(), addr));
+                .push(Instr::new(v, Op::Param, Ty::u64(), addr));
             regs.insert(g, v);
         }
         // The machine stack is memory. In a flat-memory model the entry stack
@@ -544,6 +559,24 @@ impl<'a> Lifter<'a> {
             return full;
         }
         self.cast(CastKind::Trunc, full, w)
+    }
+
+    /// Install a register value at a point that is a DEFINITION of it but is not
+    /// a `write`: a call's RAX, a caller-saved clobber, a push/pop's RSP.
+    ///
+    /// `block_def` is the transfer function `ssa_registers` solves: "this block
+    /// produced a new value for this register, so its successors read *that*".
+    /// A register installed here without the mark is read by the successors as
+    /// the block's *incoming* value, which is a silent miscompile of exactly the
+    /// kind this project does not ship: after a call, RCX keeps the value the
+    /// caller passed in, and a function whose entry block ends with `push rbp`
+    /// hands every later block an undefined RSP, so its frame slots have no
+    /// address and T2 files the whole function under "memory outside the
+    /// modelled frame". Marking is the difference between "the model says the
+    /// register is gone" and "the model forgot to say".
+    fn set_reg(&mut self, g: Grp, v: VId) {
+        self.regs.insert(g, v);
+        self.cur_defs.insert(g);
     }
 
     /// Write a width-`w` result, honouring x86's partial-write rules.
@@ -1249,7 +1282,7 @@ impl<'a> Lifter<'a> {
                 let eight = self.const_of(8, Width::W64);
                 let sp = self.read64(Grp::Rsp);
                 let nsp = self.bin(BinOp::Sub, sp, eight);
-                self.regs.insert(Grp::Rsp, nsp);
+                self.set_reg(Grp::Rsp, nsp);
                 let v = match self.src(ins, 0, Width::W64) {
                     Some(v) => v,
                     None => {
@@ -1267,7 +1300,7 @@ impl<'a> Lifter<'a> {
                     .emit(self.cur, Op::Load(Ty::u64(), sp), Ty::u64(), self.addr());
                 let eight = self.const_of(8, Width::W64);
                 let nsp = self.bin(BinOp::Add, sp, eight);
-                self.regs.insert(Grp::Rsp, nsp);
+                self.set_reg(Grp::Rsp, nsp);
                 match self.reg_op(ins, 0) {
                     Some((d, _)) => self.write(d, Width::W64, v),
                     None => {
@@ -1322,7 +1355,14 @@ impl<'a> Lifter<'a> {
                         Ty::i64(),
                         a,
                     ));
-                    self.regs.insert(Grp::Rax, v);
+                    // RAX is an unsigned W64 register value; `Op::Call`'s type is
+                    // its own declared return type (int64_t, the ABI's integer
+                    // answer), so the register reads the same bits as unsigned.
+                    // Without the view, any later partial write of RAX (`and
+                    // %call, 0xff00..` for `mov al, X`) reports the same signed /
+                    // unsigned mismatch the verifier flags for a param.
+                    let view = self.cast(CastKind::Bitcast, v, Width::W64);
+                    self.set_reg(Grp::Rax, view);
                 }
                 // Caller-saved registers are gone. Modelled, loudly, per register.
                 for g in CALLER_SAVED {
@@ -1332,7 +1372,10 @@ impl<'a> Lifter<'a> {
                         Ty::u64(),
                         self.addr(),
                     );
-                    self.regs.insert(g, v);
+                    // The clobber is a DEFINITION: a block whose register map
+                    // says "RCX is gone here" must say so to its successors, or
+                    // a value the call destroyed keeps flowing as if it survived.
+                    self.set_reg(g, v);
                     self.rep.clobbers += 1;
                 }
                 self.clear_flags();
@@ -1469,6 +1512,23 @@ impl<'a> Lifter<'a> {
                 self.regs.clear();
             }
             self.cur_defs.clear();
+            if i == 0 {
+                // The entry block DEFINES the registers the ABI and the frame
+                // model hand it: RCX/RDX/R8/R9 carry the four integer arguments
+                // (`Lifter::new` seeds them from `Op::Param`) and RSP is the
+                // modelled stack base. They are seeded, never written by an
+                // instruction, so nothing else marks them - and a register
+                // `block_def` does not list is invisible to the transfer
+                // function, which then hands every block after the entry the
+                // entry's INCOMING value for it: `undef`. That is the defect
+                // behind most of T2's "returns RAX unwritten" bucket - in
+                // `early_returns.O1`, `mov eax, edx` at 0x4 is the source's
+                // `return b`, and the IR read RDX as undefined.
+                for g in ARG_REGS {
+                    self.cur_defs.insert(g);
+                }
+                self.cur_defs.insert(Grp::Rsp);
+            }
             for (va, len) in b.insns.iter() {
                 self.at = *va;
                 let off = (*va).saturating_sub(base) as usize;
@@ -1614,20 +1674,53 @@ impl<'a> Lifter<'a> {
                     let undef = self.undef_val();
                     let new_in: VId = match phi {
                         Some(phi) => {
-                            // An incoming value that is the phi itself means the
-                            // value is undefined along that edge (the block does
-                            // not define the register and the edge is the loop
-                            // back edge); say so with undef, not self-reference.
-                            let pairs: Vec<(VId, BbId)> = preds
+                            let raw: Vec<VId> = preds
                                 .iter()
-                                .map(|&p| {
-                                    let v = out_val.get(&p).copied().unwrap_or(undef);
-                                    let v = if v == phi || unreach.contains(&p) {
+                                .map(|&p| out_val.get(&p).copied().unwrap_or(undef))
+                                .collect();
+                            // An incoming value that IS this phi is the honest
+                            // answer, not a placeholder to be removed: it says
+                            // the block does not write the register, so the
+                            // value the register holds on re-entry is the value
+                            // it had at the header - `phi(x, phi)`, the standard
+                            // SSA for a loop-invariant register. `prune_phis`
+                            // then drops the self edge and collapses the phi to
+                            // `copy x`, which is the value the machine carries.
+                            //
+                            // Substituting `undef` here (what this did) made
+                            // every loop that reads a register the loop body
+                            // does not write - `early_returns`' `cmp edx, r9d`,
+                            // the loop-carried RAX of `mov eax, 1` - an
+                            // undefined read, and T2 filed 16 functions under
+                            // "returns RAX unwritten on some path" for it.
+                            //
+                            // A self-reference with NO base case (every incoming
+                            // edge is the phi) is the real gap: no path into the
+                            // loop ever writes the register. That one is undef.
+                            //
+                            // And the self-reference has to be AVAILABLE, which is
+                            // the verifier's rule for a phi operand: the value
+                            // must be live at the END of its predecessor. A header
+                            // dominates its latch in a natural loop, so the edge
+                            // carries the header's own value; in an irreducible
+                            // loop it does not, and the honest answer for that
+                            // edge is `undef` - there is no value of the register
+                            // that reaches it from the header.
+                            let base = raw
+                                .iter()
+                                .zip(preds.iter())
+                                .any(|(v, p)| *v != phi && !unreach.contains(p));
+                            let pairs: Vec<(VId, BbId)> = raw
+                                .iter()
+                                .zip(preds.iter())
+                                .map(|(v, p)| {
+                                    let carried = *v == phi && base && cfg.dominates(*b, *p);
+                                    let v = if unreach.contains(p) || (*v == phi && !carried) {
                                         undef
                                     } else {
-                                        v
+                                        *v
                                     };
-                                    (v, p)
+                                    (v, *p)
                                 })
                                 .collect();
                             if let Some(ix) = self
@@ -1682,6 +1775,19 @@ impl<'a> Lifter<'a> {
                 };
                 if Some(new) == self.undef {
                     self.rep.undef_live_ins += 1;
+                    // Name the read, not just count it. The address is the
+                    // placeholder's own: `read64` stamped it with the address of
+                    // the instruction that read the register, so this line points
+                    // at the machine-code byte where the undefined value enters.
+                    let at = self
+                        .f
+                        .block(b)
+                        .instrs
+                        .iter()
+                        .find(|i| i.dest == old)
+                        .map(|i| i.addr)
+                        .unwrap_or(0);
+                    self.rep.undef_sites.push((at, gg));
                 }
                 if old != new {
                     rewrite_in_block(self.f.block_mut(b), old, new);
