@@ -20,7 +20,7 @@ use std::path::Path;
 /// The pre-emission pipeline. Flag elimination first: `Ty::Flags` has no C
 /// spelling on purpose, so a surviving flags value is a refusal, and the pass
 /// that removes it is the thing that has to run.
-fn clean(f: &mut Function) {
+pub(crate) fn clean(f: &mut Function) {
     for _ in 0..16 {
         let mut ch = false;
         ch |= rdec_core::fuse::flag_elimination(f);
@@ -38,7 +38,11 @@ fn clean(f: &mut Function) {
 
 /// One refusal key per class of gap, so the report says what to build next
 /// instead of dumping 200 sentences.
-fn key(r: &Refusal) -> String {
+///
+/// `pub` because `rdec cpp` reports the same classes for the C++ corpus: two
+/// tallying schemes would mean the two gates' "refusal class" lines are not
+/// comparable, which is the whole point of the class list.
+pub fn key(r: &Refusal) -> String {
     let s = r.reason.trim();
     // "opaque: live-in R8" and "opaque: syscall" are different work items; the
     // category alone would report 112 of one thing and hide what to build.
@@ -93,12 +97,17 @@ pub struct Subject {
     pub f: Function,
 }
 
-/// Load, discover, lift and clean every function in `files`.
+/// Load, discover, lift and clean every function in `files`, named by
+/// `name_of(object index, COFF symbol)`.
 ///
-/// This is `rdec c`'s front half, split out so `rdec t2` runs the *same*
-/// pipeline on the *same* names — a differential gate that re-derived the
-/// function list its own way would be measuring its own copy, not the corpus.
-pub fn lift_all(files: &[String]) -> Result<Vec<Subject>, String> {
+/// The naming scheme is a parameter, not a copy of the pipeline: `rdec cpp`
+/// names the C++ functions from their DEMANGLED text, and it must run the same
+/// discovery, the same lifter and the same passes as `rdec c` - a C++ gate that
+/// re-implemented the front half would be measuring its own copy.
+pub fn lift_all_named(
+    files: &[String],
+    name_of: &dyn Fn(usize, &str) -> String,
+) -> Result<Vec<Subject>, String> {
     let mut out: Vec<Subject> = Vec::new();
     for (oi, file) in files.iter().enumerate() {
         let obj = rdec_arch_x86::loader::load(Path::new(file))?;
@@ -178,7 +187,7 @@ pub fn lift_all(files: &[String]) -> Result<Vec<Subject>, String> {
                 .get(&start)
                 .cloned()
                 .unwrap_or_else(|| format!("fn_{start:x}"));
-            let name = format!("o{oi}_{}", c_ident(&raw));
+            let name = name_of(oi, &raw);
             let (mut f, _rep) = lift_one(&name, rg.bytes, rg.base, start, end, &plan, &names);
             clean(&mut f);
             out.push(Subject {
@@ -192,6 +201,18 @@ pub fn lift_all(files: &[String]) -> Result<Vec<Subject>, String> {
         }
     }
     Ok(out)
+}
+
+/// Load, discover, lift and clean every function in `files`, with the naming
+/// scheme every C gate shares.
+///
+/// This is `rdec c`'s front half, split out so `rdec t2` runs the *same*
+/// pipeline on the *same* names — a differential gate that re-derived the
+/// function list its own way would be measuring its own copy, not the corpus.
+pub fn lift_all(files: &[String]) -> Result<Vec<Subject>, String> {
+    // The `o<index>_` prefix is what makes one TU legal: the C corpus has 120
+    // objects that all define `f`.
+    lift_all_named(files, &|oi, raw| format!("o{oi}_{}", c_ident(raw)))
 }
 
 pub fn cmd_c(args: &[String]) -> Result<i32, String> {

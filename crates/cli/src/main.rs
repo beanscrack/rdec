@@ -34,6 +34,13 @@ fn main() {
                 1
             }
         },
+        "cpp" => match m8::cmd_cpp(&args) {
+            Ok(rc) => rc,
+            Err(e) => {
+                eprintln!("cpp: {e}");
+                1
+            }
+        },
         "disasm" => m1::cmd_disasm(&args),
         "c" => match m4::cmd_c(&args) {
             Ok(code) => code,
@@ -96,6 +103,9 @@ fn print_help() {
          \x20 corpus [--out DIR] [--opt O0,O2]  build the clang corpus + hashed manifest\n\
          \x20 corpus --cpp [--out DIR]         build the C++ corpus (M8, clang++ MSVC ABI)\n\
          \x20 demangle --cpp                  M8 gate: MSVC C++ names vs llvm-nm\n\
+         \x20 cpp --corpus                    M8 gate: the C++ corpus through the C\n\
+         \x20                                   pipeline - demangled names, emitted C,\n\
+         \x20                                   refusals and gaps by class\n\
          \x20 t2 [--corpus] [--limit N]        T2 differential gate: decompiled C vs\n\
          \x20                                   the machine code, same inputs, RAX\n\
          \x20 status                          roadmap section 9's table, from commands\n\
@@ -496,6 +506,42 @@ fn cmd_status() -> i32 {
         "demangle --cpp (M8: MSVC C++ names vs llvm-nm)".into(),
         dm.1.lines().last().unwrap_or("").trim().into(),
         dm.0,
+    ));
+    // M8 step 1: the C++ measurement. Like the t2 row, this REPORTS the gate's
+    // verdict and does not own it: `rdec cpp --corpus` decides its own exit
+    // code, and two owners on one gate is how a gate gets weakened.
+    let cpp_cmd: Vec<String> = if self_cmd[0] == "run" {
+        vec![
+            "run".into(),
+            "-q".into(),
+            "-p".into(),
+            "rdec-cli".into(),
+            "--".into(),
+            "cpp".into(),
+            "--corpus".into(),
+        ]
+    } else {
+        vec!["cpp".into(), "--corpus".into()]
+    };
+    let cpp = sh(&exe, &cpp_cmd);
+    let cpp_line = cpp
+        .1
+        .lines()
+        .find(|l| l.starts_with("compared:"))
+        .unwrap_or("no measurement ran")
+        .trim()
+        .to_string();
+    let cpp_verdict = cpp
+        .1
+        .lines()
+        .find(|l| l.starts_with("FAIL"))
+        .map(|l| format!("{cpp_line} | {l}"))
+        .unwrap_or_else(|| format!("{cpp_line} | gate green"));
+    rows.push((
+        "cpp --corpus (M8: C++ machine code -> demangled C; gate: rdec cpp)".into(),
+        cpp_verdict,
+        // Informational row: enforced by `rdec cpp --corpus`, which exits 1.
+        true,
     ));
     // T2 is the only row that RUNS both sides: `rdec c` proves the emitted C
     // compiles, this proves it computes the same values as the machine code.
