@@ -160,6 +160,20 @@ pub fn verify(f: &Function) -> Verdict {
 }
 
 /// SSA-specific checks.
+/// The predecessor a use site belongs to, when the use is a phi operand: the
+/// use's operand slot indexes the phi's (value, predecessor) pairs, so the edge
+/// is recoverable and the check can be made about availability, not position.
+fn phi_pred(f: &Function, u: UseSite) -> Option<BbId> {
+    if u.instr == usize::MAX {
+        return None;
+    }
+    let ins = f.block(u.bb).instrs.get(u.instr)?;
+    match &ins.op {
+        Op::Phi(pairs) => pairs.get(u.slot).map(|(_, bb)| *bb),
+        _ => None,
+    }
+}
+
 pub fn verify_ssa(f: &Function) -> Verdict {
     let mut e = Errs::default();
     let cfg = Cfg::build(f);
@@ -240,6 +254,25 @@ pub fn verify_ssa(f: &Function) -> Verdict {
             e.hard(format!("%{v} is defined in unreachable bb{dbb}"));
         }
         for u in f.uses_of(v) {
+            // A phi operand is a claim about its EDGE, not about the phi's
+            // position: the value has to be live at the END of its predecessor.
+            // Ordinary dominance (def dominates the phi's block, and is earlier
+            // in the same block) is the wrong rule here, and rejects the
+            // standard loop-carried form `%v = phi [%init, %head], [%next, %loop]`
+            // where `%next` is defined in the latch - the case a self edge makes
+            // into "defined later in this very block".
+            if let Some(pred) = phi_pred(f, u) {
+                if dbb != pred && !cfg.dominates(dbb, pred) {
+                    e.hard(format!(
+                        "%{v} defined in bb{dbb} is not available on the edge bb{pred} -> bb{}",
+                        u.bb
+                    ));
+                }
+                if !cfg.is_reachable(pred) {
+                    e.hard(format!("%{v} is a phi operand from unreachable bb{pred}"));
+                }
+                continue;
+            }
             if u.bb == dbb {
                 if u.instr != usize::MAX && u.instr <= dii {
                     e.hard(format!(

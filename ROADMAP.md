@@ -382,7 +382,61 @@ TV result depends on it.
 
 ---
 
-### M4 — Calls, signatures, UB-free C, T2 · 4–5 wk (v1: 3)
+#### M3 step 1 - measured (2026-11-02)
+
+SSA construction over the lifted CFG: register live-ins captured per block, phi
+inserted at joins and at back-edge-only headers, incoming values solved to a fixed
+point over the CFG edges, live-in placeholders rewritten inside the reading block.
+
+```
+lift: 120 objects, 141 functions lifted, 141 pass verify_ssa, 63 with no gaps and no exits
+evidence: 153 loud gaps, 64 Exit terminators, 17 unnamed call targets, 153 modelled register clobbers, 18 unreachable blocks dropped
+interp: 115 returned, 25 ended at Exit, 0 hit the step budget, 141 reached an unmodelled op, 0 unmodelled loads, 1 arithmetic fault, 0 used a value that is never defined
+OK: every lifted function is structurally valid IR
+```
+
+101 -> 141 valid IR. The 40 M2 failures were one class: a register read in a block
+whose value comes from several predecessors, with no phi to merge them.
+
+What the two checks establish, and what they do not:
+
+- `verify_ssa` is structural - phi/edge agreement, dominance, phi-prefix form,
+  operand types.
+- The interpreter run is semantic about *definedness and control flow*: it consumes
+  every operand strictly, so a dangling rename, a phi pointing at a value not live
+  on its edge, or an unrewritten register placeholder faults loudly. 0 holes over
+  141 functions. It says nothing yet about whether the *values* match x86 - that is
+  T2's job at M4.
+- 141 "reached an unmodelled op" is the flags-clobber `Opaque` at calls: every
+  function that calls something reads it. Expected at this milestone.
+- 18 unreachable blocks dropped, each counted as a gap: code discovery found, whose
+  only entry is an indirect jump (M5). The bytes are in the object; the CFG we built
+  cannot reach them. Emptied and counted, not left as dead defs.
+
+Three verifier/lifter rules this milestone forced, each because the gate said so:
+
+- **A phi operand is availability on its edge, not dominance of the phi.** The old
+  rule rejected the standard loop-carried `%v = phi [%init, %head], [%next, %latch]`
+  where `%next` is defined in the latch, and a self edge made it "defined later in
+  this very block". The check now asks: defined in the predecessor, or in a block
+  dominating the predecessor. (The use site's operand slot identifies the pair, so
+  the edge is recoverable - no new IR metadata was needed.)
+- **`undef` needs a legal home.** A block with no predecessors has no incoming
+  value; the entry block is the only placement that dominates every use, it must
+  sit after the phi prefix, and it must be placed at the end of the pass - emitted
+  eagerly it lands after the instructions that use it, which the program-order rule
+  correctly rejects.
+- **A definition in an unreachable block is a defect, not a detail.** Clearing such
+  a block removes its edges, so the CFG used for phi placement must be rebuilt after
+  clearing; phis built from the old predecessor list do not match the verifier's.
+
+Process rule this milestone caught, the hard way: three patches applied with plain
+string replacement, against a remembered file shape, silently matched nothing and
+left the gate printing counters it never computed (all zeros, one wrapped negative).
+Every patch in this repo now asserts its anchor matches exactly once.
+
+
+## M4 — Calls, signatures, UB-free C, T2 · 4–5 wk (v1: 3)
 
 - Call lifting: arguments and returns per ABI, clobbers, stack arguments, SysV
   varargs (`al`), Win64 shadow space. v1 limited M4 to leaf functions, but most

@@ -21,7 +21,7 @@
 //! Block boundaries come from `discover`, so the lifter never invents one that
 //! the decoder and the descent did not prove.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use iced_x86::{Decoder, Instruction, Mnemonic, OpKind, Register};
 use rdec_core::ir::{
@@ -129,6 +129,27 @@ fn split(reg: Register) -> Option<(Grp, Width)> {
     };
     Some((g, w))
 }
+
+/// Every modelled register, in a fixed order: the SSA pass walks registers in
+/// this order, which is what makes the emitted phi order deterministic.
+const GRPS: [Grp; 16] = [
+    Grp::Rax,
+    Grp::Rcx,
+    Grp::Rdx,
+    Grp::Rbx,
+    Grp::Rsp,
+    Grp::Rbp,
+    Grp::Rsi,
+    Grp::Rdi,
+    Grp::R8,
+    Grp::R9,
+    Grp::R10,
+    Grp::R11,
+    Grp::R12,
+    Grp::R13,
+    Grp::R14,
+    Grp::R15,
+];
 
 fn ty_u(w: Width) -> Ty {
     Ty::uint(w)
@@ -265,6 +286,8 @@ pub struct Report {
     pub exits: usize,
     /// Calls whose target we could not name from the symbol table.
     pub unnamed_calls: usize,
+    /// Blocks the entry cannot reach; their lifted contents dropped, counted.
+    pub unreachable_blocks: usize,
 }
 
 pub struct Lifter<'a> {
@@ -280,6 +303,20 @@ pub struct Lifter<'a> {
     /// unattributable.
     at: u64,
     pending: Pending,
+    /// (block, register, placeholder) for every register a block READ before
+    /// writing. These are the live-ins that become phis in `ssa_registers`.
+    live_in: Vec<(BbId, Grp, VId)>,
+    /// The register map at the end of each block, and which registers the block
+    /// wrote. Together they are the transfer function the SSA pass solves.
+    block_out: HashMap<BbId, HashMap<Grp, VId>>,
+    block_def: HashMap<BbId, HashSet<Grp>>,
+    cur_defs: HashSet<Grp>,
+    /// One `undef` value, defined in the entry block, used for every
+    /// "no path reaches this edge" slot. Defining it once in the entry block is
+    /// the only placement that dominates every use: a phi's incoming value for
+    /// an edge from an unreachable block cannot be defined in that block, and a
+    /// non-phi instruction before a phi is a structural error.
+    undef: Option<VId>,
     pub rep: Report,
     names: &'a HashMap<u64, String>,
     fmt: Box<dyn iced_x86::Formatter>,
@@ -317,6 +354,11 @@ impl<'a> Lifter<'a> {
             cur: entry,
             at: addr,
             pending: Pending::Fall,
+            live_in: Vec::new(),
+            block_out: HashMap::new(),
+            block_def: HashMap::new(),
+            cur_defs: HashSet::new(),
+            undef: None,
             rep: Report::default(),
             names,
             fmt: crate::decode::formatter(crate::decode::Syntax::Intel),
@@ -339,6 +381,42 @@ impl<'a> Lifter<'a> {
         self.at
     }
 
+    /// The id of the shared `undef` value. The value is allocated here and its
+    /// instruction is placed only by `place_undef`, at the end of the pass: an
+    /// `undef` emitted eagerly lands after the instructions that use it, and the
+    /// verifier's program-order rule is right to reject that.
+    fn undef_val(&mut self) -> VId {
+        if let Some(v) = self.undef {
+            return v;
+        }
+        let v = self.f.new_value(Ty::u64());
+        self.undef = Some(v);
+        v
+    }
+
+    /// Put the shared `undef` in the entry block, after its phi prefix: entry
+    /// dominates every reachable use, the phi-prefix rule forbids putting it
+    /// first, and no reachable use can precede it.
+    fn place_undef(&mut self) {
+        let Some(v) = self.undef else { return };
+        if self.f.def(v).is_some() {
+            return;
+        }
+        let entry = self.f.entry;
+        let a = self.f.block(entry).addr;
+        let pos = self
+            .f
+            .block(entry)
+            .instrs
+            .iter()
+            .take_while(|i| matches!(i.op, Op::Phi(_)))
+            .count();
+        self.f
+            .block_mut(entry)
+            .instrs
+            .insert(pos, Instr::new(v, Op::Undef, Ty::u64(), a));
+    }
+
     fn gap(&mut self, why: &str, ty: Ty) -> VId {
         self.rep.gaps += 1;
         self.f.emit(
@@ -353,7 +431,16 @@ impl<'a> Lifter<'a> {
         if let Some(v) = self.regs.get(&g) {
             return *v;
         }
-        let v = self.f.emit(self.cur, Op::Undef, Ty::u64(), self.addr());
+        // A register read before being written in this block is a LIVE-IN, not
+        // undefined: the value comes in along a CFG edge. `ssa_registers`
+        // replaces the placeholder with the incoming value, or a phi at a join.
+        let v = self.f.emit(
+            self.cur,
+            Op::Opaque(format!("live-in {g:?}").into()),
+            Ty::u64(),
+            self.addr(),
+        );
+        self.live_in.push((self.cur, g, v));
         self.regs.insert(g, v);
         v
     }
@@ -383,6 +470,7 @@ impl<'a> Lifter<'a> {
             }
         };
         self.regs.insert(g, v64);
+        self.cur_defs.insert(g);
     }
 
     fn bin(&mut self, op: BinOp, a: VId, b: VId) -> VId {
@@ -1189,6 +1277,14 @@ impl<'a> Lifter<'a> {
             };
             self.cur = id;
             self.pending = Pending::Fall;
+            if i > 0 {
+                // Each block starts with an EMPTY register map. Carrying the map
+                // over in address order (the first version) is what produced
+                // uses that no dominating def reached: the value was defined in
+                // a block that is not the predecessor, and no phi existed.
+                self.regs.clear();
+            }
+            self.cur_defs.clear();
             for (va, len) in b.insns.iter() {
                 self.at = *va;
                 let off = (*va).saturating_sub(base) as usize;
@@ -1213,10 +1309,178 @@ impl<'a> Lifter<'a> {
                 }
             }
             self.close(i);
+            self.block_out.insert(id, self.regs.clone());
+            self.block_def.insert(id, self.cur_defs.clone());
         }
+        self.ssa_registers();
         // Take, do not move: the caller reads `rep` after this returns, and a
         // report snapshotted before lifting would always claim zero gaps.
         std::mem::replace(&mut self.f, Function::new("", 0))
+    }
+
+    /// Turn the per-block register transfer into SSA: phi at joins and at
+    /// back-edge-only headers, incoming values solved to a fixed point over the
+    /// CFG edges, live-in placeholders rewritten inside the block that read them.
+    fn ssa_registers(&mut self) {
+        // Blocks the entry cannot reach. Their instructions - every def in them -
+        // are lifted artifacts the CFG says no path executes, and the verifier
+        // rejects a definition in an unreachable block, correctly. Empty them,
+        // exit loudly, count each: the bytes exist in the object, and reaching
+        // them is a discovery/structuring question (M5), not a thing to hide by
+        // leaving dead defs in the IR.
+        let first = rdec_core::cfg::Cfg::build(&self.f);
+        let unreach: HashSet<BbId> = first.unreachable().into_iter().collect();
+        for i in 0..self.f.blocks.len() {
+            let id = self.f.blocks[i].id;
+            if !unreach.contains(&id) {
+                continue;
+            }
+            let n = self.f.block(id).instrs.len();
+            self.rep.gaps += 1;
+            self.rep.unreachable_blocks += 1;
+            self.f.block_mut(id).instrs.clear();
+            self.f.block_mut(id).term = Terminator::Exit;
+            if n > 0 {
+                eprintln!(
+                    "unreachable bb{id} in {}: {n} lifted instructions dropped",
+                    self.f.name
+                );
+            }
+        }
+        // The CFG *after* the clearing: an emptied block exits, so its edges are
+        // gone, and a phi built from the old predecessor list would not match the
+        // verifier's. Every decision below uses this CFG.
+        let cfg = rdec_core::cfg::Cfg::build(&self.f);
+        let all: Vec<BbId> = self.f.blocks.iter().map(|b| b.id).collect();
+        let reachable: Vec<BbId> = all
+            .iter()
+            .copied()
+            .filter(|b| !unreach.contains(b))
+            .collect();
+
+        for &g in GRPS.iter() {
+            // Where a phi is needed for this register.
+            let mut readers: HashSet<BbId> = HashSet::new();
+            for &(b, gg, _) in self.live_in.iter() {
+                if gg == g {
+                    readers.insert(b);
+                }
+            }
+            let mut phi_of: HashMap<BbId, VId> = HashMap::new();
+            for b in &reachable {
+                let preds = cfg.preds[*b as usize].clone();
+                // A join has >= 2 incoming edges. A single predecessor that this
+                // block dominates is a back edge - a loop header whose only in
+                // edge is the latch - and a value defined in the latch does not
+                // dominate the header, so that edge needs a phi too.
+                let back = preds.len() == 1 && cfg.dominates(*b, preds[0]);
+                if preds.len() < 2 && !back {
+                    continue;
+                }
+                // Only where the register is actually read at a start point:
+                // here, or at the start of a successor.
+                let needed = readers.contains(b)
+                    || first
+                        .preds
+                        .iter()
+                        .enumerate()
+                        .any(|(p, ps)| ps.contains(b) && readers.contains(&(p as BbId)));
+                if !needed {
+                    continue;
+                }
+                let undef = self.undef_val();
+                let pairs: Vec<(VId, BbId)> = preds.iter().map(|&p| (undef, p)).collect();
+                let v = self.f.new_value(Ty::u64());
+                let addr = self.f.block(*b).addr;
+                self.f.block_mut(*b).instrs.insert(
+                    0,
+                    Instr::new(v, Op::Phi(pairs.into_boxed_slice()), Ty::u64(), addr),
+                );
+                phi_of.insert(*b, v);
+            }
+            // Solve in/out to a fixed point over the edges.
+            let mut in_val: HashMap<BbId, VId> = HashMap::new();
+            let mut out_val: HashMap<BbId, VId> = HashMap::new();
+            for round in 0..64usize {
+                let mut changed = false;
+                for b in &reachable {
+                    let preds = cfg.preds[*b as usize].clone();
+                    let phi = phi_of.get(b).copied();
+                    let undef = self.undef_val();
+                    let new_in: VId = match phi {
+                        Some(phi) => {
+                            // An incoming value that is the phi itself means the
+                            // value is undefined along that edge (the block does
+                            // not define the register and the edge is the loop
+                            // back edge); say so with undef, not self-reference.
+                            let pairs: Vec<(VId, BbId)> = preds
+                                .iter()
+                                .map(|&p| {
+                                    let v = out_val.get(&p).copied().unwrap_or(undef);
+                                    let v = if v == phi || unreach.contains(&p) {
+                                        undef
+                                    } else {
+                                        v
+                                    };
+                                    (v, p)
+                                })
+                                .collect();
+                            if let Some(ix) = self
+                                .f
+                                .block_mut(*b)
+                                .instrs
+                                .iter()
+                                .position(|i| i.dest == phi && matches!(i.op, Op::Phi(_)))
+                            {
+                                if let Op::Phi(old) = &mut self.f.block_mut(*b).instrs[ix].op {
+                                    if old.to_vec() != pairs {
+                                        *old = pairs.into_boxed_slice();
+                                        changed = true;
+                                    }
+                                }
+                            }
+                            phi
+                        }
+                        None if preds.is_empty() => undef,
+                        None => {
+                            let p = preds[0];
+                            out_val.get(&p).copied().unwrap_or(undef)
+                        }
+                    };
+                    if in_val.get(b).copied() != Some(new_in) {
+                        in_val.insert(*b, new_in);
+                        changed = true;
+                    }
+                    let o = match (self.block_def.get(b), self.block_out.get(b)) {
+                        (Some(d), Some(m)) if d.contains(&g) => m[&g],
+                        _ => new_in,
+                    };
+                    if out_val.get(b).copied() != Some(o) {
+                        out_val.insert(*b, o);
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    break;
+                }
+                if round == 63 {
+                    self.rep.gaps += 1;
+                    eprintln!("SSA: fixed point not reached for {g:?} in {}", self.f.name);
+                }
+            }
+            for (b, gg, old) in self.live_in.clone() {
+                if gg != g {
+                    continue;
+                }
+                let Some(new) = in_val.get(&b).copied() else {
+                    continue;
+                };
+                if old != new {
+                    rewrite_in_block(self.f.block_mut(b), old, new);
+                }
+            }
+        }
+        self.place_undef();
     }
 
     /// A block's terminator, from what its last instruction said.
@@ -1283,4 +1547,86 @@ pub fn lift_one(
     let f = l.lift_function(bytes, base, &blocks);
     let rep = l.rep.clone();
     (f, rep)
+}
+
+/// Replace uses of `old` with `new` inside ONE block, instructions and
+/// terminator. A global replace would be wrong: `old` is the live-in value of
+/// this block, and other blocks legitimately name the same incoming value.
+fn rewrite_in_block(b: &mut rdec_core::ir::Block, old: VId, new: VId) {
+    for i in b.instrs.iter_mut() {
+        if i.dest == old {
+            continue;
+        }
+        rewrite_op(&mut i.op, old, new);
+    }
+    rewrite_term(&mut b.term, old, new);
+}
+
+fn map(v: VId, old: VId, new: VId) -> VId {
+    if v == old {
+        new
+    } else {
+        v
+    }
+}
+
+fn rewrite_op(op: &mut Op, old: VId, new: VId) {
+    match op {
+        Op::Copy(a) => *a = map(*a, old, new),
+        Op::Bin(_, a, b) | Op::Cmp(_, a, b) => {
+            *a = map(*a, old, new);
+            *b = map(*b, old, new);
+        }
+        Op::Un(_, a) | Op::Cast(_, _, a) | Op::Load(_, a) | Op::GetFlag(_, a) => {
+            *a = map(*a, old, new);
+        }
+        Op::Store(_, a, v) => {
+            *a = map(*a, old, new);
+            *v = map(*v, old, new);
+        }
+        Op::Select(c, t, f) => {
+            *c = map(*c, old, new);
+            *t = map(*t, old, new);
+            *f = map(*f, old, new);
+        }
+        Op::Phi(pairs) => {
+            for (v, _) in pairs.iter_mut() {
+                *v = map(*v, old, new);
+            }
+        }
+        Op::Call { args, .. } => {
+            for a in args.iter_mut() {
+                *a = map(*a, old, new);
+            }
+        }
+        Op::Flags(f) => rewrite_flags(f, old, new),
+        Op::Const(_) | Op::ConstF(_) | Op::Undef | Op::Param | Op::Opaque(_) => {}
+    }
+}
+
+fn rewrite_flags(f: &mut FlagsOp, old: VId, new: VId) {
+    let m = |v: &mut VId| *v = map(*v, old, new);
+    match f {
+        FlagsOp::Add { a, b, .. }
+        | FlagsOp::Sub { a, b, .. }
+        | FlagsOp::And { a, b }
+        | FlagsOp::Or { a, b }
+        | FlagsOp::Xor { a, b }
+        | FlagsOp::Shl { a, b }
+        | FlagsOp::Shr { a, b }
+        | FlagsOp::Sar { a, b }
+        | FlagsOp::Mul { a, b, .. } => {
+            m(a);
+            m(b);
+        }
+        FlagsOp::Neg { a } | FlagsOp::Inc { a } | FlagsOp::Dec { a } => m(a),
+    }
+}
+
+fn rewrite_term(t: &mut Terminator, old: VId, new: VId) {
+    match t {
+        Terminator::Return(v) => *v = map(*v, old, new),
+        Terminator::Branch { cond, .. } => *cond = map(*cond, old, new),
+        Terminator::Jump(_) | Terminator::Unreachable | Terminator::Exit => {}
+    }
 }

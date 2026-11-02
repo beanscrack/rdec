@@ -688,6 +688,10 @@ pub fn cmd_lift(args: &[String]) -> Result<i32, String> {
     let mut exit_total = 0usize;
     let mut unnamed_total = 0usize;
     let mut clobber_total = 0usize;
+    let mut unreach_total = 0usize;
+    let (mut ret_n, mut no_ret, mut step_budget, mut holes, mut unmodeled_load, mut fault) =
+        (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+    let mut opaque = 0usize;
     let mut first_bad: Option<String> = None;
     let mut first_gappy: Option<String> = None;
     let mut budget = limit;
@@ -785,6 +789,38 @@ pub fn cmd_lift(args: &[String]) -> Result<i32, String> {
             exit_total += rep.exits;
             unnamed_total += rep.unnamed_calls;
             clobber_total += rep.clobbers;
+            unreach_total += rep.unreachable_blocks;
+            // M3's semantic check, on top of the structural one: run the IR
+            // interpreter over the lifted function. It is strict - every operand
+            // it consumes must already be defined - so a renaming that leaves a
+            // dangling reference, a phi wired to a value that is not live on that
+            // edge, or a register placeholder that never got rewritten all surface
+            // as a fault that the structural verifier's rules cannot express.
+            let ex = rdec_core::interp::run_budget(&f, &[], 20000);
+            match &ex.outcome {
+                rdec_core::interp::Outcome::Ret(_) => ret_n += 1,
+                rdec_core::interp::Outcome::NoReturn => no_ret += 1,
+                rdec_core::interp::Outcome::Budget => step_budget += 1,
+                rdec_core::interp::Outcome::Fault(ft) => match ft {
+                    rdec_core::interp::Fault::MissingOperand(v) => {
+                        holes += 1;
+                        if first_bad.is_none() {
+                            first_bad = Some(format!(
+                                "{file} :: {name}: the interpreter uses %{v}, which nothing defines"
+                            ));
+                        }
+                    }
+                    rdec_core::interp::Fault::UnmodeledLoad => unmodeled_load += 1,
+                    _ => fault += 1,
+                },
+            }
+            if ex
+                .effects
+                .iter()
+                .any(|e| matches!(e, rdec_core::interp::Effect::Opaque(_)))
+            {
+                opaque += 1;
+            }
             match verify_ssa(&f) {
                 Ok(()) => verified += 1,
                 Err(errs) => {
@@ -812,10 +848,17 @@ pub fn cmd_lift(args: &[String]) -> Result<i32, String> {
         "lift: {objects} objects, {lifted} functions lifted, {verified} pass verify_ssa, {clean} with no gaps and no exits"
     );
     println!(
-        "evidence: {gap_total} loud gaps, {exit_total} Exit terminators, {unnamed_total} unnamed call targets, {clobber_total} modelled register clobbers"
+        "evidence: {gap_total} loud gaps, {exit_total} Exit terminators, {unnamed_total} unnamed call targets, {clobber_total} modelled register clobbers, {unreach_total} unreachable blocks dropped"
+    );
+    println!(
+        "interp: {ret_n} returned, {no_ret} ended at Exit, {step_budget} hit the step budget, {opaque} reached an unmodelled op, {unmodeled_load} unmodelled loads, {fault} arithmetic faults, {holes} used a value that is never defined"
     );
     if let Some(b) = first_bad {
         println!("first verifier rejection: {b}");
+    }
+    if holes > 0 {
+        println!("FAIL: {holes} lifted functions reference a value they never define");
+        return Ok(1);
     }
     if let Some(g) = &first_gappy {
         println!("first function with gaps: {g}");
