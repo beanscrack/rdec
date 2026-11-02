@@ -1362,3 +1362,33 @@ The honest headline: the decompiler has three closed structural gates (decode, l
 SSA), a differential that proves returned values on 64/141 C functions and 27/78 C++
 functions with zero mismatches, and no structuring pass — so what it emits is correct
 where it is correct, and unreadable everywhere.
+
+### M8 step 4 - the float ABI, measured (`b60538e`, `0b4b2dd`)
+
+| gate | verdict |
+|---|---|
+| `rdec cpp --corpus` | emitted C **62**, refused 16, clang -Werror OK; the four float C++ functions (`Circle::Circle(double)`, `grow`, `radius`, `fl`) now EMIT |
+| `rdec t2 --cpp` | compared **688** / match **688** / **mismatch 0**; classes RAX 15 (360 runs) + WINDOW 12 (288) + **XMM0 5 (40 runs: 4 F64 at 64 bits, 1 F32 at its 32)**; buckets sum to 78 |
+| `rdec t2 --corpus` | unchanged: 1364 / 1364 / 0, 4 faults |
+| `c` / `lift` / `objdump-check` / `demangle` | 84/57/0 · 141/141 · 124/124 · 68/68 · 127 tests · clippy + fmt clean |
+
+The machine fact that took five mismatches to find: **Windows x64 homes parameter position
+`k` in the register PAIR that owns `RCX/RDX/R8/R9[k]` AND `XMM0-3[k]`** — so a member's
+first `float`/`double` arrives in **XMM1** (`this` takes pair 0 in both classes), and a
+free `double fip(int,double)` callee opens `movsd %xmm1,0x8(%rsp)` for the same reason.
+Proof in the commit: `llvm-objdump -d` of the harness's own driver, where the padded
+prototype put the real argument in XMM2 and the callee read its pair-owning XMM1 = 0.0.
+
+**New named gap, latent, not yet a miscompile because the corpus has no witness:** the
+lifter seeds *free*-function float parameters per register CLASS (`int f(int,double)` ->
+XMM0) while clang's caller and callee home that `double` in **XMM1** by the pair rule.
+`xmm_home_mismatch` in the T2 harness converts any such disagreement into a NAMED
+exclusion (0 corpus functions hit it today) so it cannot masquerade as a mismatch.
+Closing it is a lifter change (seed free floats by pair position) plus a corpus witness —
+the corpus generator must grow an `int f(int a, double b)` fixture, and the gate must be
+red before the fix and green after.
+
+**Attribution, kept straight:** the parent's second hypothesis (the two sides preloading
+different `this` images) was DISPROVED, not fixed — the machine answers equal `W[j][0]`
+bit-for-bit on all five rows and the C answers are `W[j][0] + p`, which rounds to exactly
+`p` where `W[j][0]` is tiny. One bug, not two. The disproof is in the commit message.
