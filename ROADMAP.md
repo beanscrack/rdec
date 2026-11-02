@@ -589,18 +589,25 @@ Two things this step made explicit, both from the gate rather than from reading:
   function entry is the ABI question ("is r8 an argument here?"), not a dataflow
   one. The number is in the gate's evidence line so it cannot be forgotten.
 
-Largest refusal class now: **37 flags values surviving elimination** - flags that
-are live across a join. The flags value gets a phi over `Ty::Flags`, and
-`fuse::flag_elimination` cannot fold a `GetFlag` of a phi, so the shape is:
+Largest refusal class now: **37 flags values surviving elimination**. My first
+explanation - flags merged by a phi at a join - was **wrong**, and gates killed it
+twice: the verifier rejected the hand-built fixture (`%5 has Flags type from a
+non-Flags op`: nothing in this IR merges a flags value, by design), and the test I
+wrote for the fix failed on the premise, not on the code. The pass and its tests
+were deleted; the diagnosis that survives is in `docs/m4-flags.md`:
 
-    GetFlag(ZF, phi[(flags_a, p1), (flags_b, p2)])
+the lifter reads **all five flag bits** for a `jcc` (defensively), the branch uses
+`SF`/`OF` only, and fusion rewrites the root's cone - so the `Flags` value stays
+partially consumed and the pass correctly refuses to half-rewrite it. DCE cannot
+clear the unused reads first, because deleting an unused `getflag` is not
+semantics-preserving here: the interpreter evaluates every instruction it reaches
+and reading a flag the model calls undefined is a fault, so removal can turn a
+faulting execution into a returning one - TV would report DCE as changing meaning.
 
-The fix is a named, local pass - push `GetFlag` through the phi:
-
-    phi[(GetFlag(ZF, flags_a), p1), (GetFlag(ZF, flags_b), p2)]
-
-so each `GetFlag` sits on a direct producer that folds into a comparison, and the
-phi ends up over bools, which C can spell. That is M4 step 3.
+M4 step 3 is therefore: fold **per flags value, not per root cone** - rewrite every
+read of a flags value in one step - while preserving the definedness story (T1 is
+the oracle for which bits an operation leaves defined). The measure is the refusal
+count: 37 of 87 today.
 
 
 ## M5 — Control-flow structuring · 4–5 wk
