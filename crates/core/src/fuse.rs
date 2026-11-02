@@ -84,6 +84,15 @@ impl SB {
         let t = self.ty.clone();
         self.push(SO::Const(v), t)
     }
+    /// A constant flag value. Flag positions are Bool - returning an integer
+    /// constant here is what made `xor(bool, uint32_t 0)` and the verifier
+    /// rejected the function ("mixes widths W1 and W32").
+    fn const_false(&mut self) -> Tm {
+        self.push(SO::Const(0), Ty::Bool)
+    }
+    fn const_true(&mut self) -> Tm {
+        self.push(SO::Const(1), Ty::Bool)
+    }
     /// Pin the working width before emitting a lowering for a flags operation.
     pub fn set_ty(&mut self, t: Ty) {
         if !t.is_bool() {
@@ -518,7 +527,7 @@ fn exact_flag(sb: &mut SB, ctx: &Ctx, fl: Flag) -> Tm {
                 // AF = bit 4 of (a XOR b XOR result)
                 let bb = match ctx.op {
                     FlagsOp::Add { .. } | FlagsOp::Sub { .. } => b,
-                    _ => sb.c(1),
+                    _ => sb.const_true(),
                 };
                 let x = sb.bin(BinOp::Xor, a, r, t.clone());
                 let y = sb.bin(BinOp::Xor, x, bb, t.clone());
@@ -547,7 +556,7 @@ fn exact_flag(sb: &mut SB, ctx: &Ctx, fl: Flag) -> Tm {
             FlagsOp::Add { carry: true, .. } => sb.cmp(IntCmp::Ule, r, a),
             FlagsOp::Sub { borrow: false, .. } => sb.cmp(IntCmp::Ult, a, b),
             FlagsOp::Sub { borrow: true, .. } => sb.cmp(IntCmp::Ule, a, b),
-            FlagsOp::And { .. } | FlagsOp::Or { .. } | FlagsOp::Xor { .. } => sb.c(0),
+            FlagsOp::And { .. } | FlagsOp::Or { .. } | FlagsOp::Xor { .. } => sb.const_false(),
             FlagsOp::Neg { .. } => {
                 let z = sb.c(0);
                 sb.cmp(IntCmp::Ne, a, z)
@@ -600,7 +609,7 @@ fn exact_flag(sb: &mut SB, ctx: &Ctx, fl: Flag) -> Tm {
                 let imin = sb.c(sign);
                 sb.cmp(IntCmp::Eq, a, imin)
             }
-            FlagsOp::And { .. } | FlagsOp::Or { .. } | FlagsOp::Xor { .. } => sb.c(0),
+            FlagsOp::And { .. } | FlagsOp::Or { .. } | FlagsOp::Xor { .. } => sb.const_false(),
             FlagsOp::Mul { signed, .. } => mul_overflow(sb, ctx, signed),
             FlagsOp::Shl { .. } | FlagsOp::Shr { .. } | FlagsOp::Sar { .. } => {
                 match ctx.count {
@@ -615,7 +624,7 @@ fn exact_flag(sb: &mut SB, ctx: &Ctx, fl: Flag) -> Tm {
                             // OF = MSB of the original operand
                             sb.bit(a, w - 1, t.clone())
                         }
-                        _ => sb.c(0), // SDM: SAR by 1 clears OF
+                        _ => sb.const_false(), // SDM: SAR by 1 clears OF
                     },
                     _ => sb.opaque("OF after a shift by a count other than 1 is undefined"),
                 }
