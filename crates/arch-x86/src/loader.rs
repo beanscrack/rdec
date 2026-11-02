@@ -106,10 +106,15 @@ fn short_z(raw: &[u8]) -> String {
 
 fn name_from_short(raw: &[u8], strings: &[u8]) -> String {
     if raw[..4].iter().all(|&x| x == 0) {
-        // Long name: a 4-byte offset into the string table.
+        // Long name: a 4-byte offset into the string table. COFF offsets are
+        // relative to the table START (the 4-byte size field occupies offset
+        // 0..4), while `strings` is the table BODY - subtract 4.
+        // (Measured on clang MSVC-ABI objects: the first entry lives at
+        // offset 4; without the subtraction every long name printed
+        // 4 characters short, e.g. `ircle@@QEAA@N@Z`.)
         let off = u32le(raw, 4) as usize;
         return strings
-            .get(off..)
+            .get(off.saturating_sub(4)..)
             .map(short_z)
             .unwrap_or_else(|| "?".to_string());
     }
