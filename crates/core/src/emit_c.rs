@@ -176,11 +176,16 @@ impl<'a> Emitter<'a> {
         let _ = write!(self.body, "{ret} {}(", self.f.name);
         let n = self.f.params.len().max(1);
         for i in 0..n {
+            // The DECLARED type wins: a Windows x64 float parameter is a bit
+            // cell in the IR (Ty::u64, one W64 word per register) and a
+            // `double`/`float` in C. The assignment at the `Op::Param` moves
+            // bits through the memcpy helpers, never a value conversion.
             let t = self
                 .f
-                .params
+                .param_tys
                 .get(i)
-                .map(|v| self.f.ty_of(*v).unwrap_or(Ty::u64()))
+                .cloned()
+                .or_else(|| self.f.params.get(i).and_then(|v| self.f.ty_of(*v)))
                 .unwrap_or(Ty::u64());
             let _ = write!(self.body, "{t}", t = c_ty(&t).unwrap_or("int64_t".into()));
             let _ = write!(self.body, " a{i} __attribute__((unused))");
@@ -473,7 +478,20 @@ impl<'a> Emitter<'a> {
             // undefined, the C has to be a number, and a comment on the same line
             // is where the difference lives.
             Op::Undef => Some("/* undef */ 0".into()),
-            Op::Param => Some(format!("a{}", param_index(self.f, v).unwrap_or(0))),
+            Op::Param => {
+                // A parameter declared `float`/`double` is a BIT CELL in the
+                // IR: the assignment reinterprets the C argument's bits
+                // (memcpy), it does not convert its value. `(uint64_t)d`
+                // truncates toward zero and answers a different number -- the
+                // memcpy helpers are the guard, the same pair the float
+                // Load/Store arms use for `movsd`/`movss`.
+                let i = param_index(self.f, v).unwrap_or(0);
+                match self.f.param_tys.get(i) {
+                    Some(Ty::Float { w: FWidth::F64 }) => Some(format!("rdec_f64_bits(a{i})")),
+                    Some(Ty::Float { w: FWidth::F32 }) => Some(format!("rdec_f32_bits(a{i})")),
+                    _ => Some(format!("a{i}")),
+                }
+            }
             Op::Copy(s) => Some(self.use_(*s)),
             Op::Bin(o, a, b) => match self.bin(*o, *a, *b, &ty, at) {
                 Some(s) => Some(s),

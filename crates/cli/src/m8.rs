@@ -761,6 +761,261 @@ pub fn cpp_ident(text: &str) -> String {
     name
 }
 
+// ---------------------------------------------------------------------------
+// Signature -> ABI shape. THE EVIDENCE IS THE DECORATED NAME.
+// ---------------------------------------------------------------------------
+//
+// Windows x64 splits arguments by register class: integer parameters consume
+// RCX/RDX/R8/R9, float parameters consume XMM0-3, and a float argument does
+// NOT consume an integer slot. To seed that, the lifter needs the parameter
+// kinds per function — and the only per-function type evidence a linker-
+// visible symbol carries is its decoration: `?grow@Circle@@QEAANN@Z` decodes
+// to `double Circle::grow(double)`, which states the parameter and the return.
+// A C symbol (`add`) states nothing, so C subjects keep the integer model.
+//
+// This is symbol-derived evidence, NOT inference from behaviour: the kinds are
+// read from the demangled text before a byte of code is lifted, and a gate that
+// agreed with the code would agree by construction. A signature the demangler
+// cannot fully type — by-value struct, `long double`, pointer parameters the
+// model must pass by integer register, a parameter list over the register
+// budget — yields `gap`/`None`: the subject keeps the integer model and the
+// pipeline COUNTS and NAMES it. Nothing is guessed.
+//
+// The type spellings are parsed from the demangled TEXT (the demangler exposes
+// `text` + `kind`, not a type list; `rdec t2` already classifies signatures
+// from that same text for the RAX/window classes — this reads types from the
+// same string, so the two classifiers cannot disagree about a spelling).
+
+/// Builtin integer spellings as the demangler prints them (MSVC: `long` is
+/// 32-bit, `__int64` is 64). Shared with the T2 classifier.
+pub const INT_TYPE_SPELLINGS: &[&str] = &[
+    "bool",
+    "char",
+    "signed char",
+    "unsigned char",
+    "short",
+    "unsigned short",
+    "int",
+    "unsigned int",
+    "unsigned",
+    "long",
+    "unsigned long",
+    "long long",
+    "unsigned long long",
+    "__int64",
+    "unsigned __int64",
+    "wchar_t",
+];
+
+pub fn is_int_spelling(t: &str) -> bool {
+    let t = t.split_whitespace().collect::<Vec<_>>().join(" ");
+    INT_TYPE_SPELLINGS.contains(&t.as_str())
+}
+
+/// The demangled text's `(return, parameters)`: `"int add(int, int)"` ->
+/// `("int", ["int","int"])`. The demangler prints parameters without names,
+/// so a comma split is the whole parse for the supported set.
+///
+/// The name is peeled from the END of the head, not by dropping the last
+/// whitespace token, because a declarator spells the return type against the
+/// name: `void *f(int)` returns `void *`. Dropping the token reads that head as
+/// a name with NO return type, which is the constructor's shape — and a
+/// pointer-returning function then keeps a typed shape it has not earned. Same
+/// for `int *f`, `int& f`, and the qualified `double Circle::grow`: peel the
+/// trailing identifier, the `~` of a destructor, and each `Class::` segment in
+/// front of it; what is left is the return type (`""` for a ctor/dtor, which
+/// declare none).
+pub fn split_signature(text: &str) -> Option<(String, Vec<String>)> {
+    let open = text.find('(')?;
+    let close = text.rfind(')')?;
+    if close < open {
+        return None;
+    }
+    let head = text[..open].trim_end();
+    let params_s = text[open + 1..close].trim();
+    let ret = return_type_of_head(head);
+    let params = if params_s.is_empty() || params_s == "void" {
+        Vec::new()
+    } else {
+        params_s.split(',').map(|p| p.trim().to_string()).collect()
+    };
+    Some((ret, params))
+}
+
+/// The head's return type: the head minus the trailing name. See
+/// [`split_signature`] for why this is a peel and not a token drop.
+pub fn return_type_of_head(head: &str) -> String {
+    let b = head.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+    let mut i = head.len();
+    loop {
+        while i > 0 && ident(b[i - 1]) {
+            i -= 1;
+        }
+        if i > 0 && b[i - 1] == b'~' {
+            // A destructor's name carries the `~`: `~Base::~Base` declares no
+            // return type, exactly like the constructor `Circle::Circle`.
+            i -= 1;
+        }
+        if i >= 2 && &head[i - 2..i] == "::" {
+            // A `Class::` segment in front of the name is part of the name.
+            i -= 2;
+            continue;
+        }
+        break;
+    }
+    if i == head.len() {
+        // Nothing peeled: the name ends in punctuation — an operator
+        // (`int Point::operator+(int)`, `operator()`, `operator new`). There
+        // the last whitespace token IS the name, the shape the token drop
+        // already got right.
+        if let Some(p) = head.rfind(' ') {
+            if head[p + 1..].contains("operator") {
+                i = p;
+            }
+        }
+    }
+    head[..i].trim_end().to_string()
+}
+
+/// The declared shape of one C++ function, read off its demangled signature.
+/// `gap` is why the signature is NOT fully typed — the function keeps the
+/// integer model and the pipeline counts the reason; it is never a guess.
+pub struct SigShape {
+    pub abi: rdec_arch_x86::lift::FnAbi,
+    pub gap: Option<String>,
+}
+
+/// `max_params` is the DECLARED budget (`this` is not counted): 4 for free
+/// functions and static members, 3 for member functions, whose `this` spends
+/// RCX. `member` prepends the `this` integer slot.
+pub fn sig_shape(text: &str, member: bool) -> SigShape {
+    let kept = |gap: Option<String>| SigShape {
+        abi: rdec_arch_x86::lift::FnAbi::integer(),
+        gap,
+    };
+    let max_params = if member { 3 } else { 4 };
+    let (ret, params) = match split_signature(text) {
+        Some(s) => s,
+        None => {
+            return kept(Some(
+                "demangled text carries no parseable signature".to_string(),
+            ))
+        }
+    };
+    if params.len() > max_params {
+        return kept(Some(format!(
+            "{} declared parameters: beyond the argument-register budget",
+            params.len()
+        )));
+    }
+    let mut args: Vec<rdec_arch_x86::lift::ArgKind> = Vec::new();
+    if member {
+        // `this` arrives in RCX: an integer-class slot, the same modelling
+        // the window class already runs on.
+        args.push(rdec_arch_x86::lift::ArgKind::Int);
+    }
+    for p in &params {
+        let p = p.trim();
+        args.push(match p {
+            "float" => rdec_arch_x86::lift::ArgKind::F32,
+            "double" => rdec_arch_x86::lift::ArgKind::F64,
+            "long double" => {
+                return kept(Some(
+                    "takes a `long double` (x87 register stack, not modelled)".to_string(),
+                ))
+            }
+            "..." => {
+                return kept(Some(
+                    "variadic (the stack area is not modelled)".to_string(),
+                ));
+            }
+            _ if is_int_spelling(p) => rdec_arch_x86::lift::ArgKind::Int,
+            _ => {
+                return kept(Some(format!(
+                    "parameter `{p}` is not a builtin integer/float (the type model)"
+                )))
+            }
+        });
+    }
+    let ret = ret.trim();
+    let rk = match ret {
+        "float" => rdec_arch_x86::lift::RetKind::F32,
+        "double" => rdec_arch_x86::lift::RetKind::F64,
+        "long double" => {
+            return kept(Some(
+                "returns `long double` (x87 register stack, not modelled)".to_string(),
+            ))
+        }
+        // `void` keeps the integer return kind: there is no value to compare,
+        // and the T2 gates exclude void returns by name; the emitted C's
+        // return type for a void function is the emitter's question, not the
+        // ABI seeding's.
+        "void" => rdec_arch_x86::lift::RetKind::Int,
+        // A constructor/destructor text carries NO return type at all
+        // (`Circle::Circle(double)`): the decoration's `@` return marker says
+        // it returns nothing. Same integer return kind, same reason.
+        "" => rdec_arch_x86::lift::RetKind::Int,
+        _ if is_int_spelling(ret) => rdec_arch_x86::lift::RetKind::Int,
+        _ => {
+            return kept(Some(format!(
+                "return type `{ret}` is not a builtin integer/float (the type model)"
+            )))
+        }
+    };
+    SigShape {
+        abi: rdec_arch_x86::lift::FnAbi {
+            args,
+            ret: rk,
+            member,
+        },
+        gap: None,
+    }
+}
+
+/// The declared shape for one C++ subject, from its demangled name.
+/// `None` = no C++ decoration to read (plain COFF symbol / demangler gap):
+/// the subject is lifted under the integer model, exactly as C subjects are.
+pub fn cpp_fn_abi(d: &rdec_demangle::Demangled, text: &str) -> Option<SigShape> {
+    let member = matches!(
+        d,
+        rdec_demangle::Demangled::Name {
+            kind: rdec_demangle::SymKind::MemberFunction { .. }
+                | rdec_demangle::SymKind::Constructor { .. }
+                | rdec_demangle::SymKind::Destructor { .. },
+            ..
+        }
+    );
+    // A vcall/displacement thunk takes its adjustment in a hidden register:
+    // its parameter list is not the source's, so its shape is not typed here.
+    if matches!(
+        d,
+        rdec_demangle::Demangled::Name {
+            kind: rdec_demangle::SymKind::MemberFunction { thunk: true, .. },
+            ..
+        }
+    ) {
+        return None;
+    }
+    // Constructors and destructors return nothing — the decoration says so
+    // with the `@` return marker (`??0Circle@@QEAA@N@Z`). The shape forces
+    // the integer return kind from the SYMBOL KIND, so no ctor can be given
+    // a float return by a text-reading accident, and the corpus's dtors and
+    // ctors keep the integer model's shape.
+    let mut shape = sig_shape(text, member);
+    if matches!(
+        d,
+        rdec_demangle::Demangled::Name {
+            kind: rdec_demangle::SymKind::Constructor { .. }
+                | rdec_demangle::SymKind::Destructor { .. },
+            ..
+        }
+    ) {
+        shape.abi.ret = rdec_arch_x86::lift::RetKind::Int;
+    }
+    Some(shape)
+}
+
 /// Create the output directory, tolerating this host's filter driver: a fresh
 /// `create_dir_all` returns `Access is denied (os error 5)` here AFTER the
 /// directory has been created (the real-time scan holds the new directory for
@@ -896,6 +1151,13 @@ pub struct CppPipeline {
     pub data_tables: usize,
     pub eh_sections: usize,
     pub eh_symbols: usize,
+    /// Signature-declared shapes, counted and named (the evidence is the
+    /// decoration, stated in the module comment above `sig_shape`).
+    /// `shape_gap` lists the signatures the front end could NOT fully type:
+    /// those subjects keep the integer model, they are not guessed.
+    pub shape_gap: BTreeMap<String, usize>,
+    pub shape_declared: usize,
+    pub shape_integer: usize,
     pub subjects: Vec<crate::m4::Subject>,
 }
 
@@ -991,13 +1253,38 @@ pub fn cpp_pipeline(files: &[String]) -> Result<CppPipeline, String> {
         c_name_of.insert(raw.clone(), name);
     }
 
-    // ---- 3. the existing pipeline, with the demangled names ----------------
-    let subjects = crate::m4::lift_all_named(files, &|oi: usize, raw: &str| {
-        c_name_of
-            .get(raw)
-            .cloned()
-            .unwrap_or_else(|| format!("o{oi}_{}", crate::m4::c_ident(raw)))
-    })?;
+    // ---- 3. the existing pipeline, with the demangled names and the
+    // signature-declared shapes ------------------------------------------------
+    // The shape is built from `dem_of` — the DECORATED NAME, decoded — before
+    // any byte is lifted, and every subject carries it (`Subject::abi`). A
+    // signature we cannot fully types keeps the integer model and lands in
+    // `shape_gap`, named. Nothing here looks at the code to decide a type.
+    let subjects = crate::m4::lift_all_named_sigs(
+        files,
+        &|oi: usize, raw: &str| {
+            c_name_of
+                .get(raw)
+                .cloned()
+                .unwrap_or_else(|| format!("o{oi}_{}", crate::m4::c_ident(raw)))
+        },
+        &|_, raw: &str| match dem_of.get(raw) {
+            Some(d @ Demangled::Name { text, .. }) => {
+                cpp_fn_abi(d, text).map(|s| s.abi).unwrap_or_default()
+            }
+            _ => Default::default(),
+        },
+    )?;
+
+    let mut shape_gap: BTreeMap<String, usize> = BTreeMap::new();
+    for (_, raw) in &symbols {
+        if let Some(d @ Demangled::Name { text, .. }) = dem_of.get(raw) {
+            if let Some(g) = cpp_fn_abi(d, text).and_then(|s| s.gap) {
+                *shape_gap.entry(g).or_default() += 1;
+            }
+        }
+    }
+    let shape_declared = subjects.iter().filter(|s| !s.abi.args.is_empty()).count();
+    let shape_integer = subjects.len() - shape_declared;
 
     let unique_names = c_name_of.len();
     Ok(CppPipeline {
@@ -1012,6 +1299,9 @@ pub fn cpp_pipeline(files: &[String]) -> Result<CppPipeline, String> {
         data_tables,
         eh_sections,
         eh_symbols,
+        shape_gap,
+        shape_declared,
+        shape_integer,
         subjects,
     })
 }
@@ -1063,6 +1353,9 @@ pub fn cmd_cpp(args: &[String]) -> Result<i32, String> {
     let data_tables = p.data_tables;
     let eh_sections = p.eh_sections;
     let eh_symbols = p.eh_symbols;
+    let shape_gap = p.shape_gap;
+    let shape_declared = p.shape_declared;
+    let shape_integer = p.shape_integer;
     let subjects = p.subjects;
     let unique_names = p.unique_names;
     // The name round-trip line counts distinct C names.
@@ -1381,22 +1674,39 @@ pub fn cmd_cpp(args: &[String]) -> Result<i32, String> {
     println!(
         "this-in-RCX: {this_lifted} member/ctor/dtor functions lifted with the class pointer modelled as parameter 0; {this_emitted} of them emitted C"
     );
+    println!(
+        "declared shape: {shape_declared} functions lifted with parameter/return kinds taken from their DEMANGLED SIGNATURES (evidence: the decorated name, read before lifting - never inferred from observed answers); {shape_integer} under the integer model (a C symbol, a demangler gap, or a signature we cannot fully type)"
+    );
+    for (why, n) in &shape_gap {
+        println!(
+            "  shape gap [{n} x] {why}: the subject keeps the integer model, it is not guessed"
+        );
+    }
     // The SSE census, counted by the lifter over the same subjects, so the
     // bracketed per-mnemonic numbers can be checked against
     // `llvm-objdump -d corpus/cpp/obj/*.obj` the way the self-idiom count can.
     let mut sse: BTreeMap<String, u32> = BTreeMap::new();
     let mut sse_zeroing = 0usize;
     let mut ret_xmm0 = 0usize;
+    let mut float_params = 0usize;
+    let mut ret_f32 = 0usize;
+    let mut ret_f64 = 0usize;
     for s in &subjects {
         for (k, v) in &s.rep.sse {
             *sse.entry(k.clone()).or_insert(0) += *v;
         }
         sse_zeroing += s.rep.sse_zeroing;
         ret_xmm0 += s.rep.ret_xmm0;
+        float_params += s.rep.float_params;
+        ret_f32 += s.rep.ret_f32;
+        ret_f64 += s.rep.ret_f64;
     }
     println!("{}", crate::m4::sse_line(&sse, sse_zeroing));
     println!(
-        "ret-float-in-XMM0: {ret_xmm0} returns reach a written XMM0 with RAX undefined: the Windows x64 ABI answers a float/double function in XMM0, and the emitted C returns the integer RAX. Their VALUE is therefore not in T2's compared set (T2 compares RAX, and its rule is unchanged)."
+        "declared float shape: {float_params} float parameters seeded from XMM0-3, {ret_f32} returns answer F32 and {ret_f64} answer F64 from XMM0 - all counted from the DECLARED signatures, checkable against the demangled texts above."
+    );
+    println!(
+        "ret-float-in-XMM0: {ret_xmm0} returns reach a written XMM0 with RAX undefined: the Windows x64 ABI answers a float/double function in XMM0. Under a signature-declared shape the emitted C declares the float return and returns XMM0's bits (the T2 XMM0 class compares them bitwise); a subject under the integer model - no typed signature - still returns the integer RAX, which is why its shape is a counted bucket, not a guess."
     );
     println!(
         "ctors identified: {} {} | dtors identified: {} {}",
@@ -1579,6 +1889,66 @@ mod tests {
     use rdec_core::emit_c::emit_c;
     use rdec_core::ir::Op;
     use std::collections::HashMap;
+
+    /// The shape the DEMANGLED NAME declares, asserted on the task's own
+    /// evidence. The type information is in the decorated name — the lifter
+    /// never reads the code to guess it — and an untypable signature keeps
+    /// the integer model with its reason counted, never a guess.
+    #[test]
+    fn a_demangled_signature_shapes_parameters_the_integer_model_cannot_see() {
+        use rdec_arch_x86::lift::{ArgKind, RetKind};
+        // The named witness: double Circle::grow(double).
+        let d = rdec_demangle::demangle("?grow@Circle@@QEAANN@Z");
+        let text = match &d {
+            rdec_demangle::Demangled::Name { text, .. } => text.clone(),
+            other => panic!("expected a name: {other:?}"),
+        };
+        assert_eq!(text, "double Circle::grow(double)");
+        let sh = cpp_fn_abi(&d, &text).expect("fully typed by the decorated name");
+        assert!(sh.gap.is_none(), "{:?}", sh.gap);
+        assert_eq!(
+            sh.abi.args,
+            vec![ArgKind::Int, ArgKind::F64],
+            "this = an integer slot, the declared double = a float slot"
+        );
+        assert_eq!(sh.abi.ret, RetKind::F64, "the answer is a double");
+        assert!(sh.abi.member, "thiscall: the pairing rule applies");
+        // A constructor: no value to return, whatever the return slot of a
+        // NON-ctor decoration spells. The corpus ctor is
+        // `??0Circle@@QEAA@N@Z` = `Circle::Circle(double)`: the `@` return
+        // marker declares "constructors return nothing", and the shape
+        // forces the integer return kind from the SYMBOL KIND.
+        let c = rdec_demangle::demangle("??0Circle@@QEAA@N@Z");
+        let ct = match &c {
+            rdec_demangle::Demangled::Name { text, .. } => text.clone(),
+            other => panic!("expected a name: {other:?}"),
+        };
+        assert_eq!(ct, "Circle::Circle(double)");
+        let sh = cpp_fn_abi(&c, &ct).expect("the ctor is shaped");
+        assert_eq!(
+            sh.abi.args,
+            vec![ArgKind::Int, ArgKind::F64],
+            "this + the declared double"
+        );
+        assert_eq!(sh.abi.ret, RetKind::Int, "a constructor returns no value");
+        // A signature the type model cannot fully type: the function KEEPS
+        // the integer model and names the reason. No guessing.
+        let p = sig_shape("void *f(int)", false);
+        assert_eq!(p.abi.args, rdec_arch_x86::lift::FnAbi::integer().args);
+        assert!(
+            p.gap
+                .as_deref()
+                .is_some_and(|g| g.contains("return type `void *`")),
+            "{:?}",
+            p.gap
+        );
+        // Undecorated C: never a typed shape — the pipeline hands the
+        // subject the integer model, and the reason (if any) is named.
+        assert!(
+            cpp_fn_abi(&rdec_demangle::demangle("plain_c_symbol"), "plain_c_symbol")
+                .is_none_or(|s| s.gap.is_some())
+        );
+    }
 
     /// Lift hand-assembled bytes the way the pipeline does: one code range, one
     /// entry, one function spanning the bytes. No clang, no corpus: the fixtures

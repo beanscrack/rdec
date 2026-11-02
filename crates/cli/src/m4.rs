@@ -10,7 +10,7 @@
 //!  3. the passes that run before emission must not break SSA - checked with the
 //!     same verifier, not with trust.
 use rdec_arch_x86::discover::{discover_all, Code};
-use rdec_arch_x86::lift::lift_one;
+use rdec_arch_x86::lift::lift_one_sig;
 use rdec_core::emit_c::{emit_c, Refusal, PRELUDE};
 use rdec_core::ir::Function;
 use rdec_core::verify::verify_ssa;
@@ -95,6 +95,12 @@ pub struct Subject {
     pub external: bool,
     /// The lifted IR, after `clean`.
     pub f: Function,
+    /// The declared shape this function was lifted under. Every C-corpus
+    /// subject carries `FnAbi::integer()` (a C symbol names no types); the
+    /// C++ pipeline fills it from the DEMANGLED SIGNATURE - the evidence is
+    /// the decorated name, stated at the site that builds it, never inferred
+    /// from observed answers.
+    pub abi: rdec_arch_x86::lift::FnAbi,
     /// The lifter's own count report for this function. `clean` may drop
     /// instructions, so the SSE census has to come from the report and not from
     /// a scan of the surviving IR: the number is "what the decoder saw", and
@@ -103,15 +109,18 @@ pub struct Subject {
 }
 
 /// Load, discover, lift and clean every function in `files`, named by
-/// `name_of(object index, COFF symbol)`.
+/// `name_of(object index, COFF symbol)` and shaped by
+/// `abi_of(object index, COFF symbol)`.
 ///
-/// The naming scheme is a parameter, not a copy of the pipeline: `rdec cpp`
-/// names the C++ functions from their DEMANGLED text, and it must run the same
-/// discovery, the same lifter and the same passes as `rdec c` - a C++ gate that
-/// re-implemented the front half would be measuring its own copy.
-pub fn lift_all_named(
+/// The naming scheme and the shape are parameters, not copies of the
+/// pipeline: `rdec cpp` names the C++ functions from their DEMANGLED text and
+/// declares their parameter kinds from the same evidence, and it must run the
+/// same discovery, the same lifter and the same passes as `rdec c` - a C++
+/// gate that re-implemented the front half would be measuring its own copy.
+pub fn lift_all_named_sigs(
     files: &[String],
     name_of: &dyn Fn(usize, &str) -> String,
+    abi_of: &dyn Fn(usize, &str) -> rdec_arch_x86::lift::FnAbi,
 ) -> Result<Vec<Subject>, String> {
     let mut out: Vec<Subject> = Vec::new();
     for (oi, file) in files.iter().enumerate() {
@@ -193,7 +202,9 @@ pub fn lift_all_named(
                 .cloned()
                 .unwrap_or_else(|| format!("fn_{start:x}"));
             let name = name_of(oi, &raw);
-            let (mut f, rep) = lift_one(&name, rg.bytes, rg.base, start, end, &plan, &names);
+            let abi = abi_of(oi, &raw);
+            let (mut f, rep) =
+                lift_one_sig(&name, rg.bytes, rg.base, start, end, &plan, &names, &abi);
             clean(&mut f);
             out.push(Subject {
                 obj: file.clone(),
@@ -202,11 +213,23 @@ pub fn lift_all_named(
                 start,
                 external: external.contains(&start),
                 f,
+                abi,
                 rep,
             });
         }
     }
     Ok(out)
+}
+
+/// Load, discover, lift and clean every function in `files`, named by
+/// `name_of(object index, COFF symbol)`, under the integer model.
+pub fn lift_all_named(
+    files: &[String],
+    name_of: &dyn Fn(usize, &str) -> String,
+) -> Result<Vec<Subject>, String> {
+    lift_all_named_sigs(files, name_of, &|_, _| {
+        rdec_arch_x86::lift::FnAbi::integer()
+    })
 }
 
 /// Load, discover, lift and clean every function in `files`, with the naming

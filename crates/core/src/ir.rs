@@ -571,6 +571,16 @@ pub struct Function {
     pub next_block: BbId,
     /// Declared parameter order (entry-block `Op::Param` defs).
     pub params: Vec<VId>,
+    /// The DECLARED C type of each parameter, parallel to `params` when the
+    /// ABI is known. A Windows x64 float parameter arrives in XMM0 as a bit
+    /// cell, so its IR value is `Ty::u64` (the register file is one unsigned
+    /// W64 word per register, float cells included) while the C signature
+    /// spells it `float`/`double`. The emitter declares the parameter with
+    /// this type and moves bits through the memcpy helpers; when the list is
+    /// empty (no declared signature), the parameter's own value type is the
+    /// declared type, which is the integer-ABI behaviour the C corpus has
+    /// always had.
+    pub param_tys: Vec<Ty>,
     pub ret_ty: Ty,
 }
 
@@ -585,6 +595,7 @@ impl Function {
             next_value: 0,
             next_block: 0,
             params: Vec::new(),
+            param_tys: Vec::new(),
             ret_ty: Ty::Void,
         };
         let e = f.new_block(0);

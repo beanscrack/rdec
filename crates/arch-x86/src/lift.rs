@@ -39,6 +39,19 @@
 //! * A call clobbers the caller-saved registers. That is modelled, as an
 //!   `Opaque` per clobbered register, because leaving a value live across a call
 //!   is a silent miscompile, and the silent kind is the one that ships.
+//! * The Windows x64 ABI splits arguments by REGISTER CLASS: integer parameters
+//!   consume RCX/RDX/R8/R9 in order and float parameters consume XMM0-3 in
+//!   order, each argument consuming only its own class. Which kind each
+//!   parameter has is NOT visible in the machine code - it is a property of the
+//!   declared signature - so the lifter does not infer it: the caller hands in
+//!   an `FnAbi` per function (`lift_one_sig`), and the C++ pipeline builds it
+//!   from the DEMANGLED SIGNATURE, saying out loud that the evidence is the
+//!   decorated name, not observed answers. An empty `FnAbi` is the integer
+//!   model exactly as it was: the four integer registers seeded as parameters,
+//!   an integer return. A signature the front end cannot fully type keeps the
+//!   integer model and is counted and named - never guessed. `ret` follows the
+//!   same declared kind: a float/double function answers in XMM0 (the cell's
+//!   low 32/64 bits), and the emitted C declares the float return type.
 //! * Everything outside the subset becomes `Op::Opaque(text)` - in the IR,
 //!   counted, printed. Never a plausible guess.
 //!
@@ -227,6 +240,80 @@ fn ty_u(w: Width) -> Ty {
 /// The Windows x86-64 integer calling convention, as far as we model it: four
 /// integer arguments, integer return. More arguments is a loud gap, not a drop.
 const ARG_REGS: [Grp; 4] = [Grp::Rcx, Grp::Rdx, Grp::R8, Grp::R9];
+
+/// The float argument registers, in order. The Windows x64 ABI gives every
+/// parameter a register in its OWN class: a float argument consumes an XMM slot
+/// and leaves the integer slots to the integer arguments (and vice versa), so
+/// `int f(int a, double b)` arrives with `a` in RCX and `b` in XMM0 - RDX is
+/// NOT "used" by `b`, it holds nothing this function may read.
+const ARG_XMM: [Grp; 4] = [Grp::Xmm(0), Grp::Xmm(1), Grp::Xmm(2), Grp::Xmm(3)];
+
+/// Which register class one declared parameter arrives in. The kind is a
+/// property of the DECLARED signature (the demangled C++ name, the C prototype
+/// the front end was given) - never a conclusion drawn from what the lifted
+/// code does with the register, because a type inferred from observed answers
+/// is the gate that reads the answer off the answer.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum ArgKind {
+    /// An integer-class parameter: consumes the next of RCX/RDX/R8/R9.
+    Int,
+    /// `float`: consumes the next of XMM0-3. The cell's value is the 32-bit
+    /// bit pattern zero-extended to 64 - the `movss` a scalar caller must use
+    /// zeroes bits 127:32, so bits 63:32 are architecturally zero.
+    F32,
+    /// `double`: consumes the next of XMM0-3, the cell's value is the bits.
+    F64,
+}
+
+/// Which register `ret` answers from, per the declared signature.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+pub enum RetKind {
+    /// The integer answer in RAX (the model as it has always been). The
+    /// default: no declared signature means the integer model.
+    #[default]
+    Int,
+    /// A `float` answer in XMM0's low 32 bits.
+    F32,
+    /// A `double` answer in XMM0's low 64 bits.
+    F64,
+}
+
+/// The declared shape of one function: parameter kinds in declaration order,
+/// and the return kind. An empty `args` is "no signature was given": seed the
+/// four integer argument registers, exactly the pre-float-ABI model, so every
+/// caller that knows nothing keeps the behaviour it has always had.
+#[derive(Clone, Debug, Default)]
+pub struct FnAbi {
+    pub args: Vec<ArgKind>,
+    pub ret: RetKind,
+    /// Member function (`this` is `args[0]`). Windows x64 lays parameters
+    /// into four PAIRED slots — slot k owns `RCX/RDX/R8/R9[k]` AND
+    /// `XMM0-3[k]` — and a `__thiscall` callee takes `this` in slot 0, so
+    /// DECLARED parameter k lands in slot k of its register class: a
+    /// member's first `double` arrives in XMM1, not XMM0. The corpus says
+    /// so as machine fact: `?grow@Circle@@QEAANN@Z` opens
+    /// `movsd %xmm1, 0x8(%rsp)` — the declared parameter is saved from XMM1.
+    /// For free functions the slots are per class (the Microsoft x64 rule
+    /// for `__cdecl`): `int f(int a, double b)` = ECX + XMM0, and a float
+    /// consumes no integer slot.
+    pub member: bool,
+}
+
+impl FnAbi {
+    /// "No declared signature": the four integer registers as parameters, an
+    /// integer return. Identical to the model every C-corpus gate measures.
+    pub fn integer() -> FnAbi {
+        FnAbi {
+            args: Vec::new(),
+            ret: RetKind::Int,
+            member: false,
+        }
+    }
+    /// True when seeding this ABI produced exactly the integer model.
+    pub fn is_integer(&self) -> bool {
+        self.args.is_empty() && self.ret == RetKind::Int
+    }
+}
 
 /// Caller-saved: a call may overwrite these.
 const CALLER_SAVED: [Grp; 25] = [
@@ -427,6 +514,16 @@ pub struct Report {
     /// follow. T2 compares RAX only, so these are outside its claim; the C++
     /// gate prints the number so the shape is visible rather than inferred.
     pub ret_xmm0: usize,
+    /// Parameters seeded from a DECLARED float kind (XMM0-3). Counted at the
+    /// seed, so the number is "how many float parameters the declared
+    /// signatures named", checkable against the demangled texts, never against
+    /// what the code does with them.
+    pub float_params: usize,
+    /// Functions whose `ret` answered from XMM0 at F32/F64 width, per the
+    /// declared return kind. The emitted C declares `float`/`double`; T2's
+    /// XMM0 class compares the bit pattern at exactly this width.
+    pub ret_f32: usize,
+    pub ret_f64: usize,
     /// Where a register read resolved to `undef`: the address of the read and
     /// which register. `undef_live_ins` counts them; this names them, because
     /// "13 undef live-ins" is not a work item and "`0x29` reads RDX, which no
@@ -500,6 +597,17 @@ pub struct Lifter<'a> {
     /// unattributable.
     at: u64,
     pending: Pending,
+    /// The declared shape this function was lifted under: which parameter
+    /// arrives in which register class, and what `ret` answers from. Seeded
+    /// from the caller's evidence (a demangled signature), never inferred from
+    /// the code's behaviour.
+    abi: FnAbi,
+    /// Registers `Lifter::new` seeded as entry definitions (the four ARG_REGS
+    /// of an empty ABI, the per-class registers of a declared one, plus RSP).
+    /// The entry block marks these in `cur_defs`: a register the transfer
+    /// function does not see defined at the entry is read as `undef` by every
+    /// later block, which is the silent kind of wrong.
+    seeded: Vec<Grp>,
     /// (block, register, placeholder) for every register a block READ before
     /// writing. These are the live-ins that become phis in `ssa_registers`.
     live_in: Vec<(BbId, Grp, VId)>,
@@ -520,26 +628,126 @@ pub struct Lifter<'a> {
 }
 
 impl<'a> Lifter<'a> {
+    /// Lift under the integer model: RCX/RDX/R8/R9 seeded as the four
+    /// parameters, `ret` answers from RAX. Identical in behaviour to every
+    /// gate that ran before the float ABI existed - `FnAbi::integer()` seeds
+    /// exactly what this constructor always seeded.
     pub fn new(name: &str, addr: u64, names: &'a HashMap<u64, String>) -> Lifter<'a> {
+        Lifter::new_abi(name, addr, names, &FnAbi::integer())
+    }
+
+    /// Lift under a DECLARED shape. `abi.args` is the parameter list in
+    /// declaration order; each kind consumes its own register class
+    /// (`ARG_REGS` for integers, `ARG_XMM` for floats), which is the Windows
+    /// x64 rule that a float argument does not consume an integer slot.
+    /// An empty `abi.args` is the integer model: the four integer registers.
+    pub fn new_abi(
+        name: &str,
+        addr: u64,
+        names: &'a HashMap<u64, String>,
+        abi: &FnAbi,
+    ) -> Lifter<'a> {
         let mut f = Function::new(name, addr);
-        f.ret_ty = Ty::i64();
+        f.ret_ty = match abi.ret {
+            RetKind::Int => Ty::i64(),
+            RetKind::F32 => Ty::f32(),
+            RetKind::F64 => Ty::f64(),
+        };
         let entry = f.entry;
         let mut regs = HashMap::new();
-        for g in ARG_REGS {
-            // The four argument registers are REGISTER values, and a register is
-            // one unsigned W64 word in this model. Typed `int64_t` (the earlier
-            // spelling) makes the entry's params the only signed values in the
-            // register model, so as soon as they flow past the entry block -
-            // which they now do - every `and`/`add` that reads one reports
-            // "op type int64_t != recorded uint64_t": the verifier is right, the
-            // register model was inconsistent. Signedness is a property of a
-            // *read* (`movsx` asks for it, `sar` asks for it), and the emitter
-            // spells both; it is not a property of the bits in a register.
-            let v = f.new_value(Ty::u64());
-            f.params.push(v);
-            f.block_mut(f.entry)
-                .push(Instr::new(v, Op::Param, Ty::u64(), addr));
-            regs.insert(g, v);
+        let mut seeded: Vec<Grp> = Vec::new();
+        let mut over_budget = 0usize;
+        let mut float_params = 0usize;
+        if abi.args.is_empty() {
+            for g in ARG_REGS {
+                // The four argument registers are REGISTER values, and a register is
+                // one unsigned W64 word in this model. Typed `int64_t` (the earlier
+                // spelling) makes the entry's params the only signed values in the
+                // register model, so as soon as they flow past the entry block -
+                // which they now do - every `and`/`add` that reads one reports
+                // "op type int64_t != recorded uint64_t": the verifier is right, the
+                // register model was inconsistent. Signedness is a property of a
+                // *read* (`movsx` asks for it, `sar` asks for it), and the emitter
+                // spells both; it is not a property of the bits in a register.
+                let v = f.new_value(Ty::u64());
+                f.params.push(v);
+                f.param_tys.push(Ty::u64());
+                f.block_mut(f.entry)
+                    .push(Instr::new(v, Op::Param, Ty::u64(), addr));
+                regs.insert(g, v);
+                seeded.push(g);
+            }
+        } else {
+            // One parameter per declared kind, consuming its OWN class. A
+            // float parameter's IR value is the XMM cell - one unsigned W64
+            // word, the register file's rule - and its DECLARED type
+            // (`param_tys`) is what the C signature spells; the emitter
+            // moves bits through the memcpy helpers at the assignment.
+            let mut int_slot = 0usize;
+            let mut xmm_slot = 0usize;
+            for (pos, &k) in abi.args.iter().enumerate() {
+                // Free function: each class counts its own slots (`int
+                // f(int, double)` = RCX + XMM0). Member: the PAIRED slot
+                // rule — parameter `pos` (this = 0) lands in slot `pos` of
+                // its class, so the first declared `double` is XMM1. The
+                // corpus bytes, not a model preference, picked this.
+                let grp = match k {
+                    ArgKind::Int => {
+                        if abi.member {
+                            ARG_REGS.get(pos).copied()
+                        } else {
+                            ARG_REGS.get(int_slot).copied()
+                        }
+                    }
+                    ArgKind::F32 | ArgKind::F64 => {
+                        if abi.member {
+                            ARG_XMM.get(pos).copied()
+                        } else {
+                            ARG_XMM.get(xmm_slot).copied()
+                        }
+                    }
+                };
+                let declared = match k {
+                    ArgKind::Int => Ty::u64(),
+                    ArgKind::F32 => Ty::f32(),
+                    ArgKind::F64 => Ty::f64(),
+                };
+                let Some(g) = grp else {
+                    // More parameters of one class than the ABI has registers
+                    // for: loud, counted, and the parameter is NOT invented.
+                    // The front end is asked to hand in a fully-typed,
+                    // in-budget signature; this is the net under the guess.
+                    over_budget += 1;
+                    continue;
+                };
+                if k == ArgKind::Int {
+                    int_slot += 1;
+                } else {
+                    xmm_slot += 1;
+                    float_params += 1;
+                }
+                let v = f.new_value(Ty::u64());
+                f.params.push(v);
+                f.param_tys.push(declared);
+                f.block_mut(f.entry)
+                    .push(Instr::new(v, Op::Param, Ty::u64(), addr));
+                regs.insert(g, v);
+                seeded.push(g);
+            }
+            if over_budget > 0 {
+                // Loud, counted, and visible in the IR: a parameter that
+                // founds no register is an `Opaque`, never a guess.
+                f.emit_void(
+                    entry,
+                    Op::Opaque(
+                        format!(
+                            "{over_budget} declared parameters beyond the register-class budget"
+                        )
+                        .into(),
+                    ),
+                    addr,
+                );
+            }
         }
         // The machine stack is memory. In a flat-memory model the entry stack
         // pointer is a fixed address, which makes every rsp-relative access a real
@@ -554,7 +762,8 @@ impl<'a> Lifter<'a> {
         // `stack2reg` (M6) is the pass that turns these offsets into locals.
         let rsp = f.emit(f.entry, Op::Const(STACK_BASE), Ty::u64(), addr);
         regs.insert(Grp::Rsp, rsp);
-        Lifter {
+        seeded.push(Grp::Rsp);
+        let mut l = Lifter {
             f,
             regs,
             flags: None,
@@ -563,6 +772,8 @@ impl<'a> Lifter<'a> {
             cur: entry,
             at: addr,
             pending: Pending::Fall,
+            abi: abi.clone(),
+            seeded,
             live_in: Vec::new(),
             block_out: HashMap::new(),
             block_def: HashMap::new(),
@@ -571,7 +782,25 @@ impl<'a> Lifter<'a> {
             rep: Report::default(),
             names,
             fmt: crate::decode::formatter(crate::decode::Syntax::Intel),
-        }
+        };
+        l.rep.float_params = float_params;
+        l.rep.gaps += over_budget;
+        l
+    }
+
+    /// The entry register map, resolved to IR values where the seed defines
+    /// one. `None` means the register is NOT an entry definition under this
+    /// ABI: an integer parameter does not make RDX a parameter, and a float
+    /// parameter does not make XMM0's neighbours parameters. This is the
+    /// window through which a caller can check the per-class seeding - the
+    /// claim "a float argument consumes no integer slot" is assertable, not
+    /// narrated.
+    pub fn entry_regs(&self) -> Vec<(Grp, Option<VId>)> {
+        ARG_REGS
+            .iter()
+            .chain(ARG_XMM.iter())
+            .map(|g| (*g, self.regs.get(g).copied()))
+            .collect()
     }
 
     /// The mnemonic, lowercased, from iced's formatter: iced's `Mnemonic` has no
@@ -2260,20 +2489,20 @@ impl<'a> Lifter<'a> {
             self.cur_defs.clear();
             if i == 0 {
                 // The entry block DEFINES the registers the ABI and the frame
-                // model hand it: RCX/RDX/R8/R9 carry the four integer arguments
-                // (`Lifter::new` seeds them from `Op::Param`) and RSP is the
-                // modelled stack base. They are seeded, never written by an
-                // instruction, so nothing else marks them - and a register
-                // `block_def` does not list is invisible to the transfer
-                // function, which then hands every block after the entry the
-                // entry's INCOMING value for it: `undef`. That is the defect
-                // behind most of T2's "returns RAX unwritten" bucket - in
-                // `early_returns.O1`, `mov eax, edx` at 0x4 is the source's
-                // `return b`, and the IR read RDX as undefined.
-                for g in ARG_REGS {
+                // model hand it: under the integer model RCX/RDX/R8/R9 carry
+                // the four integer arguments; under a declared signature each
+                // kind seeded its own class (`seeded` lists exactly those),
+                // and RSP is the modelled stack base. They are seeded, never
+                // written by an instruction, so nothing else marks them - and
+                // a register `block_def` does not list is invisible to the
+                // transfer function, which then hands every block after the
+                // entry the entry's INCOMING value for it: `undef`. That is
+                // the defect behind most of T2's "returns RAX unwritten"
+                // bucket - in `early_returns.O1`, `mov eax, edx` at 0x4 is the
+                // source's `return b`, and the IR read RDX as undefined.
+                for g in self.seeded.clone() {
                     self.cur_defs.insert(g);
                 }
-                self.cur_defs.insert(Grp::Rsp);
             }
             for (va, len) in b.insns.iter() {
                 self.at = *va;
@@ -2323,6 +2552,12 @@ impl<'a> Lifter<'a> {
     /// answers: a width inferred from answers is the gate that collapses to one
     /// bit and can never fail.
     fn record_return_width(&mut self) {
+        // A declared float return already owns `ret_ty` (F32/F64): the
+        // integer-width question is about RAX, and XMM0's answer is typed by
+        // the declaration, not by a bits analysis of integer writes.
+        if self.f.ret_ty.is_float() {
+            return;
+        }
         if rdec_core::width::return_width(&self.f) == 32 {
             self.f.ret_ty = ty_u(Width::W32);
             self.rep.ret_w32 += 1;
@@ -2585,10 +2820,32 @@ impl<'a> Lifter<'a> {
                     Terminator::Exit
                 }
             },
-            Pending::Ret => {
-                let r = self.read64(Grp::Rax);
-                Terminator::Return(r)
-            }
+            Pending::Ret => match self.abi.ret {
+                RetKind::Int => {
+                    let r = self.read64(Grp::Rax);
+                    Terminator::Return(r)
+                }
+                // A declared float/double function answers in XMM0: the cell's
+                // bits ARE the answer, viewed as a float for the declared
+                // return type. `f32` compares 32 bits - the `movss` the ABI
+                // caller must use zeroes 127:32, so the low 32 are the whole
+                // answer; the truncation to 32 is the width the type names,
+                // not a mask to force an agreement. The kind is the declared
+                // signature's, never a reading of what the code did.
+                RetKind::F32 => {
+                    self.rep.ret_f32 += 1;
+                    let bits = self.read64(Grp::Xmm(0));
+                    let low = self.narrow(bits, Width::W32);
+                    let v = self.cast_ty(CastKind::Bitcast, low, Ty::f32());
+                    Terminator::Return(v)
+                }
+                RetKind::F64 => {
+                    self.rep.ret_f64 += 1;
+                    let bits = self.read64(Grp::Xmm(0));
+                    let v = self.cast_ty(CastKind::Bitcast, bits, Ty::f64());
+                    Terminator::Return(v)
+                }
+            },
             Pending::Jump(t) => match self.bb_of.get(&t).copied() {
                 Some(bb) => Terminator::Jump(bb),
                 None => {
@@ -2620,7 +2877,8 @@ impl<'a> Lifter<'a> {
     }
 }
 
-/// Lift one function out of an object's discovered code.
+/// Lift one function out of an object's discovered code, under the integer
+/// model (RCX/RDX/R8/R9 as parameters, RAX as the answer).
 pub fn lift_one(
     name: &str,
     bytes: &[u8],
@@ -2630,8 +2888,38 @@ pub fn lift_one(
     plan: &Plan,
     names: &HashMap<u64, String>,
 ) -> (Function, Report) {
+    lift_one_sig(
+        name,
+        bytes,
+        base,
+        start,
+        end,
+        plan,
+        names,
+        &FnAbi::integer(),
+    )
+}
+
+/// Lift one function under a DECLARED shape: the parameter kinds and return
+/// kind come from the caller's evidence (the C++ pipeline builds them from the
+/// demangled signature and says so in the report). `FnAbi::integer()` is
+/// `lift_one` exactly.
+// The parameter list is the lift entry's, and `abi` is the eighth: bundling the
+// five code-range arguments (bytes/base/start/end/plan) into a struct is a
+// refactor of every caller in the repo, not a lint fix.
+#[allow(clippy::too_many_arguments)]
+pub fn lift_one_sig(
+    name: &str,
+    bytes: &[u8],
+    base: u64,
+    start: u64,
+    end: u64,
+    plan: &Plan,
+    names: &HashMap<u64, String>,
+    abi: &FnAbi,
+) -> (Function, Report) {
     let blocks = split_blocks(plan, start, end);
-    let mut l = Lifter::new(name, start, names);
+    let mut l = Lifter::new_abi(name, start, names, abi);
     let f = l.lift_function(bytes, base, &blocks);
     let rep = l.rep.clone();
     (f, rep)
