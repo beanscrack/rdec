@@ -51,6 +51,9 @@ pub struct Out {
 
 struct Emitter<'a> {
     f: &'a Function,
+    /// The C spelling of `f.ret_ty`: the function's declared return type, which
+    /// the `return` statement casts through (see `term`).
+    ret: String,
     body: String,
     externs: Vec<String>,
     refusals: Vec<Refusal>,
@@ -97,6 +100,7 @@ pub fn emit_c(f: &Function) -> Result<Out, Vec<Refusal>> {
     let ret = c_ty(&f.ret_ty).unwrap_or_else(|| "int64_t".into());
     let mut e = Emitter {
         f,
+        ret: ret.clone(),
         body: String::new(),
         externs: Vec::new(),
         refusals: Vec::new(),
@@ -525,7 +529,25 @@ impl<'a> Emitter<'a> {
                     let _ = writeln!(self.body, "    return;");
                 } else {
                     let x = self.use_(*v);
-                    let _ = writeln!(self.body, "    return (int64_t){x};");
+                    // The cast is to the DECLARED return type, not to int64_t.
+                    // The declared type is the width the answer reaches `RAX` at
+                    // (the lifter records it from the machine code: a 32-bit
+                    // write zeroes bits 63:32), and `verify` checks the value
+                    // fits it. Casting through it is what makes the emitted C
+                    // return the same bits the machine leaves in RAX: `(uint32_t)`
+                    // keeps the zero-extension the hardware performed, where the
+                    // old unconditional `(int64_t)` sign-extended a 32-bit answer
+                    // into bits that the machine code had already cleared.
+                    //
+                    // A `void` function that returns a value is the IR lying about
+                    // itself, and `(void)x` is not C: keep the old int64_t spelling
+                    // for that shape rather than inventing a cast.
+                    let rc: &str = if self.ret == "void" {
+                        "int64_t"
+                    } else {
+                        &self.ret
+                    };
+                    let _ = writeln!(self.body, "    return ({rc}){x};");
                 }
             }
             Terminator::Unreachable => {
@@ -670,5 +692,38 @@ mod tests {
 
     fn rdec_ir_no_val() -> u32 {
         crate::ir::NO_VAL
+    }
+
+    /// The declared return type is the width the answer is returned AT, so the
+    /// `return` casts through it: a `uint32_t` function keeps the zero-extension
+    /// a 32-bit machine write performed, where an unconditional `(int64_t)` cast
+    /// sign-extended bits the machine code had already cleared.
+    #[test]
+    fn the_return_cast_is_the_declared_return_type() {
+        let mut f = Function::new("r32", 0);
+        let e = f.entry;
+        let a = f.emit(e, Op::Param, Ty::u32(), 0);
+        f.params.push(a);
+        let one = f.emit(e, Op::Const(1), Ty::u32(), 0);
+        let s = f.emit(e, Op::Bin(BinOp::Add, a, one), Ty::u32(), 0);
+        f.block_mut(e).term = Terminator::Return(s);
+        f.ret_ty = Ty::u32();
+        let out = emit_c(&f).expect("a uint32_t function emits C");
+        assert!(out.text.contains("uint32_t r32("), "{}", out.text);
+        assert!(
+            out.text.contains("return (uint32_t)x2;"),
+            "the return casts through the declared type: {}",
+            out.text
+        );
+
+        // The 64-bit case is unchanged: int64_t in, int64_t out.
+        let mut g = Function::new("r64", 0);
+        let e = g.entry;
+        let a = g.emit(e, Op::Param, Ty::u64(), 0);
+        g.params.push(a);
+        g.block_mut(e).term = Terminator::Return(a);
+        g.ret_ty = Ty::i64();
+        let out = emit_c(&g).expect("an int64_t function emits C");
+        assert!(out.text.contains("return (int64_t)x0;"), "{}", out.text);
     }
 }

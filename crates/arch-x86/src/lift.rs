@@ -314,6 +314,11 @@ pub struct Report {
     /// where no modelled path defines it. At a function entry that is the ABI
     /// question (is this register an argument?), not a dataflow question.
     pub undef_live_ins: usize,
+    /// Functions whose answer provably reaches `RAX` at 32-bit width, so bits
+    /// 63:32 are zero on every path and the emitted C returns `uint32_t`. This
+    /// is a machine-code fact (a 32-bit register write zeroes the upper half),
+    /// counted so the width modelling can be watched, not assumed.
+    pub ret_w32: usize,
 }
 
 pub struct Lifter<'a> {
@@ -484,17 +489,31 @@ impl<'a> Lifter<'a> {
     }
 
     /// Write a width-`w` result, honouring x86's partial-write rules.
+    ///
+    /// The value is first read at the width the WRITE has: a `W32` write of a
+    /// wider value truncates, because that is what the hardware does. Skipping
+    /// that step is what made T2's last 39 mismatches: `lea (%rcx,%rdx), %eax`
+    /// computes a 64-bit address and writes 32 bits of it, and the old code
+    /// "zero-extended" the full 64-bit sum - a no-op on an already-64-bit value,
+    /// so the emitted C added the caller's whole 64-bit registers and returned
+    /// `0x100000000` where the machine returned `0` (saturation,
+    /// args=[0x80000000,0x80000000]).
     fn write(&mut self, g: Grp, w: Width, v: VId) {
         let v64 = match w {
             Width::W64 => v,
-            // A 32-bit write zeroes the upper half: `zext`.
-            Width::W32 => self.cast(CastKind::ZExt, v, Width::W64),
+            // A 32-bit write zeroes the upper half: `zext` of the low 32 bits.
+            Width::W32 => {
+                let low = self.narrow(v, Width::W32);
+                self.cast(CastKind::ZExt, low, Width::W64)
+            }
+            // An 8/16-bit write leaves the rest of the register alone.
             _ => {
                 let old = self.read64(g);
                 let mask: u64 = if w == Width::W8 { 0xff } else { 0xffff };
                 let m = self.const_of(!mask, Width::W64);
                 let keep = self.bin(BinOp::And, old, m);
-                let up = self.cast(CastKind::ZExt, v, Width::W64);
+                let low = self.narrow(v, w);
+                let up = self.cast(CastKind::ZExt, low, Width::W64);
                 self.bin(BinOp::Or, keep, up)
             }
         };
@@ -1366,9 +1385,30 @@ impl<'a> Lifter<'a> {
             self.block_def.insert(id, self.cur_defs.clone());
         }
         self.ssa_registers();
+        self.record_return_width();
         // Take, do not move: the caller reads `rep` after this returns, and a
         // report snapshotted before lifting would always claim zero gaps.
         std::mem::replace(&mut self.f, Function::new("", 0))
+    }
+
+    /// Record the width at which this function's answer reaches `RAX`.
+    ///
+    /// A 32-bit register write zeroes bits 63:32 architecturally, and `write`
+    /// above models that write as `zext` - so when every returned value provably
+    /// fits in 32 bits, `RAX` IS `zero_extend_32(value)` on every path. The
+    /// emitted C has to return `uint32_t` to match it: an `int64_t` return that
+    /// sign-extends the same 32 bits is an over-extension in the OUTPUT, and T2
+    /// measured it - saturation's `f(1,-100)` gives machine `RAX = 0xffffff9d`
+    /// against the C's `0xffffffffffffff9d`, 39 of 732 runs.
+    ///
+    /// The width is read off the IR the machine code produced, never off observed
+    /// answers: a width inferred from answers is the gate that collapses to one
+    /// bit and can never fail.
+    fn record_return_width(&mut self) {
+        if rdec_core::width::return_width(&self.f) == 32 {
+            self.f.ret_ty = ty_u(Width::W32);
+            self.rep.ret_w32 += 1;
+        }
     }
 
     /// Turn the per-block register transfer into SSA: phi at joins and at

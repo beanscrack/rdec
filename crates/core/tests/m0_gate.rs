@@ -692,3 +692,44 @@ fn a_constants_width_is_the_emitters_claim() {
         "the rejection must say why: {errs:?}"
     );
 }
+
+/// The declared return type is a WIDTH claim about the bits the caller sees -
+/// `uint32_t` zero-extends on the way out, `int64_t` sign-extends, and the
+/// machine's RAX has exactly the bits the width says (a 32-bit write cleared the
+/// upper half). A returned value that needs more bits than the return type holds
+/// is emitted C that drops them, and the C still compiles, so the verifier is
+/// the only place that can say so.
+#[test]
+fn a_return_wider_than_its_declared_type_is_rejected() {
+    use rdec_core::ir::{BinOp, CastKind, Function, Op, Terminator};
+    use rdec_core::ty::Ty;
+    use rdec_core::verify::verify_ssa;
+
+    let mut f = Function::new("rw", 0);
+    f.ret_ty = Ty::u32();
+    let a = f.emit(f.entry, Op::Param, Ty::u64(), 0x1000);
+    f.params = vec![a];
+    f.block_mut(f.entry).term = Terminator::Return(a);
+    let errs = verify_ssa(&f).expect_err("a 64-bit parameter does not fit uint32_t");
+    assert!(
+        errs.iter().any(|e| e.contains("return type holds")),
+        "the rejection must say why: {errs:?}"
+    );
+
+    // The same value masked and truncated to the width the machine wrote
+    // verifies: this is exactly what a 32-bit register write leaves in RAX.
+    let mut g = Function::new("ok", 0);
+    g.ret_ty = Ty::u32();
+    let a = g.emit(g.entry, Op::Param, Ty::u64(), 0x1000);
+    g.params = vec![a];
+    let lo = g.emit(g.entry, Op::Const(0xffff_ffff), Ty::u64(), 0x1004);
+    let m = g.emit(g.entry, Op::Bin(BinOp::And, a, lo), Ty::u64(), 0x1008);
+    let t = g.emit(
+        g.entry,
+        Op::Cast(CastKind::Trunc, Ty::u32(), m),
+        Ty::u32(),
+        0x100c,
+    );
+    g.block_mut(g.entry).term = Terminator::Return(t);
+    assert_eq!(verify_ssa(&g), Ok(()), "32 bits fit a uint32_t return");
+}

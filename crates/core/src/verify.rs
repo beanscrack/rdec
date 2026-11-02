@@ -120,6 +120,31 @@ pub fn verify(f: &Function) -> Verdict {
                 if *v != NO_VAL && !defined(f, *v) {
                     e.hard(format!("bb{}: ret of undefined %{}", b.id, v));
                 }
+                // The declared return type is a WIDTH CLAIM, and it is the one
+                // type claim in the IR that changes the bits the caller sees:
+                // `uint32_t` zero-extends on the way out, `int64_t` sign-extends,
+                // and the machine's `RAX` has exactly the bits the width says
+                // (a 32-bit write cleared the upper half). A value that needs
+                // more bits than the return type has is emitted C that drops
+                // them, and a pass that widens a returned value - folding a
+                // constant, replacing a `zext` chain, fusing a `select` - breaks
+                // the claim the lifter made from the machine code. Hard, because
+                // the C still compiles: the same reason the branch and Select
+                // checks are hard.
+                if *v != NO_VAL {
+                    if let Some(w) = f.ret_ty.width() {
+                        let bits = w.bits();
+                        if bits < 64 {
+                            let need = crate::width::bits_needed(f, *v);
+                            if need > bits {
+                                e.hard(format!(
+                                    "bb{}: ret %{} needs {need} bits, more than the declared {} return type holds",
+                                    b.id, v, f.ret_ty
+                                ));
+                            }
+                        }
+                    }
+                }
             }
             Terminator::Branch { cond, .. } => {
                 if !defined(f, *cond) {

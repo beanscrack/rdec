@@ -1100,3 +1100,58 @@ can never fail.
 Also named: 29 functions are skipped because RAX is unwritten on some path, and the IR
 dump shows why - at entry, `xor eax,eax` becomes `xor(trunc(%undef), trunc(%undef))` and
 no pass folds `x ^ x -> 0`. An idempotent-op fold admits ~29 more functions to the gate.
+
+## T2 - return width modelled: measured (2026-11-02), GREEN
+
+The option chosen above was the first one, and the question it rests on was settled, not
+assumed: on x86-64 a 32-bit register write **zeroes bits 63:32 architecturally**. A
+function whose answer reaches RAX through such a write has an answer that is exactly
+`zero_extend_32(value)` - bits 63:32 are a fact, not "undefined above bit 31". So the
+emitted C returning `int64_t` and sign-extending was an over-extension in the OUTPUT, and
+the harness's old framing ("the Win64 ABI leaves the upper halves undefined, so reading
+the whole RAX is honest") was that over-extension wearing the ABI's clothes.
+
+Three pieces, each measured:
+
+* `rdec_core::width::bits_needed` - how many bits provably hold a value, read off the IR:
+  a sound under-approximation that answers 64 ("any u64") the moment it cannot prove less
+  (a cycle - a loop-carried phi - claims nothing, and `Phi` merges at its **widest** edge).
+  `return_width` takes the max over every `Return` and gives 32 or 64.
+* The lifter records it (`lift.rs::record_return_width`) as `f.ret_ty = uint32_t`, counted
+  in `Report::ret_w32` and printed by both gates; `emit_c` casts the `return` through the
+  declared type; `rdec t2`'s wrapper casts the **call expression**, whose type is that
+  declared return type, so the C value is widened in C - defined behaviour, not a
+  `uint64_t` pointer reading bits the callee never promised.
+* `verify` checks the claim (a returned value needing more bits than the declared return
+  type holds is a hard error), so no pass can quietly widen a returned value: the check
+  fires on the IR, not on the emitted C, and `rdec c` counts the function as
+  "invalid after passes" instead of emitting a lie.
+
+The first measurement after that was still 39 mismatches, which is the check earning its
+keep: `bits_needed` said 64 for saturation, and the reason was upstream in the lifter.
+`lea (%rcx,%rdx), %eax` computes a 64-bit address and writes 32 bits of it, and
+`write(g, W32, v)` "zero-extended" the full 64-bit sum - a no-op on an already-64-bit
+value - so the emitted C added the caller's whole 64-bit registers and returned
+`0x100000000` where the machine returned `0` for args=[0x80000000,0x80000000]. Fixed:
+a W32 write truncates the value to 32 bits before the zext (the W8/W16 partial-write path
+got the same narrowing).
+
+```
+lift: 120 objects, 141 functions lifted, 141 pass verify_ssa, 85 with no gaps and no exits
+return width: 116 of 141 functions answer at 32-bit width
+emit-c: 141 lifted functions, 84 emitted C, 57 refused, 0 invalid after passes; clang -Werror: OK
+t2: runnable: 31 functions on both sides, 53 not runnable
+return width: 30/31 of the runnable functions declare uint32_t
+compared: 732 | match: 732 | mismatch: 0 | not compared (one side faulted): 0 | of the
+  mismatches, differing only above bit 31: 0
+OK: the decompiled C computes the same 64-bit result as the machine code on all 732 runs
+```
+
+The gate went 693 -> 732 matched of 732 compared, with the comparison set unchanged (same
+31 functions, same 732 jobs) - no function was dropped to make it green, and the
+"differing only above bit 31" bucket is kept as its own count: a nonzero value there names
+a function whose recorded width is wrong, and it is still a mismatch.
+
+The T2 gate is green for the first time. What it does NOT yet cover is the green part of
+the corpus: 57 functions are refused by the emitter, 29 return RAX unwritten on some path,
+14 touch memory outside the modelled frame. Width is modelled; coverage is the work.

@@ -21,11 +21,17 @@
 //!    line per job; the parent restarts after the job that never reported and
 //!    files it under faults. A divide-by-zero in one function cannot erase the
 //!    other seventy measurements, and cannot masquerade as a match either.
-//!  * **The comparison width is RAX.** The Win64 ABI leaves the upper halves of
-//!    RAX undefined for a 32-bit return, and x86-64 zeroes them on every 32-bit
-//!    write — which is what the lifter models — so the full register is the
-//!    honest thing to compare. A `char` return would not be, and no snippet in
-//!    the corpus has one.
+//!  * **The comparison width is RAX, and the C side is widened from its own
+//!    declared return type.** A 32-bit register write zeroes bits 63:32 of RAX
+//!    architecturally, so a function whose answer reaches RAX through one has an
+//!    answer that is exactly `zero_extend_32(value)` — the upper half is a fact,
+//!    not undefined. The lifter records that width and the emitted C returns
+//!    `uint32_t`; the harness calls it as `uint32_t` and widens the value in C,
+//!    so both sides' 64 bits are compared with nothing guessed at. (The earlier
+//!    claim here — "the Win64 ABI leaves the upper halves undefined for a 32-bit
+//!    return, so reading the full RAX of a `uint64_t` call is the honest thing" —
+//!    was the emitter's over-extension wearing the ABI's clothes: it made 39 of
+//!    732 runs disagree on bits the machine code had already cleared.)
 //!
 //! Loop-shaped functions get small arguments only: a 2^31-trip loop is a
 //! timeout, not a test. Loop-free functions additionally get the width and
@@ -34,6 +40,7 @@
 use crate::m4::{self, Subject};
 use rdec_core::emit_c::{emit_c, PRELUDE};
 use rdec_core::ir::{BinOp, CastKind, Function, Op, Terminator};
+use rdec_core::ty::{Sx, Ty, Width};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -269,6 +276,40 @@ fn job_tables(jobs: &[(usize, usize)]) -> String {
     )
 }
 
+/// The decompiled side's call wrapper, one per function.
+///
+/// The `(uint64_t)` cast is applied to the CALL EXPRESSION, whose type is the
+/// emitted function's own declared return type. That is what "compare the C side
+/// widened from its declared return type" means, and it is plain C: a function
+/// declared `uint32_t` called as `uint32_t` yields the 32-bit value the C
+/// computed, and the cast widens it - which is the same bits a 32-bit machine
+/// write leaves in RAX. Reading all 64 bits of a call made through a
+/// `uint64_t`-returning pointer is the other claim, and the worse one: the ABI
+/// leaves the callee's upper bits unspecified, so the gate would be comparing
+/// bits nobody promised.
+///
+/// The arguments are the ABI's four, cast down to the emitted signature's
+/// `int64_t` - spelled here rather than hidden in a function-pointer cast.
+fn c_wrapper(idx: usize, cname: &str) -> String {
+    format!(
+        "static uint64_t w{idx}(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {{\n\
+         \x20 return (uint64_t){cname}((int64_t)a, (int64_t)b, (int64_t)c, (int64_t)d);\n}}\n"
+    )
+}
+
+/// Does this function's emitted C declare a 32-bit return, i.e. did the lifter
+/// record that its answer reaches `RAX` through a 32-bit write? Counted so the
+/// width modelling is a number the gate prints, not a claim in a comment.
+fn declares_32_bit_return(f: &Function) -> bool {
+    matches!(
+        f.ret_ty,
+        Ty::Int {
+            w: Width::W32,
+            sx: Sx::Unsigned
+        }
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Running a harness.
 // ---------------------------------------------------------------------------
@@ -492,16 +533,19 @@ fn snippet_of(obj: &str) -> String {
 
 /// Does this pair differ only in RAX's top 32 bits?
 ///
-/// An `int f(int,int)` answers in EAX, and a 32-bit write zeroes bits 32..63 of
-/// RAX; the emitted C returns `int64_t` and sign-extends. So some pairs agree on
-/// the 32 bits the source ever had and differ only in how the answer was
-/// stretched to 64 — that is the emitter's extension convention, not its
-/// arithmetic. It is counted as its own bucket and printed, and it is STILL a
-/// mismatch: the mask experiments (compare at 32 bits; infer the width from the
-/// observed answers) all ended with a gate that could not fail — a function that
-/// returned 0 on every vector read as "1 bit wide", and saturation's
-/// `C = 0x7fffffffffffffff` against `machine = 0xffffffff` is not an extension of
-/// anything, it is a different number. RAX is compared in full.
+/// This is the signature of a WIDTH modelling error, and after the return-width
+/// work it should read zero: the lifter records the width the answer reaches
+/// RAX at, the emitted C returns that width, and the harness widens the C value
+/// from its declared type. A pair that agrees in the low 32 bits and differs
+/// above is a function whose recorded width is wrong (the emitter stretched a
+/// 32-bit answer to 64, or clipped a 64-bit one), which is why the bucket is
+/// kept: it names the class, and the count is the work list.
+///
+/// It is STILL a mismatch. The mask experiments (compare at 32 bits; infer the
+/// width from the observed answers) all ended with a gate that could not fail —
+/// a function that returned 0 on every vector read as "1 bit wide", and
+/// saturation's `C = 0x7fffffffffffffff` against `machine = 0xffffffff` is not an
+/// extension of anything, it is a different number. RAX is compared in full.
 fn extension_only(x: u64, y: u64) -> bool {
     (x ^ y) >> 32 != 0 && (x as u32) == (y as u32)
 }
@@ -718,6 +762,13 @@ pub fn cmd_t2(args: &[String]) -> Result<i32, String> {
     }
     let loop_free = subs.iter().filter(|s| !s.loops).count();
     let skipped_n: usize = skipped.values().map(|v| v.len()).sum();
+    // The width modelling, as a number: how many of the functions about to be
+    // compared declare a 32-bit return because their answer reaches RAX through
+    // a 32-bit write (which zeroes bits 63:32), versus the 64-bit default.
+    let ret32 = subs
+        .iter()
+        .filter(|s| declares_32_bit_return(&s.s.f))
+        .count();
 
     // --- the decompiled side: the emitter's own text, plus a table ---
     let mut decomp = String::from(
@@ -733,14 +784,7 @@ pub fn cmd_t2(args: &[String]) -> Result<i32, String> {
     }
     decomp.push_str("typedef uint64_t (*Fn)(uint64_t, uint64_t, uint64_t, uint64_t);\n");
     for sb in &subs {
-        // A wrapper per function: the emitted signature is the IR's (int64_t),
-        // the table's is the ABI's (uint64_t), and the cast is spelled here
-        // rather than hidden in a function-pointer cast.
-        decomp.push_str(&format!(
-            "static uint64_t w{}(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {{\n\
-             \x20 return (uint64_t){}((int64_t)a, (int64_t)b, (int64_t)c, (int64_t)d);\n}}\n",
-            sb.c_sym, sb.s.cname
-        ));
+        decomp.push_str(&c_wrapper(sb.c_sym, &sb.s.cname));
     }
     decomp.push_str("static const Fn FN[] = {\n");
     for sb in &subs {
@@ -854,6 +898,10 @@ pub fn cmd_t2(args: &[String]) -> Result<i32, String> {
         jobs.len()
     );
     println!(
+        "return width: {ret32}/{} of the runnable functions declare uint32_t (their answer reaches RAX through a 32-bit write, which zeroes bits 63:32), the rest int64_t",
+        subs.len()
+    );
+    println!(
         "build: {built}/{} harnesses with {cc} -Werror in {:?}, {} failures",
         builds.len(),
         t0.elapsed(),
@@ -882,7 +930,9 @@ pub fn cmd_t2(args: &[String]) -> Result<i32, String> {
         }
     }
 
-    println!("compare: the full 64-bit RAX, every vector, on both sides");
+    println!(
+        "compare: the full 64-bit RAX, every vector, on both sides; the C side widened from its declared return type"
+    );
 
     let mut match_n = 0usize;
     let mut mismatch: Vec<String> = Vec::new();
@@ -1185,5 +1235,36 @@ mod tests {
             !synthetic("fn_3b", 0x4),
             "only the name discovery actually invented is synthetic"
         );
+    }
+
+    /// The widening is a C cast on the call expression, so the type that decides
+    /// it is the emitted function's declared return type: a `uint32_t` function
+    /// called as `uint32_t` yields the 32-bit value the C computed and the cast
+    /// widens it, which is the same bits a 32-bit machine write leaves in RAX.
+    /// The wrapper must not reach RAX through a `uint64_t`-returning pointer -
+    /// that compares bits the ABI leaves unspecified.
+    #[test]
+    fn the_c_side_is_widened_from_its_declared_return_type() {
+        let w = c_wrapper(3, "o7_f");
+        assert!(w.contains("static uint64_t w3("), "{w}");
+        assert!(w.contains("(uint64_t)o7_f(("), "{w}");
+        assert!(!w.contains('*'), "no function-pointer cast: {w}");
+    }
+
+    /// Which functions the gate counts as 32-bit-returning, pinned on the two
+    /// declarations the lifter emits.
+    #[test]
+    fn a_declared_uint32_return_is_the_counted_width() {
+        let mut f = Function::new("w32", 0);
+        let c = f.emit(f.entry, Op::Const(7), Ty::u32(), 0);
+        f.block_mut(f.entry).term = Terminator::Return(c);
+        f.ret_ty = Ty::u32();
+        assert!(declares_32_bit_return(&f));
+
+        let mut g = Function::new("w64", 0);
+        let d = g.emit(g.entry, Op::Const(7), Ty::u64(), 0);
+        g.block_mut(g.entry).term = Terminator::Return(d);
+        g.ret_ty = Ty::i64();
+        assert!(!declares_32_bit_return(&g));
     }
 }

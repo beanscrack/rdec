@@ -23,6 +23,7 @@ pub mod passes;
 pub mod tv;
 pub mod ty;
 pub mod verify;
+pub mod width;
 
 pub use ir::{BbId, Function, Op, Terminator, VId, NO_BB, NO_VAL};
 pub use ty::{Sx, Ty, Width};

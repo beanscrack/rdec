@@ -691,6 +691,7 @@ pub fn cmd_lift(args: &[String]) -> Result<i32, String> {
     let mut unreach_total = 0usize;
     let mut undef_live = 0usize;
     let mut scaffolding = 0usize;
+    let mut ret_w32 = 0usize;
     let (mut ret_n, mut no_ret, mut step_budget, mut holes, mut unmodeled_load, mut fault) =
         (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
     let mut opaque = 0usize;
@@ -795,6 +796,7 @@ pub fn cmd_lift(args: &[String]) -> Result<i32, String> {
             unreach_total += rep.unreachable_blocks;
             undef_live += rep.undef_live_ins;
             scaffolding += rep.scaffolding_removed;
+            ret_w32 += rep.ret_w32;
             // M3's semantic check, on top of the structural one: run the IR
             // interpreter over the lifted function. It is strict - every operand
             // it consumes must already be defined - so a renaming that leaves a
@@ -857,6 +859,9 @@ pub fn cmd_lift(args: &[String]) -> Result<i32, String> {
     }
     println!(
         "lift: {objects} objects, {lifted} functions lifted, {verified} pass verify_ssa, {clean} with no gaps and no exits"
+    );
+    println!(
+        "return width: {ret_w32} of {lifted} functions answer at 32-bit width (a 32-bit write zeroes RAX's upper half, so the emitted C returns uint32_t)"
     );
     println!(
         "evidence: {gap_total} loud gaps, {exit_total} Exit terminators, {unnamed_total} unnamed call targets, {clobber_total} modelled register clobbers, {unreach_total} unreachable blocks dropped, {scaffolding} live-in placeholders resolved, {undef_live} of them `undef` (the ABI question)"
