@@ -1155,3 +1155,101 @@ a function whose recorded width is wrong, and it is still a mismatch.
 The T2 gate is green for the first time. What it does NOT yet cover is the green part of
 the corpus: 57 functions are refused by the emitter, 29 return RAX unwritten on some path,
 14 touch memory outside the modelled frame. Width is modelled; coverage is the work.
+
+## M4 steps 4-6 and M8 step 0 - measured (2026-11-02), all gates re-run by the parent
+
+Everything below was verified by running the command on the committed tree, not read
+from a report. Commits: `4a1be44`, `9ba1519`, `8bffd9b`+`3169162`, `26cdf48`,
+`0459b3d`, `b692e79`, `08b399b`, `bac8258`, `ab189c2`. CI green on every one.
+
+### The C emission count 56 -> 74 -> 84, from two type bugs in the flag lowerings
+
+| fix | measure |
+|---|---|
+| fusion constants carry the operation's width (`SB::set_ty(Ctx.ty)`) - a fused SF of a 32-bit `sub` was `and(u32, 0x80000000u64)`, "mixes widths W32 and W64" | pass breaks 68 -> 21, emitted C 56 -> **74** |
+| constant flag values are Bool (`CF`/`OF` of And/Or/Xor, ZF of shift-by-0, OF of SAR-by-1 returned `sb.c(0)`, an INTEGER) - the tree built `xor(bool, uint32_t)`, "mixes widths W1 and W32" | pass breaks 21 -> **0**, emitted C 74 -> **84** |
+| `movsx` re-reads its source as signed at its own width (a same-width Bitcast) before SExt - the emitter was right to refuse `SExt` of a `uint32_t` | the 12-function `sext` class -> **gone**, emitted C 84, refused 67 -> **57** |
+
+Accounting closes at every step: 141 = emitted + refused + pass-broken (84 + 57 + 0).
+Note the ordering lesson: the type bug survived the width fix. It was never about width.
+
+### T2 (differential execution) - landed, found a miscompile, and is now green
+
+`rdec t2 --corpus`: links each corpus `.obj`, calls the machine function through its
+COFF symbol (Win64 ABI, `RAX` read with inline asm), calls the generated C on the same
+4-argument vectors, compares the FULL 64-bit `RAX`. Crashes are their own bucket;
+unrunnable functions are named with a reason.
+
+| T2 measure | first run | after `sar` | after self-idioms |
+|---|---:|---:|---:|
+| functions runnable | 31 | 31 | **44** |
+| compared | 732 | 732 | **1044** |
+| match | 617 | 693 | **1044** |
+| mismatch | 115 | 39 | **0** |
+
+What T2 caught that nothing else could: `BinOp::Sar` on an unsigned-typed operand was
+emitted as `((uint64_t)x >> cnt)` - a **logical** shift. `sar` is arithmetic by
+definition; the operand is unsigned only because registers are modelled as one unsigned
+W64 value, the same root cause as `movsx`. 76 of 732 runs disagreed
+(`f(0x80000000,0x80000000,1,0)`: machine `0xa0000000`, C `0x60000000`).
+
+The last 39 were a deeper one: a 32-bit write of a 64-bit-typed value kept the full
+64-bit computation, because the write path returned the operand unchanged when it was
+already W64-typed - so `lea (%rcx,%rdx),%eax` emitted C that added the caller's whole
+64-bit registers (`0x100000000` vs the machine's `0`). A write at width *w* truncates to
+*w* first. The return width is now derived from the machine code (`width.rs` proves the
+fewest bits that hold each returned value; a loop-carried cycle claims nothing, a phi
+merges at its widest edge), and `verify_ssa` hard-errors when a returned value needs more
+bits than the declared return type. 30 of 31 runnable functions declare `uint32_t`,
+matching the architectural fact that a 32-bit write zeroes `RAX[63:32]`.
+
+`xor eax,eax` (29 functions excluded as "returns RAX unwritten") was fixed in the
+**lifter**, not `const_fold`: the strict interpreter faults on reading `undef`, so a
+general `x^x -> 0` fold deletes a faulting read and changes meaning - the same trap as
+DCE of a `getflag` read. `xor r,r`/`sub r,r` compute 0 **without reading** the operand,
+which is a machine fact, and the lifter now emits that (flags still produced; `sbb r,r`
+= -CF stays a named gap). The lifter's self-idiom counter says 81; an independent
+`llvm-objdump` census of the corpus says 81.
+
+**Scope of the T2 claim, stated plainly:** proven = the returned 64-bit value agrees on
+1044 (function, input) pairs across 44 of 141 functions. Not proven = the other 97
+functions (57 emitter refusals, 16 RAX-unwritten, 14 memory outside the modelled frame,
+4 unlinkable file-static, 5 no COFF symbol, 1 `Exit`), and **memory effects** - T2
+compares the return value, not writes to the flat store. A green T2 is a green sample.
+
+### M8 step 0: MSVC C++ name demangling, gated against `llvm-nm` - 68/68
+
+`crates/demangle/` (zero production deps) decodes MSVC x64 decorated names to
+`Name{text, kind}` / `Unsupported{raw, reason}`, kinds = FreeFunction /
+MemberFunction{class, constness} / Constructor(`??0`) / Destructor(`??1`) / StaticMember /
+Vtable - the classification M8 consumes, not the pretty text. Gate `rdec demangle --cpp`
+over 15 header-free C++ snippets: 69 defined function symbols, 68 supported, **68 agreed
+with `llvm-nm`, 0 disagreed**, 1 Unsupported by design (template fixture). Fails on any
+disagreement, on zero compared, and below a stated floor.
+
+Measured, not copied: the planning brief's example `?area@Circle@@QEAA_NXZ` is **non**-const
+(this-adjust `A` non-const, `B` const, `C` volatile, `D` cv); x64 refs are `AEAH`/`AEBH`
+shaped and `CED` is three builtins, not a volatile ref. A 45-pair measured table is a unit
+test. A name that demangles to something plausible is the failure mode, so templates,
+rvalue refs, function-pointer types, arrays, RTTI, operator/new/delete names, data
+symbols and anon-namespace labels each refuse with a named reason.
+
+The C++ corpus exposed a **loader bug**: COFF long symbol names were read 4 characters
+short (string-table offsets are relative to the table start, which includes the 4-byte
+size field), so `??0Circle@@QEAA@N@Z` came out `ircle@@QEAA@N@Z`. Invisible to the C
+corpus, whose names are short. The demangle gate is the proof it is fixed: symbols read
+through that loader match `llvm-nm` by name 1:1, zero unmatched.
+
+CI: `corpus --cpp` runs before the test step (the `.obj` files are generated, not
+committed) and a step runs `demangle --cpp` with the same-toolchain two-build manifest
+check - not `git diff` against the committed manifest, which compares clang 22.1.8 with
+the runner's 20.1.8.
+
+### Where this leaves M8
+
+Names, ctor/dtor identification and the `this`-in-RCX convention are available and
+measured. Nothing has lifted C++ machine code yet: `rdec cpp --corpus` is the first real
+measurement (Kind census, lifted/valid/emitted/refused by class), in progress. Then
+T2 for C++ free functions, then member calls with a pointer argument in the differential
+(the harness currently excludes pointer args, so member functions are not T2-runnable -
+stated, not faked), then vtable dispatch last.
