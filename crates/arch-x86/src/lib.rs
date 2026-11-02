@@ -7,4 +7,5 @@
 pub mod decode;
 pub mod discover;
 pub mod flags;
+pub mod lift;
 pub mod loader;

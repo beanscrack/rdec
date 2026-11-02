@@ -655,3 +655,40 @@ fn pipeline_is_deterministic() {
         "pipeline output must not hard-fail verification: {warns:?}"
     );
 }
+
+/// A constant's width is the emitter's claim, and the IR must keep it.
+///
+/// `Function::emit` used to take the type from `Op::ty`, where `Const` answered
+/// `Ty::u64()` - so `add ecx, 1` (a W32 operation on an 8-bit immediate) came
+/// out as a W32 + W64 mix, and the lifter's declared width was thrown away in
+/// silence. Pinned here because the symptom showed up two layers away, in the
+/// verifier's mixed-width check over lifted code.
+#[test]
+fn a_constants_width_is_the_emitters_claim() {
+    use rdec_core::ir::{Function, Op, Terminator};
+    use rdec_core::ty::Ty;
+    use rdec_core::verify::verify_ssa;
+
+    let mut f = Function::new("c", 0);
+    f.ret_ty = Ty::u32();
+    let c = f.emit(f.entry, Op::Const(1), Ty::u32(), 0);
+    assert_eq!(
+        f.ty_of(c),
+        Some(Ty::u32()),
+        "emit must honour the declared width of a constant"
+    );
+    f.block_mut(f.entry).term = Terminator::Return(c);
+    assert_eq!(verify_ssa(&f), Ok(()), "1 fits in uint32_t");
+
+    // And a constant that does not fit its declared width is a hard error: the
+    // declared type is the only size claim a constant carries.
+    let mut g = Function::new("d", 0);
+    g.ret_ty = Ty::u32();
+    let big = g.emit(g.entry, Op::Const(1 << 40), Ty::u32(), 0);
+    g.block_mut(g.entry).term = Terminator::Return(big);
+    let errs = verify_ssa(&g).expect_err("0x1_0000_0000 does not fit uint32_t");
+    assert!(
+        errs.iter().any(|e| e.contains("does not fit")),
+        "the rejection must say why: {errs:?}"
+    );
+}

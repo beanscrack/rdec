@@ -44,7 +44,7 @@ pub enum Syntax {
     Nasm,
 }
 
-fn formatter(syntax: Syntax) -> Box<dyn Formatter> {
+pub(crate) fn formatter(syntax: Syntax) -> Box<dyn Formatter> {
     match syntax {
         Syntax::Intel => Box::new(IntelFormatter::new()),
         Syntax::Nasm => Box::new(NasmFormatter::new()),

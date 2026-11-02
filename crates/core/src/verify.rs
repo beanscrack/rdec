@@ -183,6 +183,27 @@ pub fn verify_ssa(f: &Function) -> Verdict {
                 seen_non_phi = true;
             }
         }
+        // A constant must fit the width it was declared at. Constants carry no
+        // width of their own (`Op::ty` deliberately returns None for them), so
+        // the declared type is the only claim about size - and a `uint32_t`
+        // constant holding 0x1_0000_0000 is a lie about the value.
+        for i in &b.instrs {
+            if let Op::Const(v) = i.op {
+                match f.ty_of(i.dest).and_then(|t| t.width()) {
+                    None => e.hard(format!("bb{}: const %{} has no integer type", b.id, i.dest)),
+                    Some(w) => {
+                        let bits = w.bits();
+                        if bits < 64 && (v >> bits) != 0 {
+                            e.hard(format!(
+                                "bb{}: const %{} = {v:#x} does not fit {bits}-bit type",
+                                b.id, i.dest
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
         // phi incoming blocks == predecessors, as a multiset.
         for i in &b.instrs {
             if let Op::Phi(pairs) = &i.op {

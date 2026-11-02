@@ -307,7 +307,13 @@ impl Op {
     /// or (for `Select`/`Phi`) the type is the instruction's recorded type.
     pub fn ty(&self, f: &Function) -> Option<Ty> {
         Some(match self {
-            Op::Const(_) => Ty::u64(),
+            // A constant has no intrinsic width: `1` is the same bit pattern at
+            // every width, and which width it means is the *emitter's* claim.
+            // Returning `Ty::u64()` here (the first version) made `Function::emit`
+            // overwrite the width the lifter declared, so `add ecx, 1` became a
+            // W32 + W64 mix - the lifter asked for uint32_t and silently got a
+            // 64-bit constant. The value's stored type is the answer.
+            Op::Const(_) => return None,
             Op::ConstF(_) => Ty::f64(),
             Op::Undef | Op::Opaque(_) => return None,
             Op::Param | Op::Copy(_) => return None,

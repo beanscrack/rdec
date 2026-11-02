@@ -760,6 +760,40 @@ Bugs found by building this, each pinned by a test:
   nothing: `let Ok(obj) = load(path) else { continue }` reported "no overlap
   found" over an empty loop. Same lesson as the CI hygiene test, paid for twice.
 
+### Measured: M2 step 1 (lifting x86-64 -> IR), 2026-11-02 — **gate RED, by design**
+
+`rdec lift --corpus`, all 120 objects:
+
+```
+lift: 120 objects, 141 functions lifted, 101 pass verify_ssa, 63 with no gaps and no exits
+evidence: 135 loud gaps, 64 Exit terminators, 17 unnamed call targets, 153 modelled register clobbers
+FAIL: 40 lifted functions are not valid IR
+```
+
+| claim | measurement |
+|---|---|
+| Subset lifted | mov/movzx/movsx/movsxd/lea, add/sub/and/or/xor (register and memory destinations), shl/shr/sar with the hardware count mask, inc/dec, neg/not, cmp/test, imul, push/pop, xchg, jcc/jmp/call/ret, setcc, cmovcc. Everything else becomes `Op::Opaque` in the IR and is counted: 135 gaps, 64 `Exit`s, 17 unnamed call targets. |
+| Register model | One `W64` SSA value per register; 32-bit read = `trunc`, 32-bit write = `zext` (the x86 clear-upper-half rule), 8/16-bit write = the mask/or pair. 153 register clobbers modelled after calls, per caller-saved register, as `Opaque` — a value kept live across a call is a silent miscompile. |
+| Flags | `cmp`/`test`/arith emit a `Ty::Flags` SSA value; `jcc`/`setcc`/`cmovcc` read it with `GetFlag`, expanded to the flag-bit expression (L = SF^OF, A = ^CF & ^ZF, ...). Fusion (`fuse.rs`) and DCE simplify them; the lifter stays literal. |
+| Structural soundness | 101 of 141 pass `verify_ssa`. The 40 failures are all one named class: a register value defined in one block and used in a join successor with no phi — SSA construction, which is M3. The gate stays red; the threshold was not moved. |
+
+Two bugs found, each pinned by a test:
+- **The IR discarded the width of a constant.** `Function::emit` takes the type
+  from `Op::ty`, and `Op::Const(_) => Ty::u64()` — so the lifter's declared
+  `uint32_t` for `add ecx, 1` was silently overwritten with 64-bit, and the
+  verifier's mixed-width check fired two layers away in lifted code. A constant
+  has no intrinsic width; the emitter's claim is the value's type
+  (`Op::ty(Const) => None`), and a constant that does not fit its declared width
+  is now a hard verifier error. Pinned by `a_constants_width_is_the_emitters_claim`.
+- **Overflow and parity are different bits.** The condition-code map folded
+  `pe` (parity even) into the signed-overflow condition, so `jo` and `jp` would
+  have compiled to the same test. The dead-code lint found it (`Cond::No` never
+  constructed), which is the whole argument for `-D warnings`.
+
+Attribution lesson: the IR recorded each instruction's **block** address, so
+`%51` and the instruction that produced it could not be matched — a width
+complaint was untraceable. IR nodes now carry the instruction address.
+
 ## 10. Changes from v1
 
 | Change | Reason |

@@ -19,6 +19,13 @@ fn main() {
         "selftest" => cmd_selftest(),
         "corpus" => cmd_corpus(&args[1..]),
         "disasm" => m1::cmd_disasm(&args),
+        "lift" => match m1::cmd_lift(&args) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("lift: {e}");
+                2
+            }
+        },
         "discover" => match m1::cmd_discover(&args) {
             Ok(rc) => rc,
             Err(e) => {

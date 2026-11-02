@@ -628,3 +628,206 @@ pub fn cmd_discover(args: &[String]) -> Result<i32, String> {
     println!("OK: every symbol-table function is reachable, coverage above the 99.5% gate");
     Ok(0)
 }
+
+pub fn cmd_lift(args: &[String]) -> Result<i32, String> {
+    use rdec_arch_x86::discover::{discover_all, Code};
+    use rdec_arch_x86::lift::lift_one;
+    use rdec_core::fmt_ir::format_function;
+    use rdec_core::verify::verify_ssa;
+    use std::collections::HashMap;
+
+    const TAKES_VALUE: [&str; 3] = ["--limit", "--ir", "--syntax"];
+    let mut files: Vec<String> = Vec::new();
+    let mut ir_name: Option<String> = None;
+    let mut skip_value = false;
+    for a in args.iter().skip(1) {
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+        if TAKES_VALUE.contains(&a.as_str()) {
+            skip_value = true;
+            if a == "--ir" {
+                ir_name = Some(args[args.iter().position(|x| x == a).unwrap() + 1].clone());
+            }
+            continue;
+        }
+        if !a.starts_with("--") {
+            files.push(a.clone());
+        }
+    }
+    if args.iter().any(|a| a == "--corpus") {
+        let man = std::fs::read_to_string("corpus/manifest.tsv")
+            .map_err(|e| format!("corpus/manifest.tsv: {e}"))?;
+        for line in man.lines() {
+            if line.starts_with('#') || line.starts_with("name\t") {
+                continue;
+            }
+            if let Some(o) = line.split('\t').nth(2) {
+                files.push(o.to_string());
+            }
+        }
+    }
+    if files.is_empty() {
+        return Err(
+            "usage: rdec lift <object.obj> [...] [--corpus] [--limit N] [--ir NAME]".to_string(),
+        );
+    }
+    let limit = args
+        .iter()
+        .position(|a| a == "--limit")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(usize::MAX);
+
+    let mut objects = 0usize;
+    let mut lifted = 0usize;
+    let mut verified = 0usize;
+    let mut clean = 0usize;
+    let mut gap_total = 0usize;
+    let mut exit_total = 0usize;
+    let mut unnamed_total = 0usize;
+    let mut clobber_total = 0usize;
+    let mut first_bad: Option<String> = None;
+    let mut first_gappy: Option<String> = None;
+    let mut budget = limit;
+
+    for file in &files {
+        let obj = loader::load(Path::new(file))?;
+        objects += 1;
+        let mut ranges: Vec<Code> = Vec::new();
+        let mut idx_of = HashMap::new();
+        let mut base_of: Vec<u64> = Vec::new();
+        let mut next_base = 0u64;
+        for (i, sec) in obj.sections.iter().enumerate() {
+            if obj.is_code(i) && !sec.bytes.is_empty() {
+                idx_of.insert(i, ranges.len());
+                base_of.push(next_base);
+                ranges.push(Code {
+                    base: next_base,
+                    bytes: sec.bytes.as_slice(),
+                });
+                next_base += sec.bytes.len() as u64 + 16;
+            }
+        }
+        if ranges.is_empty() {
+            continue;
+        }
+        let mut seeds: HashMap<usize, (Vec<u64>, Vec<u64>)> = HashMap::new();
+        for i in obj.code_symbols() {
+            let s = &obj.symbols[i];
+            let sec = s.section.unwrap();
+            if !obj.is_code(sec) || s.name.starts_with('.') || s.size == 0 {
+                continue;
+            }
+            if let Some(&r) = idx_of.get(&sec) {
+                seeds.entry(r).or_default().0.push(base_of[r] + s.offset);
+            }
+        }
+        for (sec, rels) in obj.sections.iter().enumerate() {
+            let Some(&r) = idx_of.get(&sec) else { continue };
+            for rl in &rels.relocations {
+                if !matches!(rl.typ, 2 | 4 | 5 | 6 | 7) {
+                    continue;
+                }
+                if let Some(t) = obj.symbols.get(rl.symbol) {
+                    if t.section == Some(sec) && !t.name.starts_with('.') {
+                        seeds.entry(r).or_default().1.push(base_of[r] + t.offset);
+                    }
+                }
+            }
+        }
+        let plan = discover_all(&ranges, &seeds);
+
+        // Addresses we can name: defined symbols, and relocation targets (the
+        // callee of a call, which is what a call target needs to compile).
+        let mut names: HashMap<u64, String> = HashMap::new();
+        for (i, sec) in obj.sections.iter().enumerate() {
+            let Some(&r) = idx_of.get(&i) else { continue };
+            for s in obj
+                .symbols
+                .iter()
+                .filter(|s| s.section == Some(i) && !s.name.starts_with('.'))
+            {
+                names.insert(base_of[r] + s.offset, s.name.clone());
+            }
+            for rl in &sec.relocations {
+                if let Some(t) = obj.symbols.get(rl.symbol) {
+                    names.insert(base_of[r] + rl.address, t.name.clone());
+                }
+            }
+        }
+
+        for (k, &start) in plan.functions.iter().enumerate() {
+            if budget == 0 {
+                break;
+            }
+            budget -= 1;
+            let Some((_, rg)) = ranges
+                .iter()
+                .enumerate()
+                .find(|(_, r)| start >= r.base && start < r.base + r.bytes.len() as u64)
+            else {
+                continue;
+            };
+            let end = plan.functions[k + 1..]
+                .iter()
+                .find(|a| **a >= rg.base && **a < rg.base + rg.bytes.len() as u64)
+                .copied()
+                .unwrap_or(rg.base + rg.bytes.len() as u64);
+            let name = names
+                .get(&start)
+                .cloned()
+                .unwrap_or_else(|| format!("fn_{start:x}"));
+            let (f, rep) = lift_one(&name, rg.bytes, rg.base, start, end, &plan, &names);
+            lifted += 1;
+            gap_total += rep.gaps;
+            exit_total += rep.exits;
+            unnamed_total += rep.unnamed_calls;
+            clobber_total += rep.clobbers;
+            match verify_ssa(&f) {
+                Ok(()) => verified += 1,
+                Err(errs) => {
+                    if first_bad.is_none() {
+                        first_bad = Some(format!("{file} :: {name}: {}", errs.join("; ")));
+                    }
+                }
+            }
+            if rep.gaps == 0 && rep.exits == 0 {
+                clean += 1;
+            } else if first_gappy.is_none() && rep.gaps > 0 {
+                first_gappy = Some(format!(
+                    "{file} :: {name}: {} gaps, {} exits",
+                    rep.gaps, rep.exits
+                ));
+            }
+            if let Some(w) = &ir_name {
+                if *w == name {
+                    println!("{}", format_function(&f));
+                }
+            }
+        }
+    }
+    println!(
+        "lift: {objects} objects, {lifted} functions lifted, {verified} pass verify_ssa, {clean} with no gaps and no exits"
+    );
+    println!(
+        "evidence: {gap_total} loud gaps, {exit_total} Exit terminators, {unnamed_total} unnamed call targets, {clobber_total} modelled register clobbers"
+    );
+    if let Some(b) = first_bad {
+        println!("first verifier rejection: {b}");
+    }
+    if let Some(g) = &first_gappy {
+        println!("first function with gaps: {g}");
+    }
+    if verified == lifted && lifted > 0 {
+        println!("OK: every lifted function is structurally valid IR");
+        Ok(0)
+    } else {
+        println!(
+            "FAIL: {} lifted functions are not valid IR",
+            lifted - verified
+        );
+        Ok(1)
+    }
+}
