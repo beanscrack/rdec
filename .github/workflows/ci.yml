@@ -105,6 +105,17 @@ jobs:
         shell: powershell
         run: cargo run -q -p rdec-cli -- cpp --corpus
 
+      - name: "t2 (differential: decompiled C value-verified against the machine)"
+        # The strongest gate in the repo was not in CI: it links the corpus objects,
+        # calls the machine code and the generated C on the same vectors, and compares
+        # the full 64-bit RAX. Red here means a miscompile, not a style problem.
+        shell: powershell
+        run: cargo run -q -p rdec-cli -- t2 --corpus
+
+      - name: "t2 --cpp (M8 step 3: decompiled C++ value-verified against the machine)"
+        shell: powershell
+        run: cargo run -q -p rdec-cli -- t2 --cpp
+
       - name: status (prints section 9's table from the commands above)
         run: cargo run -q -p rdec-cli -- status
 
