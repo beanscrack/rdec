@@ -50,6 +50,10 @@ jobs:
         # compares clang versions (the runner has 20.1.8, the manifest was built
         # with 22.1.8), not RDec. The manifest now records its compiler, and
         # `status` re-parses every object's Machine field.
+        # Explicit: this step uses PowerShell cmdlets and fc.exe. The default
+        # shell on windows-latest happens to be pwsh, and "happens to be" is
+        # exactly what a workflow should not depend on.
+        shell: powershell
         run: |
           cargo run -q -p rdec-cli -- corpus
           cargo run -q -p rdec-cli -- corpus --out corpus-a
@@ -58,7 +62,7 @@ jobs:
           Copy-Item corpus-a/manifest.tsv m2.tsv
           fc.exe /b m1.tsv m2.tsv
 
-      - name: objdump-check (M1: instruction boundaries vs llvm-objdump, whole corpus)
+      - name: "objdump-check (M1 instruction boundaries vs llvm-objdump, whole corpus)"
         shell: powershell
         run: cargo run -q -p rdec-cli -- objdump-check --corpus
 
