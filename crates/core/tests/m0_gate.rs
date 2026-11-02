@@ -593,3 +593,65 @@ fn tv_accepts_the_real_pipeline_on_a_valid_function() {
         interp::run(&before, &[3, 4]).outcome
     );
 }
+
+// ---------------------------------------------------------------------------
+// The verifier's own new checks (§1.3), and pipeline determinism, which is
+// TV's precondition: a nondeterministic pipeline makes every before/after
+// comparison meaningless.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn verifier_rejects_a_mixed_width_binop() {
+    let mut f = fn2("vwidth");
+    let e = f.entry;
+    let a = f.params[0]; // i32
+    let c = f.emit(e, Op::Const(1), Ty::u64(), 0x1000); // u64
+    let s = f.emit(e, Op::Bin(BinOp::Add, a, c), Ty::u64(), 0x1004);
+    f.block_mut(e).term = Terminator::Return(s);
+    let err = verify::verify_ssa(&f).expect_err("mixed widths must be rejected");
+    assert!(
+        err.iter().any(|m| m.contains("mixes widths")),
+        "expected a width-agreement message, got {err:?}"
+    );
+}
+
+#[test]
+fn verifier_rejects_a_select_with_an_integer_condition() {
+    let mut f = fn2("vsel");
+    let e = f.entry;
+    let a = f.params[0]; // i32, not bool
+    let s = f.emit(e, Op::Select(a, a, a), i32(), 0x1000);
+    f.block_mut(e).term = Terminator::Return(s);
+    let err = verify::verify_ssa(&f).expect_err("an integer select condition must be rejected");
+    assert!(
+        err.iter().any(|m| m.contains("select condition")),
+        "expected a select-condition message, got {err:?}"
+    );
+}
+
+#[test]
+fn pipeline_is_deterministic() {
+    let base = with_test("det", Flag::OF);
+    let mut x = base.clone();
+    let mut y = base.clone();
+    rdec_core::run_pipeline(&mut x);
+    rdec_core::run_pipeline(&mut y);
+    assert_eq!(
+        rdec_core::fmt_ir::format_function(&x),
+        rdec_core::fmt_ir::format_function(&y),
+        "the pipeline is not deterministic: TV comparisons would be noise"
+    );
+    for (p, q) in [(1u64, 2u64), (7, 9), (0, 0), (u32::MAX as u64, 3)] {
+        assert_eq!(
+            run01(&x, p, q),
+            run01(&y, p, q),
+            "results differ at ({p},{q})"
+        );
+    }
+    let v = verify::verify_ssa(&x);
+    let warns: Vec<String> = v.err().unwrap_or_default();
+    assert!(
+        warns.iter().all(|m| m.starts_with("warn:")),
+        "pipeline output must not hard-fail verification: {warns:?}"
+    );
+}

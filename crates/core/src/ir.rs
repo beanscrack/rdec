@@ -292,8 +292,10 @@ pub enum Op {
         callee: Callee,
         ret_ty: Ty,
         args: Box<[VId]>,
-        /// The call has side effects we do not model (printf, I/O, ...).
-        /// Blocks DCE and blocks hoisting.
+        /// The call computes a value from its arguments and has no effects we
+        /// do not model: DCE may delete it when the result is unused.
+        /// `pure: false` is the loud default for printf, I/O, and anything
+        /// whose behaviour is not modelled.
         pure: bool,
     },
     /// Something we could not model. Prints as a comment; blocks DCE.

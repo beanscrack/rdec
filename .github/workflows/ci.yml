@@ -1,0 +1,43 @@
+name: gates
+# Roadmap M0: the gates are commands, so CI runs the commands. A green badge that
+# checks nothing is worse than no badge, because it launders a missing check into
+# a passed one.
+on:
+  push:
+  pull_request:
+
+jobs:
+  gates:
+    # Self-hosted Windows, per roadmap §4 M0: T1 executes real x86 instructions,
+    # so the runner is the machine. If no self-hosted runner is registered,
+    # github's windows-latest runs the same steps (T1 still runs; it is the
+    # corpus's clang target that must stay MSVC).
+    runs-on: [self-hosted, windows]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: toolchain
+        run: rustc -V && cargo -V && clang --version
+
+      - name: fmt
+        run: cargo fmt --check
+
+      - name: clippy (deny warnings)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: test (B1-B7 fixtures, TV, T1 grid, sabotage)
+        run: cargo test --no-fail-fast
+
+      - name: selftest (the verifier must be able to fail)
+        run: cargo run -q -p rdec-cli -- selftest
+
+      - name: flags (T1 grid; use --full on a nightly job)
+        run: cargo run -q -p rdec-cli -- flags
+
+      - name: corpus (rebuild, and the manifest must not move)
+        run: |
+          cargo run -q -p rdec-cli -- corpus
+          git diff --exit-code corpus/manifest.tsv
+
+      - name: status (prints section 9's table from the commands above)
+        run: cargo run -q -p rdec-cli -- status

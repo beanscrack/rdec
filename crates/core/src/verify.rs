@@ -67,6 +67,45 @@ pub fn verify(f: &Function) -> Verdict {
                     b.id, i.dest
                 ));
             }
+            // Operand width agreement (§1.3). `Bin`/`Cmp` over mixed widths is
+            // the signature of a missing extend, and the C emitter will happily
+            // print `(int)a + b` — legal C, wrong arithmetic, so: hard.
+            let pair = match &i.op {
+                Op::Bin(_, x, y) | Op::Cmp(_, x, y) => Some((*x, *y)),
+                _ => None,
+            };
+            if let Some((x, y)) = pair {
+                if let (Some(wx), Some(wy)) = (
+                    f.ty_of(x).and_then(|t| t.width()),
+                    f.ty_of(y).and_then(|t| t.width()),
+                ) {
+                    if wx != wy {
+                        e.hard(format!(
+                            "bb{}: %{} mixes widths {wx:?} and {wy:?}",
+                            b.id, i.dest
+                        ));
+                    }
+                }
+            }
+            // A `Select` condition is Bool and its arms share one type. Hard for
+            // the same reason as the branch check: C's ternary accepts an integer
+            // condition, so a soft warning ships a pass bug as legal C.
+            if let Op::Select(c, x, y) = &i.op {
+                if !f.ty_of(*c).map(|t| t.is_bool()).unwrap_or(false) {
+                    e.hard(format!(
+                        "bb{}: %{} select condition %{} is not bool",
+                        b.id, i.dest, c
+                    ));
+                }
+                if let (Some(tx), Some(ty2)) = (f.ty_of(*x), f.ty_of(*y)) {
+                    if tx != ty2 {
+                        e.hard(format!(
+                            "bb{}: %{} select arms disagree: {tx} vs {ty2}",
+                            b.id, i.dest
+                        ));
+                    }
+                }
+            }
         }
         // Terminator targets in range.
         let mut succ = Vec::new();

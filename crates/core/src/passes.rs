@@ -639,28 +639,6 @@ pub fn notes(f: &Function) -> Vec<String> {
 }
 
 impl Function {
-    /// Reuse an existing integer constant when there is one.
-    pub fn add_const(&mut self, ty: Ty, v: u64, _addr: u64) -> VId {
-        for b in self.blocks.iter() {
-            for i in &b.instrs {
-                if let Op::Const(c) = i.op {
-                    if c == v && i.ty == ty {
-                        return i.dest;
-                    }
-                }
-            }
-        }
-        let bb = self.entry;
-        self.emit(bb, Op::Const(v), ty, 0)
-    }
-
-    /// Place an op in the entry block and return its value. Used by flag
-    /// lowering, which builds comparisons out of thin air.
-    pub fn add_value_op(&mut self, op: Op, ty: Ty, addr: u64) -> VId {
-        let bb = self.entry;
-        self.emit(bb, op, ty, addr)
-    }
-
     pub fn as_const(&self, v: VId) -> Option<u64> {
         let (bb, ii) = self.def(v)?;
         self.blocks[bb as usize].instrs[ii].op.as_const()

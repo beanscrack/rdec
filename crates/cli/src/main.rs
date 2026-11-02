@@ -16,6 +16,7 @@ fn main() {
         "flags" => cmd_flags(&args),
         "selftest" => cmd_selftest(),
         "corpus" => cmd_corpus(&args[1..]),
+        "status" => cmd_status(),
         "probe" => cmd_probe(&args),
         "help" | "--help" | "-h" => {
             print_help();
@@ -38,6 +39,8 @@ fn print_help() {
          \x20 flags [--full N] [--sabotage]   T1 oracle: flag model vs real EFLAGS\n\
          \x20 probe <op> <w> <a> <b>          print model+hardware flags for one case\n\
          \x20 selftest                        prove the IR verifier rejects broken IR\n\
+         \x20 corpus [--out DIR] [--opt O0,O2]  build the clang corpus + hashed manifest\n\
+         \x20 status                          roadmap section 9's table, from commands\n\
          \n\
          coming next (M1): disasm <obj> [symbol]"
     );
@@ -277,4 +280,215 @@ fn broken_bad_branch_ty() -> Function {
     };
     f.block_mut(b2).term = Terminator::Return(s);
     f
+}
+
+// ---------------------------------------------------------------------------
+// status: roadmap section 9's measured table, generated from commands.
+// ---------------------------------------------------------------------------
+
+/// Every row is the result of running something, so the state section of the
+/// roadmap is never hand-written again (and a stale claim cannot survive a
+/// commit). `rdec status` is what CI prints.
+fn cmd_status() -> i32 {
+    let mut rows: Vec<(String, String, bool)> = Vec::new();
+
+    let git = sh("git", ["rev-parse", "--short", "HEAD"]);
+    let dirty = sh("git", ["status", "--porcelain"]);
+    rows.push((
+        "tree".into(),
+        format!(
+            "{}{}",
+            git.1.trim(),
+            if dirty.1.trim().is_empty() {
+                ""
+            } else {
+                " (dirty)"
+            }
+        ),
+        git.0,
+    ));
+
+    let rustc = sh("rustc", ["-V"]);
+    rows.push(("toolchain".into(), rustc.1.trim().into(), rustc.0));
+
+    let fmt = sh("cargo", ["fmt", "--check"]);
+    rows.push((
+        "cargo fmt --check".into(),
+        if fmt.0 {
+            "clean".into()
+        } else {
+            "DIRTY".into()
+        },
+        fmt.0,
+    ));
+
+    let clp = sh("cargo", ["clippy", "--all-targets", "--", "-D", "warnings"]);
+    rows.push((
+        "clippy -D warnings".into(),
+        if clp.0 {
+            "clean".into()
+        } else {
+            "FINDINGS".into()
+        },
+        clp.0,
+    ));
+
+    let tst = sh("cargo", ["test", "--no-fail-fast"]);
+    let mut passed = 0usize;
+    let mut failed = 0usize;
+    for l in tst.1.lines() {
+        if let Some(rest) = l.trim().strip_prefix("test result: ") {
+            // "test result: ok. 15 passed; 0 failed; ..." -> ["ok.","15","passed;","0",...]
+            let a: Vec<&str> = rest.split_whitespace().collect();
+            if a.len() >= 4 {
+                passed += a[1].parse().unwrap_or(0);
+                failed += a[3].parse().unwrap_or(0);
+            }
+        }
+    }
+    rows.push((
+        "cargo test".into(),
+        format!("{} passed, {} failed", passed, failed),
+        tst.0 && failed == 0 && passed > 0,
+    ));
+
+    let exe = std::env::current_exe().unwrap_or_else(|_| "cargo".into());
+    let self_cmd: Vec<String> = if exe.file_stem().map(|s| s == "cargo").unwrap_or(false) {
+        vec![
+            "run".into(),
+            "-q".into(),
+            "-p".into(),
+            "rdec-cli".into(),
+            "--".into(),
+            "selftest".into(),
+        ]
+    } else {
+        vec!["selftest".into()]
+    };
+    let st = sh(&exe, &self_cmd);
+    rows.push((
+        "rdec selftest".into(),
+        st.1.lines().last().unwrap_or("").trim().into(),
+        st.0,
+    ));
+
+    let fl_cmd: Vec<String> = if self_cmd[0] == "run" {
+        vec![
+            "run".into(),
+            "-q".into(),
+            "-p".into(),
+            "rdec-cli".into(),
+            "--".into(),
+            "flags".into(),
+        ]
+    } else {
+        vec!["flags".into()]
+    };
+    let fl = sh(&exe, &fl_cmd);
+    rows.push((
+        "rdec flags (grid)".into(),
+        fl.1.lines().last().unwrap_or("").trim().into(),
+        fl.0,
+    ));
+
+    rows.push(corpus_row());
+
+    println!("| check | result |");
+    println!("|---|---|");
+    let mut ok = true;
+    for (k, v, good) in &rows {
+        println!("| {k} | {}{} |", if *good { "" } else { "**FAIL** " }, v);
+        ok &= *good;
+    }
+    println!(
+        "\n{}",
+        if ok {
+            "status OK"
+        } else {
+            "status: FAILING ROWS ABOVE"
+        }
+    );
+    if ok {
+        0
+    } else {
+        1
+    }
+}
+
+/// Re-read the corpus manifest and re-parse every object's COFF header: the row
+/// says the objects are what the manifest claims, AMD64, and non-empty.
+fn corpus_row() -> (String, String, bool) {
+    let Ok(man) = std::fs::read_to_string("corpus/manifest.tsv") else {
+        return (
+            "corpus".into(),
+            "no manifest (run `rdec corpus`)".into(),
+            false,
+        );
+    };
+    let mut n = 0usize;
+    let mut bytes = 0usize;
+    let mut bad = Vec::new();
+    for line in man.lines().skip(1) {
+        let mut it = line.split('\t');
+        let (Some(name), Some(opt), Some(path)) = (it.next(), it.next(), it.next()) else {
+            continue;
+        };
+        let Ok(b) = std::fs::read(path) else {
+            bad.push(format!("{name}.{opt}: missing"));
+            continue;
+        };
+        n += 1;
+        bytes += b.len();
+        // A .obj starts with the COFF header, so Machine is at offset 0. Only
+        // images (MZ) carry the PE\0\0 signature; claiming the header is where
+        // an image's header is would read garbage for every object.
+        let le = |o: usize| u16::from_le_bytes([b[o], b[o + 1]]) as usize;
+        let m = if b.len() > 0x40 && &b[0..2] == b"MZ" {
+            let pe = u32::from_le_bytes([b[0x3c], b[0x3d], b[0x3e], b[0x3f]]) as usize;
+            if b.len() > pe + 6 && &b[pe..pe + 4] == b"PE\0\0" {
+                le(pe + 4)
+            } else {
+                0
+            }
+        } else if b.len() > 2 {
+            le(0)
+        } else {
+            0
+        };
+        if m != 0x8664 {
+            bad.push(format!("{name}.{opt}: machine {m:#x}"));
+        }
+    }
+    let verdict = if bad.is_empty() {
+        format!("{n} objects, {bytes} bytes, every Machine == 0x8664")
+    } else {
+        format!(
+            "{n} objects, {bytes} bytes, {} bad: {}",
+            bad.len(),
+            bad[..bad.len().min(3)].join(", ")
+        )
+    };
+    ("corpus".into(), verdict, bad.is_empty() && n > 0)
+}
+
+/// Run a command, return (success, stdout+stderr).
+fn sh<P, A, S>(program: P, args: A) -> (bool, String)
+where
+    P: AsRef<std::ffi::OsStr>,
+    A: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let mut c = std::process::Command::new(program);
+    c.args(args);
+    match c.output() {
+        Ok(o) => (
+            o.status.success(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            ),
+        ),
+        Err(e) => (false, format!("could not run: {e}")),
+    }
 }

@@ -286,6 +286,22 @@ verifier selftest 5/5, corpus generator + hashed manifest, fmt + clippy clean.
 - TV catches a sabotaged pass by name (e.g. a DCE that drops one random live
   instruction).
 
+**Closed 2026-11-01** (d326306 + the follow-up in this commit). The gate is green,
+measured by `rdec status`:
+
+| Gate item | Evidence |
+|---|---|
+| Interpreter + semantics document | `crates/core/src/interp.rs`, `docs/ir-semantics.md` |
+| TV driver, sabotage caught by name | `crates/core/src/tv.rs`; `tv_catches_the_sabotaged_dce_by_name` |
+| T0 fixtures, red before their fix | `crates/core/tests/m0_gate.rs` — 18 tests, one per §9 bug plus the read-findings, checked against ground truth / the interpreter, never against pass output |
+| Verifier forwards messages, checks operand types, escalates | B7 test + `verifier_rejects_a_mixed_width_binop`, `verifier_rejects_a_select_with_an_integer_condition`, branch-on-non-bool as a hard error |
+| §9 bugs fixed test-first | §9's "Closed" table: B1–B7, each with the test that pins it |
+| `rdec status` prints §9 from commands | `rdec status` — tree, toolchain, fmt, clippy, test counts, selftest, T1 grid, corpus (120 objects, every COFF `Machine` re-parsed from the bytes, not trusted from clang's exit code) |
+| CI | `.github/workflows/ci.yml` runs exactly the commands above, plus a manifest-diff determinism check. **Written, not yet observed green**: no runner is registered for this repo from this machine, so the first real run is the proof. |
+
+Pipeline determinism is now a test (`pipeline_is_deterministic`), because every
+TV result depends on it.
+
 ---
 
 ### M1 — Load, decode, discover · 2 wk
@@ -583,6 +599,55 @@ the ones the verifier accepts.
 | B5 | `FlagCtx.res` and the exact path use the `Flags` value as the arithmetic result | `test a,b; ja` → compares the `Flags` value to 0 | rejects, with no message (B7) |
 | **B6** | Exact fallback covers only CF/OF/ZF/SF of add/sub | `test; jp` and `inc; jc` leave `get_flag` and a live `Flags` value | **accepts** |
 | B7 | `verify_ssa` maps `verify()`'s errors to `Err(vec![])` | structural failures reported with zero messages | — |
+
+### Closed 2026-11-01 at d326306 (M0 reopened → closed)
+
+The gate was: reproduce each bug as a fixture that fails, fix it, and check the
+result against ground truth or the interpreter — never against pass output.
+`crates/core/tests/m0_gate.rs`, 15 tests, red before, green now.
+
+| # | Fix | Evidence (test names) |
+|---|---|---|
+| B1 | `uses_of` / `replace_use_all` count `Return` and `Branch` operands | `b1_terminator_uses_are_counted`, `b1_dce_must_not_delete_a_returned_value` |
+| **B2** | `dedup_blocks` rewrites uses along the positional mapping it just computed, canonicalises **only block-local values** (free operands and successor targets key by identity), and skips phi blocks | `b2_dedup_must_not_merge_blocks_with_different_operands` (both arms), `b2_dedup_must_not_merge_blocks_with_different_conditions` |
+| **B3** | fusion matches the `get_flag` tree **at its root** (`crates/core/src/fuse.rs`); v1's per-leaf pass is deleted, not patched | `b3_jl_after_cmp_is_signed_less` |
+| **B4** | SF lowers against a recomputed `a − b`, never against `a` | `b4_sf_after_cmp_is_the_sign_of_a_minus_b` |
+| B5 | the arithmetic result is re-emitted from the operands; `FlagCtx.res` no longer exists | `b5_zf_after_test_is_the_result_of_a_and_b` |
+| **B6** | every (FlagsOp × flag) pair is answered. Where the IR cannot express it — CF after `inc` (§1.2 item 3), OF after a variable shift, AF after logic/shift/mul — the lowering is `Op::Opaque` **with the reason**, so the function reports itself E0 | `b6_pf_after_test_is_lower_byte_parity_and_leaves_no_flags`, `b6_cf_after_inc_is_undefined_and_must_be_reported_not_invented` |
+| B7 | `verify_ssa` keeps `verify()`'s messages; a non-bool branch condition is a hard error, not a warning | `b7_structural_failures_keep_their_messages`, `rdec selftest` 5/5 |
+
+The missing oracle layer (§1.1), built before any of the fixes were trusted:
+
+- `crates/core/src/interp.rs` — executable IR semantics, the reference for TV and
+  later for T1R/P1. Writing it found a soundness hole in the harness: a dangling
+  operand read as `0`, which is why the sabotage test had passed. Dangling uses
+  are now `MissingOperand`.
+- `crates/core/src/tv.rs` — `run(f, s) == run(pass(f), s)` over sampled and
+  boundary states, comparing outcome, ordered effects and final memory.
+  `tv_accepts_the_real_pipeline_on_a_valid_function`,
+  `tv_catches_the_sabotaged_dce_by_name`.
+
+Read-findings closed by the same work: `cmp_pair` (derived from the trichotomy
+subsets instead of remembered, validated exhaustively —
+`cmp_pair_table_is_arithmetically_correct`), `joint_pair` (deleted; the exact
+form needs no pair table, and `CF ∧ ¬ZF` is `¬ZF`, not `ZF`), OF after `cmp`
+(now exact), `add_value_op` / `add_const` (deleted: no callers, both broke
+dominance), `const_bin` `MulHi`/`MulSmul` at narrow widths
+(`const_fold_mulhi_does_not_shift_by_64_at_narrow_widths`), `merge_blocks` phi
+incoming (`merge_blocks_updates_phi_incoming`), `Call::pure`'s inverted doc.
+
+Open, with the milestone that owns each: phi-aware merging in
+`simplify_branches`/`dedup_blocks` (M3 GVN); carry-in and previous-flags as real
+operands (§1.2 items 1 and 3, M2 — today those cases are loud gaps, not lies);
+flag values through phis (§1.2 item 7, M3); `Op::Const` typed `u64` (M3);
+`def()`/`uses_of()` linear scans (M3); and the T1 coverage gaps named above
+(`adc`/`sbb` with carry-in 0, more flag seeds), which M2's T1R closes against
+silicon *and* the interpreter.
+
+Gates at d326306: `cargo fmt --check` clean; `clippy --all-targets -D warnings`
+clean; 20 tests green (15 gate + 5 oracle, including the T1 hardware run);
+`selftest` 5/5; `corpus` 120/120 AMD64 objects. `flags.rs` is untouched by this
+commit, so the measured T1 result (9.7 × 10⁹ probes, 0 mismatches) still stands.
 
 ### Found by reading
 
