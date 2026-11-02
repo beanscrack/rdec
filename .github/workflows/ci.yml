@@ -58,6 +58,10 @@ jobs:
           Copy-Item corpus-a/manifest.tsv m2.tsv
           fc.exe /b m1.tsv m2.tsv
 
+      - name: objdump-check (M1: instruction boundaries vs llvm-objdump, whole corpus)
+        shell: powershell
+        run: cargo run -q -p rdec-cli -- objdump-check --corpus
+
       - name: status (prints section 9's table from the commands above)
         run: cargo run -q -p rdec-cli -- status
 

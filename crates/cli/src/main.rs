@@ -9,6 +9,8 @@ use rdec_core::ty::{Sx, Ty, Width};
 use rdec_core::verify;
 use rdec_verify::{hw, model_shim, Sabotage};
 
+mod m1;
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first().map(|s| s.as_str()).unwrap_or("help");
@@ -16,6 +18,14 @@ fn main() {
         "flags" => cmd_flags(&args),
         "selftest" => cmd_selftest(),
         "corpus" => cmd_corpus(&args[1..]),
+        "disasm" => m1::cmd_disasm(&args),
+        "objdump-check" => match m1::cmd_objdump_check(&args) {
+            Ok(rc) => rc,
+            Err(e) => {
+                eprintln!("{e}");
+                1
+            }
+        },
         "status" => cmd_status(),
         "probe" => cmd_probe(&args),
         "help" | "--help" | "-h" => {
@@ -392,6 +402,32 @@ fn cmd_status() -> i32 {
     ));
 
     rows.push(corpus_row());
+    let ob_cmd: Vec<String> = if self_cmd[0] == "run" {
+        vec![
+            "run".into(),
+            "-q".into(),
+            "-p".into(),
+            "rdec-cli".into(),
+            "--".into(),
+            "objdump-check".into(),
+            "--corpus".into(),
+            "--limit".into(),
+            "60".into(),
+        ]
+    } else {
+        vec![
+            "objdump-check".into(),
+            "--corpus".into(),
+            "--limit".into(),
+            "60".into(),
+        ]
+    };
+    let ob = sh(&exe, &ob_cmd);
+    rows.push((
+        "objdump-check (M1: boundaries vs llvm-objdump)".into(),
+        ob.1.lines().last().unwrap_or("").trim().into(),
+        ob.0,
+    ));
     let local = rdec_verify::corpus::clang_stamp(&rdec_verify::corpus::clang_path()).0;
     let recorded = rdec_verify::corpus::manifest_clang(std::path::Path::new("corpus/manifest.tsv"));
     let same = recorded == local;

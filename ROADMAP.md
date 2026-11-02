@@ -701,6 +701,23 @@ bugs were caught on the first run.
 
 ---
 
+### Measured: M1 step 1 (load + decode), 2026-11-02
+
+| item | result |
+|---|---|
+| COFF object reader | **Written from scratch.** goblin 0.10.7 ships no COFF *object* reader — `src/read/coff` does not exist in the crate — and a decompiler cannot outsource the container it targets. Parses file/section headers, the symbol table (aux records skipped), per-section relocations, long names via the string table (`/N` section names, offset-form symbol names). `crates/arch-x86/src/loader.rs` |
+| Function extents | COFF records **no symbol size**, so extents are inferred as "next symbol in section, else section end" and tagged `SizeSource::{NextSymbol, SectionEnd}`. Nothing downstream can read an inferred extent as a declared one. |
+| Section-definition trap | `.text`'s definition symbol sits at offset 0, the same address as the first function. An offset-ordered extent walk that keeps it gives the function **size 0**, and the first version of this loader then reported "no code symbols" — which the gate accepted as success. Extents now exclude definition symbols (`a_function_sharing_offset_zero_with_its_section_symbol_gets_an_extent`), and **a check that inspects zero symbols is a FAIL**, not an OK. |
+| Entry-count trap | `NumberOfSymbols` counts auxiliary records. Walking main symbols until `symbols.len() == nsyms` runs off the table end — the exact error the first real object produced. The loop bound is entries consumed. |
+| Decoder | iced-x86 1.22 (`op_code_info`, `instr_info`, `intel`/`nasm`). A refusal is emitted as a `len == 0` gap **and ends the sweep** — advancing past undecodable bytes is how a disassembler invents instructions out of data (`an_undecodable_byte_is_reported_as_a_gap_not_skipped`). |
+| **Gate: boundaries vs llvm-objdump** | `rdec objdump-check --corpus`, all 120 objects: **124 symbols, 124 exact boundary matches, 0 mismatches**, each symbol also decode→encode→decode stable. Its own CI step; a sampled row in `rdec status`. |
+| Fuzz | 40,000 pseudo-random windows (prefix-biased): 0 panics, every accepted instruction 1..=15 bytes, addresses monotonic, refusals terminal. |
+
+Not yet M1: recursive-descent discovery from entry points and relocations,
+indirect-jump classification (jump-table recovery), the coverage measurement
+itself, and the disassembly-literal test vectors. M1's gate stays open until
+coverage ≥ 99.5% is measured on the corpus.
+
 ## 10. Changes from v1
 
 | Change | Reason |
