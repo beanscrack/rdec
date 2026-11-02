@@ -1253,3 +1253,77 @@ measurement (Kind census, lifted/valid/emitted/refused by class), in progress. T
 T2 for C++ free functions, then member calls with a pointer argument in the differential
 (the harness currently excludes pointer args, so member functions are not T2-runnable -
 stated, not faked), then vtable dispatch last.
+
+## The phi miscompile, T2 at 1364 comparisons, and M8 step 1 - measured (2026-11-02)
+
+Commits `48375c8`, `a569f0d`, `99da80e`. CI green on the stack; every number below was
+re-run on the merged tree by the parent, not taken from a report.
+
+### Third real miscompile: the emitter emitted a statement for a phi node
+
+A phi's value arrives through the edge-copy at the end of its predecessor, so the phi op
+has no C statement. The emitter emitted one anyway (`dest = 0`, the no-incoming-edge
+initialiser), and a statement at the top of a block runs on EVERY entry - including the
+back edge - so each iteration wiped the loop-carried value.
+
+The corpus hid it for as long as no T2-runnable function had a phi (the preheader's
+incoming value happened to be 0). T2 caught it the moment loop functions became runnable:
+41 of 1335 runs, minimized `early_returns.O1 :: f(7,-1,40,3)` - machine `0x2a`,
+decompiled C `0`, where the `mov eax,0x2a` edge copy into the return block was
+overwritten by that block's own phi statement. Pinned by
+`crates/arch-x86/tests/phi_edge_copy.rs`.
+
+### T2 coverage 44 -> 64 functions, comparisons 1044 -> 1364, all matching
+
+```
+runnable: 64 functions on both sides, 20 not runnable (10 memory outside the modelled
+          frame | 5 no COFF symbol to link | 4 file-static | 1 unmodelled control flow)
+inputs: 12 vectors per function, 24 for the 50 loop-free ones -> 1368 comparisons
+compared: 1364 | match: 1364 | mismatch: 0 | not compared (one side faulted): 4
+OK: the decompiled C computes the same 64-bit result as the machine code on all 1364 runs
+```
+
+The "returns RAX unwritten" bucket is gone. The comparison did not shrink: same vectors
+(more for loop-free functions), full 64-bit RAX, no masking, no width inferred from
+observed answers. 4 jobs time out (`loop_do` at vector 8, a genuine infinite loop under
+those inputs) and are counted as faults, never as matches.
+
+**What T2 proves, exactly:** the returned 64-bit value agrees on 1364 (function, input)
+pairs across 64 of 141 C functions. It does not prove memory effects (the flat store is
+not compared), the other 77 functions, or anything about C++ - no C++ function has been
+compared by T2 yet, because the harness takes integer args and reads RAX, so pointer and
+float args are out of its range. Green sample, not a green decompiler.
+
+### M8 step 1 - the first C++ measurement: 55 of 78 lifted functions emit accepted C
+
+`rdec cpp --corpus` runs the same pipeline over the C++ corpus, naming functions from the
+demangled text with the decorated name kept in a comment:
+
+```
+compared: 69 | lifted: 78 | valid IR: 78/78 | emitted C: 55 | refused: 23
+this-in-RCX: 30 member/ctor/dtor functions lifted with the class pointer modelled as
+             parameter 0; 18 of them emitted C
+ctors identified: 1, dtors identified: 3 (the ??0/??1 prefix and the demangler Kind agree)
+clang -Werror: OK
+```
+
+Kind census: 36 FreeFunction | 2 StaticMember | 13 MemberFunction | 13
+MemberFunction(virtual) | 1 Constructor | 3 Destructor | 1 Unsupported(template).
+
+Named refusal classes: 9 call-clobber, 6 `movsd`, 4 indirect call, 1 arithmetic with an
+unmodelled operand, 1 rip-relative mov, 1 mov with unmodelled source, 1 `movss`. Lifted-IR
+gap census: 126 call-clobber, 14 `movsd`, 5 indirect call, 3 `movss`, 2 rip-relative mov,
+2 `addsd`, 1 by-value struct, 1 `cvttsd2si`, 1 `cvttss2si`.
+
+Two findings that shape M8: **scalar SSE is the single biggest C++ cost** (every refusal
+it causes is a float/double member), and **this clang build names zero vftable symbols**,
+so vtable identity is not reachable from the `.obj` files - `.rdata` bytes plus REL32
+relocations is the only route, which is why vtable dispatch stays last.
+
+### Next, in order
+
+1. Scalar SSE in the lifter and emitter (XMM file, `movsd/movss/movapd/addsd/...`,
+   `pxor xmm,xmm` as the zeroing idiom modelled as a machine fact like `xor r,r`, and
+   `cvttsd2si` guarded to the x86 magic constant because out-of-range is UB in C).
+2. T2 for C++: float/pointer args in the differential - emission is not value-equivalence.
+3. The 57 C refusals (call-clobber, `cdq`, `imul`, `div`, `lea` naming) and the 23 C++ ones.
