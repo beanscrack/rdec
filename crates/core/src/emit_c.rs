@@ -234,6 +234,20 @@ impl<'a> Emitter<'a> {
         for b in &self.f.blocks {
             let _ = writeln!(self.body, "l{}: /* at {:#x} */", b.id, b.addr);
             for ins in &b.instrs {
+                // A phi's value arrives by the edge-copy at the end of its
+                // predecessor, so the phi op has no C statement: emitting one
+                // (`dest = 0`, the initialiser's "no incoming edge" case) runs on
+                // EVERY entry to the block - including the back edge - and wipes
+                // the loop-carried value the latch just copied in. The corpus
+                // masked this for as long as no runnable function had a phi (the
+                // preheader's incoming value happened to be 0); T2, comparing the
+                // newly-runnable loop functions, did not: 41 of 1335 runs, e.g.
+                // `early_returns.O1::f(7,-1,40,3)` machine 0x2a, C 0, where the
+                // `mov eax,0x2a` edge copy into the ret block was overwritten by
+                // its own phi statement.
+                if matches!(ins.op, Op::Phi(_)) {
+                    continue;
+                }
                 self.instr(ins)?;
                 self.bail()?;
             }
