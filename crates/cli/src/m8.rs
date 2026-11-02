@@ -1316,6 +1316,23 @@ pub fn cmd_cpp(args: &[String]) -> Result<i32, String> {
     println!(
         "this-in-RCX: {this_lifted} member/ctor/dtor functions lifted with the class pointer modelled as parameter 0; {this_emitted} of them emitted C"
     );
+    // The SSE census, counted by the lifter over the same subjects, so the
+    // bracketed per-mnemonic numbers can be checked against
+    // `llvm-objdump -d corpus/cpp/obj/*.obj` the way the self-idiom count can.
+    let mut sse: BTreeMap<String, u32> = BTreeMap::new();
+    let mut sse_zeroing = 0usize;
+    let mut ret_xmm0 = 0usize;
+    for s in &subjects {
+        for (k, v) in &s.rep.sse {
+            *sse.entry(k.clone()).or_insert(0) += *v;
+        }
+        sse_zeroing += s.rep.sse_zeroing;
+        ret_xmm0 += s.rep.ret_xmm0;
+    }
+    println!("{}", crate::m4::sse_line(&sse, sse_zeroing));
+    println!(
+        "ret-float-in-XMM0: {ret_xmm0} returns reach a written XMM0 with RAX undefined: the Windows x64 ABI answers a float/double function in XMM0, and the emitted C returns the integer RAX. Their VALUE is therefore not in T2's compared set (T2 compares RAX, and its rule is unchanged)."
+    );
     println!(
         "ctors identified: {} {} | dtors identified: {} {}",
         ctors.len(),

@@ -7,6 +7,30 @@
 //!   the upper half. 8/16-bit writes are the mask/or pair the hardware performs.
 //!   One representation per register is what keeps SSA, the verifier and the
 //!   interpreter honest.
+//! * Each XMM register is ONE `W64` SSA value too: its low 64 BITS, not a
+//!   float. That is a choice, and the reasons are here rather than in a comment
+//!   at the first `movsd` because the emitter's C types follow from it.
+//!   - The alternative is a cell typed `Ty::Float{F64}` (a scalar double view),
+//!     and it breaks at the first `movss`: `movss` writes 32 bits of the
+//!     register and zeroes 127:32, so the cell would have to be a `float` one
+//!     instruction and a `double` the next, and a phi over a loop-carried
+//!     register would have two types. The register file's job is to be ONE
+//!     value per register; a type that changes with the instruction defeats it.
+//!   - At bits, every modelled op is expressible: `movsd`/`movss` move bits in
+//!     and out, and each arithmetic, comparison or conversion op starts with an
+//!     explicit `Cast(Bitcast, Ty::Float{w}, bits)` view (and writes the result
+//!     back through the inverse). The C follows the same shape - `uint64_t`
+//!     cells, `rdec_bits_f64(...)` / `rdec_f64_bits(...)` at the uses - so
+//!     nobody has to guess where the number stops being a bit pattern.
+//!   - Bits also make the ops the model CANNOT do loud. `movsd xmm,xmm` zeroes
+//!     bits 127:64: in this model there is no cell for those bits, so the write
+//!     discards the destination's old value entirely and no stale upper half
+//!     can flow anywhere - the zeroing cannot be observed, which is what makes
+//!     it safe not to represent. The ops that WOULD observe it (packed
+//!     arithmetic, shuffles, mask `andps`/`orps`, a 128-bit store, `movdqa`
+//!     into memory, `movd`/`movq`'s upper-bit rules) are refused by name, with
+//!     the mnemonic and the address, and counted. A model that silently ignores
+//!     a 128-bit read is the miscompile; a refusal is the work item.
 //! * Flag-defining instructions produce a `Ty::Flags` value; `jcc`/`setcc`/
 //!   `cmovcc` read it with `GetFlag`. Dead flags then die by DCE, and `fuse.rs`
 //!   turns `(cmp, jl)` into a signed compare. Flag semantics are width-dependent
@@ -25,9 +49,10 @@ use std::collections::{HashMap, HashSet};
 
 use iced_x86::{Decoder, Instruction, Mnemonic, OpKind, Register};
 use rdec_core::ir::{
-    BbId, BinOp, Callee, CastKind, Flag, FlagsOp, Function, Instr, Op, Terminator, UnOp, VId,
+    BbId, BinOp, Callee, CastKind, FBinOp, Flag, FlagsOp, Function, Instr, Op, Terminator, UnOp,
+    VId,
 };
-use rdec_core::ty::{Ty, Width};
+use rdec_core::ty::{FWidth, Ty, Width};
 
 use crate::discover::Plan;
 
@@ -50,6 +75,12 @@ pub enum Grp {
     R13,
     R14,
     R15,
+    /// One XMM register, by number. `Grp` is the register-file key, and the SSA
+    /// machinery (live-ins, phis, the block transfer function, call clobbers) is
+    /// keyed on it — so an XMM register is a register here, not a side table
+    /// that the SSA pass forgets to consult. The value is the register's low 64
+    /// bits; see the module doc for why bits and not a float.
+    Xmm(u8),
 }
 
 /// What one width-view of a register means. High-byte forms (AH/CH/DH/BH) are
@@ -124,6 +155,25 @@ fn split(reg: Register) -> Option<(Grp, Width)> {
         R::R15W => (R15, W16),
         R::R15D => (R15, W32),
         R::R15 => (R15, W64),
+        // XMM registers: one group per register, always read as the whole
+        // 64-bit low cell. The 128-bit view does not exist in this model, which
+        // is why packed ops are refused rather than half-modelled.
+        R::XMM0 => (Xmm(0), W64),
+        R::XMM1 => (Xmm(1), W64),
+        R::XMM2 => (Xmm(2), W64),
+        R::XMM3 => (Xmm(3), W64),
+        R::XMM4 => (Xmm(4), W64),
+        R::XMM5 => (Xmm(5), W64),
+        R::XMM6 => (Xmm(6), W64),
+        R::XMM7 => (Xmm(7), W64),
+        R::XMM8 => (Xmm(8), W64),
+        R::XMM9 => (Xmm(9), W64),
+        R::XMM10 => (Xmm(10), W64),
+        R::XMM11 => (Xmm(11), W64),
+        R::XMM12 => (Xmm(12), W64),
+        R::XMM13 => (Xmm(13), W64),
+        R::XMM14 => (Xmm(14), W64),
+        R::XMM15 => (Xmm(15), W64),
         // AH/CH/DH/BH alias a value we model as one 64-bit word: refuse.
         _ => return None,
     };
@@ -131,8 +181,11 @@ fn split(reg: Register) -> Option<(Grp, Width)> {
 }
 
 /// Every modelled register, in a fixed order: the SSA pass walks registers in
-/// this order, which is what makes the emitted phi order deterministic.
-const GRPS: [Grp; 16] = [
+/// this order, which is what makes the emitted phi order deterministic. The XMM
+/// cells follow the GPRs: the SSA pass is keyed on `Grp`, so adding them here
+/// is what gives an XMM register a live-in, a phi at a join, and a clobber at a
+/// call, with no second copy of that machinery.
+const GRPS: [Grp; 32] = [
     Grp::Rax,
     Grp::Rcx,
     Grp::Rdx,
@@ -149,6 +202,22 @@ const GRPS: [Grp; 16] = [
     Grp::R13,
     Grp::R14,
     Grp::R15,
+    Grp::Xmm(0),
+    Grp::Xmm(1),
+    Grp::Xmm(2),
+    Grp::Xmm(3),
+    Grp::Xmm(4),
+    Grp::Xmm(5),
+    Grp::Xmm(6),
+    Grp::Xmm(7),
+    Grp::Xmm(8),
+    Grp::Xmm(9),
+    Grp::Xmm(10),
+    Grp::Xmm(11),
+    Grp::Xmm(12),
+    Grp::Xmm(13),
+    Grp::Xmm(14),
+    Grp::Xmm(15),
 ];
 
 fn ty_u(w: Width) -> Ty {
@@ -160,7 +229,7 @@ fn ty_u(w: Width) -> Ty {
 const ARG_REGS: [Grp; 4] = [Grp::Rcx, Grp::Rdx, Grp::R8, Grp::R9];
 
 /// Caller-saved: a call may overwrite these.
-const CALLER_SAVED: [Grp; 9] = [
+const CALLER_SAVED: [Grp; 25] = [
     Grp::Rax,
     Grp::Rcx,
     Grp::Rdx,
@@ -170,6 +239,24 @@ const CALLER_SAVED: [Grp; 9] = [
     Grp::R11,
     Grp::Rsi,
     Grp::Rdi,
+    // The whole XMM file is caller-saved in the Windows x64 ABI: a float in
+    // XMM3 across a call is the same class of bug as an int in ECX across one.
+    Grp::Xmm(0),
+    Grp::Xmm(1),
+    Grp::Xmm(2),
+    Grp::Xmm(3),
+    Grp::Xmm(4),
+    Grp::Xmm(5),
+    Grp::Xmm(6),
+    Grp::Xmm(7),
+    Grp::Xmm(8),
+    Grp::Xmm(9),
+    Grp::Xmm(10),
+    Grp::Xmm(11),
+    Grp::Xmm(12),
+    Grp::Xmm(13),
+    Grp::Xmm(14),
+    Grp::Xmm(15),
 ];
 
 /// The condition a `jcc`/`setcc`/`cmovcc` tests, expressed over flag bits.
@@ -325,6 +412,21 @@ pub struct Report {
     /// what makes `RAX` defined on paths that used to read an undefined
     /// register, and a reader must be able to ask how many paths moved.
     pub self_idioms: usize,
+    /// SSE mnemonics translated, by name, counted at the instruction whether the
+    /// op was modelled or refused. It is in the Report because the gate prints
+    /// it next to the `self_idioms` count for the same reason: the number is
+    /// checkable against `llvm-objdump -d` over the same address ranges, so a
+    /// claim about SSE coverage is measured, not trusted.
+    pub sse: std::collections::BTreeMap<String, u32>,
+    /// `pxor/xorps/xorpd xmm,xmm` translated as the machine fact it is: all 128
+    /// bits become 0 and the register is not read. Counted apart from
+    /// `self_idioms` so the GPR number stays comparable to the history.
+    pub sse_zeroing: usize,
+    /// Functions whose `ret` reaches it with XMM0 defined and RAX not: a
+    /// float/double answer, in the register the ABI says and the model does not
+    /// follow. T2 compares RAX only, so these are outside its claim; the C++
+    /// gate prints the number so the shape is visible rather than inferred.
+    pub ret_xmm0: usize,
     /// Where a register read resolved to `undef`: the address of the read and
     /// which register. `undef_live_ins` counts them; this names them, because
     /// "13 undef live-ins" is not a work item and "`0x29` reads RDX, which no
@@ -931,11 +1033,645 @@ impl<'a> Lifter<'a> {
             .emit(self.cur, Op::Cast(k, t.clone(), v), t, self.addr())
     }
 
+    // ---- SSE: the scalar subset -------------------------------------------
+    //
+    // The XMM cells are bit patterns (`Grp::Xmm`, module doc), so every op here
+    // opens with an explicit float view and closes with the inverse. Nothing in
+    // this section invents a C rule: each arm says what the hardware does, and
+    // what it cannot express it refuses by name.
+
+    /// The XMM register file: one `W64` bit cell per register, read through the
+    /// same `read64` the GPRs use, so a read before a write is a live-in here too
+    /// and a loop-carried float gets a phi for free.
+    fn xmm(&mut self, i: u8) -> VId {
+        self.read64(Grp::Xmm(i))
+    }
+
+    fn set_xmm(&mut self, i: u8, v: VId) {
+        self.set_reg(Grp::Xmm(i), v);
+    }
+
+    /// The operand is `XMMn`; that is the whole question, so this is the only
+    /// place that asks it.
+    fn xmm_op(&self, ins: &Instruction, i: u32) -> Option<u8> {
+        if ins.op_kind(i) != OpKind::Register {
+            return None;
+        }
+        use Register as R;
+        Some(match ins.op_register(i) {
+            R::XMM0 => 0,
+            R::XMM1 => 1,
+            R::XMM2 => 2,
+            R::XMM3 => 3,
+            R::XMM4 => 4,
+            R::XMM5 => 5,
+            R::XMM6 => 6,
+            R::XMM7 => 7,
+            R::XMM8 => 8,
+            R::XMM9 => 9,
+            R::XMM10 => 10,
+            R::XMM11 => 11,
+            R::XMM12 => 12,
+            R::XMM13 => 13,
+            R::XMM14 => 14,
+            R::XMM15 => 15,
+            _ => return None,
+        })
+    }
+
+    /// The bit pattern read as a float at `fw`. In the C this is
+    /// `rdec_bits_f64(x)` / `rdec_bits_f32(x)` -- a memcpy, never a conversion.
+    fn fview(&mut self, bits: VId, fw: FWidth) -> VId {
+        let t = Ty::Float { w: fw };
+        self.f.emit(
+            self.cur,
+            Op::Cast(CastKind::Bitcast, t.clone(), bits),
+            t,
+            self.addr(),
+        )
+    }
+
+    /// The inverse view: a float value's bits, for writing back into a cell.
+    fn fbits(&mut self, fl: VId) -> VId {
+        let t = Ty::uint(Width::W64);
+        self.f.emit(
+            self.cur,
+            Op::Cast(CastKind::Bitcast, t.clone(), fl),
+            t,
+            self.addr(),
+        )
+    }
+
+    /// `Cast` to an arbitrary type. `cast` builds an integer type from a width,
+    /// which is right for the GPRs and wrong here: a float conversion's result
+    /// type is a float.
+    fn cast_ty(&mut self, k: CastKind, v: VId, t: Ty) -> VId {
+        self.f
+            .emit(self.cur, Op::Cast(k, t.clone(), v), t, self.addr())
+    }
+
+    fn fbinop(&mut self, o: FBinOp, a: VId, b: VId) -> VId {
+        let t = self.f.ty_of(a).unwrap_or_else(Ty::f64);
+        self.f.emit(self.cur, Op::FBin(o, a, b), t, self.addr())
+    }
+
+    /// A scalar SSE operand: an XMM cell viewed at `fw`, or memory loaded as a
+    /// float at `fw` (which the emitter spells as a bit reinterpretation).
+    fn fsrc(&mut self, ins: &Instruction, i: u32, fw: FWidth) -> Option<VId> {
+        match ins.op_kind(i) {
+            OpKind::Register => {
+                let s = self.xmm_op(ins, i)?;
+                let b = self.xmm(s);
+                Some(self.fview(b, fw))
+            }
+            OpKind::Memory => {
+                let a = self.addr_of(ins, i)?;
+                let t = Ty::Float { w: fw };
+                Some(
+                    self.f
+                        .emit(self.cur, Op::Load(t.clone(), a), t, self.addr()),
+                )
+            }
+            _ => None,
+        }
+    }
+
+    /// A refusal that names the mnemonic, the reason, and (through `self.at`)
+    /// the address -- the same shape as `unmodelled instruction: movsd`, so the
+    /// gate's refusal classes sort by mnemonic on their own.
+    fn sse_gap(&mut self, nm: &str, why: &str) {
+        let text = format!("unmodelled instruction: {nm} ({why})");
+        self.f
+            .emit_void(self.cur, Op::Opaque(text.into()), self.addr());
+        self.rep.gaps += 1;
+    }
+
+    /// Translate one SSE instruction: the scalar subset, and nothing else.
+    ///
+    /// Matching on the canonical mnemonic NAME is deliberate. The name is what
+    /// the census counts, what a refusal prints, and what `llvm-objdump -d`
+    /// shows at that address, so the three are checkable against each other; an
+    /// enum match would let the gate's numbers and the object's bytes drift
+    /// apart in silence.
+    fn sse(&mut self, nm: &str, ins: &Instruction) {
+        use FWidth::{F32, F64};
+        // ---- the zeroing idiom, and only the idiom -------------------------
+        if matches!(nm, "pxor" | "xorps" | "xorpd") {
+            if let (Some(d), Some(s)) = (self.xmm_op(ins, 0), self.xmm_op(ins, 1)) {
+                if d == s {
+                    // `pxor xmm0, xmm0`: all 128 bits become 0 and the register
+                    // is NOT read. The SSE sibling of `xor r,r`, modelled here
+                    // for the reason `SelfIdiom` gives: as a general IR fold
+                    // (`xor(x,x) -> 0`) the rule is a lie about meaning, because
+                    // this interpreter is strict -- a read of an undefined xmm
+                    // faults when it is reached, and deleting the read turns a
+                    // faulting execution into a returning one. The operand is an
+                    // address whose value is never consumed, and only the
+                    // encoding knows that.
+                    self.rep.sse_zeroing += 1;
+                    let z = self.const_of(0, Width::W64);
+                    self.set_xmm(d, z);
+                    // EFLAGS untouched. Setting flags here would hand a later
+                    // `jz` a flags value the machine left stale.
+                    return;
+                }
+            }
+            self.sse_gap(nm, "a 128-bit bitwise xor: a mask, not a scalar op");
+            return;
+        }
+        // ---- scalar arithmetic --------------------------------------------
+        if let Some((op, fw)) = Self::sse_arith(nm) {
+            if ins.op_kind(0) != OpKind::Register || self.xmm_op(ins, 0).is_none() {
+                self.sse_gap(nm, "no XMM register destination");
+                return;
+            }
+            let d = self.xmm_op(ins, 0).unwrap();
+            // `self.xmm(d)` must be read BEFORE the view is emitted: `fview`
+            // appends an instruction, which grows `self.f.blocks` that
+            // `read64`'s live-in machinery also touches.
+            let bits = self.xmm(d);
+            let a = self.fview(bits, fw);
+            let b = match self.fsrc(ins, 1, fw) {
+                Some(v) => v,
+                None => {
+                    self.sse_gap(nm, "no readable float source");
+                    return;
+                }
+            };
+            let r = self.fbinop(op, a, b);
+            let bits = self.fbits(r);
+            self.set_xmm(d, bits);
+            return;
+        }
+        // ---- moves, by the size the mnemonic names ------------------------
+        match nm {
+            "movsd" | "movss" => {
+                let fw = if nm == "movsd" { F64 } else { F32 };
+                let n = if nm == "movsd" {
+                    Width::W64
+                } else {
+                    Width::W32
+                };
+                if let Some(d) = self.xmm_op(ins, 0) {
+                    let v = match ins.op_kind(1) {
+                        OpKind::Register => {
+                            let s = match self.xmm_op(ins, 1) {
+                                Some(s) => s,
+                                None => {
+                                    self.sse_gap(nm, "source is not an XMM register");
+                                    return;
+                                }
+                            };
+                            // The low bits move; `movsd` zeroes 127:64 and
+                            // `movss` zeroes 127:32. In this model the
+                            // destination's cell is REPLACED, and there is no
+                            // upper half to carry over, so the zeroing cannot be
+                            // observed -- the ops that could observe it are all
+                            // refused below by name.
+                            //
+                            // The read is hoisted out of the `emit` argument
+                            // list: `emit` takes `&mut self.f`, and `self.xmm`
+                            // takes `&mut self`, which the borrow checker
+                            // correctly refuses to stack.
+                            let src = self.xmm(s);
+                            self.f
+                                .emit(self.cur, Op::Copy(src), Ty::uint(n), self.addr())
+                        }
+                        OpKind::Memory => {
+                            let a = match self.addr_of(ins, 1) {
+                                Some(a) => a,
+                                None => {
+                                    self.sse_gap(nm, "load from an address we cannot name");
+                                    return;
+                                }
+                            };
+                            let t = ty_u(n);
+                            self.f.emit(self.cur, Op::Load(t, a), ty_u(n), self.addr())
+                        }
+                        _ => {
+                            self.sse_gap(nm, "source is neither an XMM register nor memory");
+                            return;
+                        }
+                    };
+                    let _ = fw; // the precision lives in the cell's users, not the cell
+                    let up = self.cast(CastKind::ZExt, v, Width::W64);
+                    self.set_xmm(d, up);
+                    return;
+                }
+                if ins.op_kind(0) == OpKind::Memory {
+                    let s = match self.xmm_op(ins, 1) {
+                        Some(s) => s,
+                        None => {
+                            self.sse_gap(nm, "store from a non-XMM source");
+                            return;
+                        }
+                    };
+                    let a = match self.addr_of(ins, 0) {
+                        Some(a) => a,
+                        None => {
+                            self.sse_gap(nm, "store to an address we cannot name");
+                            return;
+                        }
+                    };
+                    let bits = self.xmm(s);
+                    let low = self.narrow(bits, n);
+                    // A float-typed store, so the emitter writes the VALUE's bits
+                    // (`rdec_f64_bits`), and a bit-typed source is bitcast to the
+                    // float the store's type names. Both halves of that are the
+                    // same memcpy; the IR names the type, which is the point.
+                    let v = self.cast_ty(CastKind::Bitcast, low, Ty::Float { w: fw });
+                    self.f
+                        .emit_void(self.cur, Op::Store(Ty::Float { w: fw }, a, v), self.addr());
+                    return;
+                }
+                self.sse_gap(nm, "form the model does not have");
+                return;
+            }
+            "movapd" | "movaps" | "movdqa" | "movdqu" => {
+                if let Some(d) = self.xmm_op(ins, 0) {
+                    match ins.op_kind(1) {
+                        OpKind::Register => {
+                            let s = match self.xmm_op(ins, 1) {
+                                Some(s) => s,
+                                None => {
+                                    self.sse_gap(nm, "source is not an XMM register");
+                                    return;
+                                }
+                            };
+                            // The 128-bit copy, modelled as its low 64 bits. The
+                            // upper half is not carried, and that is sound only
+                            // because every op that could read it is refused:
+                            // the module doc calls this out on purpose.
+                            let src = self.xmm(s);
+                            let v = self.f.emit(self.cur, Op::Copy(src), Ty::u64(), self.addr());
+                            self.set_xmm(d, v);
+                            return;
+                        }
+                        OpKind::Memory => {
+                            let a = match self.addr_of(ins, 1) {
+                                Some(a) => a,
+                                None => {
+                                    self.sse_gap(nm, "load from an address we cannot name");
+                                    return;
+                                }
+                            };
+                            // A 128-bit LOAD is modelled as its low 8 bytes: a
+                            // dropped load is safe, because the value it would
+                            // have produced is observable only to the packed ops
+                            // this lifter refuses.
+                            let t = Ty::u64();
+                            let v = self
+                                .f
+                                .emit(self.cur, Op::Load(t.clone(), a), t, self.addr());
+                            self.set_xmm(d, v);
+                            return;
+                        }
+                        _ => {
+                            self.sse_gap(nm, "source is neither an XMM register nor memory");
+                            return;
+                        }
+                    }
+                }
+                // A 128-bit STORE is refused, and the reason is the asymmetry
+                // above: the model has 64 bits to store, and the 8 bytes it does
+                // not write come back as `undef` in the model and as the real
+                // value on the machine. Memory is observable; a dropped load is
+                // not. `array_walk`'s `movaps %xmm0,(%rax)` is the case, and it
+                // stays a named gap.
+                self.sse_gap(
+                    nm,
+                    "a 128-bit store: the model has one 64-bit cell per xmm, and half a store leaves 8 bytes undefined",
+                );
+                return;
+            }
+            "movd" | "movq" => {
+                let n = if nm == "movd" { Width::W32 } else { Width::W64 };
+                if let Some(d) = self.xmm_op(ins, 0) {
+                    // gpr/memory -> xmm. The low 32/64 bits land in the cell and
+                    // the rest of the register is zeroed: ZExt to the cell width
+                    // IS that zeroing, which is why this direction is modelled
+                    // and a 128-bit store is not.
+                    let v = match self.src(ins, 1, n) {
+                        Some(v) => v,
+                        None => {
+                            self.sse_gap(nm, "no readable source");
+                            return;
+                        }
+                    };
+                    let up = self.cast(CastKind::ZExt, v, Width::W64);
+                    self.set_xmm(d, up);
+                    return;
+                }
+                if let Some(s) = self.xmm_op(ins, 1) {
+                    let bits = self.xmm(s);
+                    if let Some((d, dw)) = self.reg_op(ins, 0) {
+                        // xmm -> gpr: the low bits, and the destination's own
+                        // write rule (a 32-bit write clears the upper half)
+                        // finishes the job.
+                        let low = self.narrow(bits, dw);
+                        self.write(d, dw, low);
+                        return;
+                    }
+                    if ins.op_kind(0) == OpKind::Memory {
+                        let a = match self.addr_of(ins, 0) {
+                            Some(a) => a,
+                            None => {
+                                self.sse_gap(nm, "store to an address we cannot name");
+                                return;
+                            }
+                        };
+                        let low = self.narrow(bits, n);
+                        self.f
+                            .emit_void(self.cur, Op::Store(ty_u(n), a, low), self.addr());
+                        return;
+                    }
+                }
+                self.sse_gap(nm, "form the model does not have");
+                return;
+            }
+            _ => {}
+        }
+        // ---- conversions --------------------------------------------------
+        if nm == "cvtsi2sd" || nm == "cvtsi2ss" {
+            let fw = if nm == "cvtsi2sd" { F64 } else { F32 };
+            let Some(d) = self.xmm_op(ins, 0) else {
+                self.sse_gap(nm, "no XMM destination");
+                return;
+            };
+            // The source is read at ITS width and CONVERTED AS SIGNED: `cvtsi2sd
+            // xmm0, eax` reads 32 bits, not the 64-bit register. Reading at W32
+            // is the width rule; the signed re-read at that width is what makes
+            // -1 convert to -1.0 and not to 4294967295.0.
+            let sw = match ins.op_kind(1) {
+                OpKind::Register => match self.reg_op(ins, 1) {
+                    Some((_, w)) => w,
+                    None => {
+                        self.sse_gap(nm, "source is not a general-purpose register");
+                        return;
+                    }
+                },
+                OpKind::Memory => match Self::w_of_ms(ins.memory_size()) {
+                    Some(w) => w,
+                    None => {
+                        self.sse_gap(nm, "source has no readable size");
+                        return;
+                    }
+                },
+                _ => {
+                    self.sse_gap(nm, "source is not an integer operand");
+                    return;
+                }
+            };
+            let v = match self.src(ins, 1, sw) {
+                Some(v) => v,
+                None => {
+                    self.sse_gap(nm, "no readable integer source");
+                    return;
+                }
+            };
+            let sv = self.cast_ty(CastKind::Bitcast, v, Ty::int(sw, rdec_core::ty::Sx::Signed));
+            let f = self.cast_ty(CastKind::SIToFp, sv, Ty::Float { w: fw });
+            let bits = self.fbits(f);
+            self.set_xmm(d, bits);
+            return;
+        }
+        if matches!(nm, "cvttsd2si" | "cvttss2si") {
+            let fw = if nm == "cvttsd2si" { F64 } else { F32 };
+            let Some((d, dw)) = self.reg_op(ins, 0) else {
+                self.sse_gap(nm, "no integer destination");
+                return;
+            };
+            let v = match self.fsrc(ins, 1, fw) {
+                Some(v) => v,
+                None => {
+                    self.sse_gap(nm, "no readable float source");
+                    return;
+                }
+            };
+            // Truncate toward zero, and x86's answer for NaN or an out-of-range
+            // source is the destination's sign bit. `FpToSI`'s C spelling is the
+            // GUARDED form for that reason: a bare C cast is undefined
+            // behaviour exactly where the machine has a defined answer.
+            let t = Ty::int(dw, rdec_core::ty::Sx::Signed);
+            let cvt = self.cast_ty(CastKind::FpToSI, v, t);
+            self.write(d, dw, cvt);
+            return;
+        }
+        if nm == "cvtss2sd" || nm == "cvtsd2ss" {
+            let (from, to) = if nm == "cvtss2sd" {
+                (F32, F64)
+            } else {
+                (F64, F32)
+            };
+            let Some(d) = self.xmm_op(ins, 0) else {
+                self.sse_gap(nm, "no XMM destination");
+                return;
+            };
+            let v = match self.fsrc(ins, 1, from) {
+                Some(v) => v,
+                None => {
+                    self.sse_gap(nm, "no readable float source");
+                    return;
+                }
+            };
+            let k = if to == F64 {
+                CastKind::FPExt
+            } else {
+                CastKind::FPTrunc
+            };
+            let r = self.cast_ty(k, v, Ty::Float { w: to });
+            let bits = self.fbits(r);
+            self.set_xmm(d, bits);
+            return;
+        }
+        if matches!(nm, "cvtsd2si" | "cvtss2si") {
+            // The ROUNDING forms: they convert with MXCSR's rounding mode, which
+            // the model does not carry. `cvttsd2si` (truncate) is modelled;
+            // inventing round-to-nearest here would be a guess about a register
+            // the function may have changed.
+            self.sse_gap(
+                nm,
+                "a rounding-mode-dependent conversion; MXCSR is not modelled",
+            );
+            return;
+        }
+        if matches!(nm, "ucomisd" | "comisd" | "ucomiss" | "comiss") {
+            // The refusal is not laziness about flags. `ucomisd` sets
+            // ZF/CF/PF to a THREE-bit answer (below / equal / above-or-equal /
+            // unordered), and the `jcc` spellings that read it are combinations
+            // (`ja` = CF=0&&ZF=0, `jb` = CF=1, `jae` = ZF=1||CF=0, `jp` = PF=1)
+            // whose unordered cases are not one boolean. `ja`/`jb`/`je`/`jne`
+            // alone C would spell; `jae`/`jbe`/`jp`/`jnp` would not, and picking
+            // the subset that works in the corpus is the guess this project
+            // refuses to make. The compare stays a named gap.
+            self.sse_gap(
+                nm,
+                "an ordered float compare: ZF/CF/PF is a three-bit answer and the jcc spellings of it are not one boolean",
+            );
+            return;
+        }
+        // Everything else in the family: packed arithmetic, shuffles, unpacks,
+        // masks, `movmskps`, the `p*` integer-vector set. All of them read or
+        // write bits 127:64 (or 127:32), which this model does not carry.
+        self.sse_gap(
+            nm,
+            "packed/vector SSE: it reads or writes bits this model does not carry",
+        );
+    }
+
+    /// The scalar SSE arithmetic, by canonical name. The SUFFIX is the precision,
+    /// and the base must be one of these words exactly: that is what keeps
+    /// `addpd` (base `addp`) and `cvtsd2si` out of a match that would happily read
+    /// them as `add`/`cvt`.
+    fn sse_arith(nm: &str) -> Option<(FBinOp, FWidth)> {
+        use FWidth::{F32, F64};
+        // The SUFFIX IS TWO LETTERS: `addsd` is `add` + `sd`, and stripping one
+        // letter reads the base as `adds`, which is in no table. Getting this wrong
+        // is not a crash -- it is `addsd` falling through to the packed refusal,
+        // which is why the test names the mnemonics it expects to be modelled.
+        let (base, fw) = match nm.strip_suffix("sd") {
+            Some(b) => (b, F64),
+            None => (nm.strip_suffix("ss")?, F32),
+        };
+        let op = match base {
+            "add" => FBinOp::Add,
+            "sub" => FBinOp::Sub,
+            "mul" => FBinOp::Mul,
+            "div" => FBinOp::Div,
+            // x86's `maxsd`/`minsd` return the SECOND operand when either side is
+            // NaN -- the IR op carries that rule, not C's `fmax`.
+            "max" => FBinOp::Max,
+            "min" => FBinOp::Min,
+            "sqrt" => FBinOp::Sqrt,
+            _ => return None,
+        };
+        Some((op, fw))
+    }
+
+    /// The SSE family, by canonical name: everything here reaches `Lifter::sse`,
+    /// where the scalar subset is modelled and the rest is refused by name. The
+    /// census counts at this gate, so the number the gates print is the number of
+    /// SSE instructions the lifter SAW -- modelled and refused together, which is
+    /// the only census that can be checked against `llvm-objdump -d`.
+    ///
+    /// What is NOT in this list falls through to the integer paths and lands in
+    /// `unmodelled instruction: <mnemonic>` -- loud and counted there, so a missing
+    /// name here is a renamed gap, never a silent one.
+    fn sse_family(nm: &str) -> bool {
+        // `cvtsi2sd`/`cvtsi2ss`/`cvtss2sd`/`cvtsd2ss` all END in `sd`/`ss`, so the
+        // arithmetic matcher must be tried AFTER the conversion names, and the
+        // packed forms must be in this list: what is not listed here falls through
+        // to the integer paths, where the generic decoder's own
+        // `unmodelled instruction: <mnemonic>` gap is loud and counted.
+        matches!(
+            nm,
+            "movsd"
+                | "movss"
+                | "movapd"
+                | "movaps"
+                | "movdqa"
+                | "movdqu"
+                | "movd"
+                | "movq"
+                | "addsd"
+                | "subsd"
+                | "mulsd"
+                | "divsd"
+                | "maxsd"
+                | "minsd"
+                | "sqrtsd"
+                | "addss"
+                | "subss"
+                | "mulss"
+                | "divss"
+                | "maxss"
+                | "minss"
+                | "sqrtss"
+                | "addpd"
+                | "subpd"
+                | "mulpd"
+                | "divpd"
+                | "maxpd"
+                | "minpd"
+                | "sqrtpd"
+                | "addps"
+                | "subps"
+                | "mulps"
+                | "divps"
+                | "maxps"
+                | "minps"
+                | "sqrtps"
+                | "pxor"
+                | "xorps"
+                | "xorpd"
+                | "andps"
+                | "andpd"
+                | "andnps"
+                | "andnpd"
+                | "orps"
+                | "orpd"
+                | "comisd"
+                | "ucomisd"
+                | "comiss"
+                | "ucomiss"
+                | "shufps"
+                | "shufpd"
+                | "unpcklps"
+                | "unpckhps"
+                | "unpcklpd"
+                | "unpckhpd"
+                | "movmskps"
+                | "movmskpd"
+                | "cvtsi2sd"
+                | "cvtsi2ss"
+                | "cvttsd2si"
+                | "cvttss2si"
+                | "cvtsd2si"
+                | "cvtss2si"
+                | "cvtss2sd"
+                | "cvtsd2ss"
+                | "cvtdq2ps"
+                | "cvtps2dq"
+                | "cvtpd2ps"
+                | "cvtps2pd"
+                | "paddd"
+                | "paddq"
+                | "paddb"
+                | "paddw"
+                | "psubd"
+                | "psubq"
+                | "pmuludq"
+                | "pmullw"
+                | "pmulhw"
+                | "pand"
+                | "pandn"
+                | "por"
+                | "pcmpgtd"
+                | "pcmpeqd"
+                | "pslld"
+                | "psrld"
+                | "psrad"
+                | "movntdq"
+                | "movntpd"
+                | "movntps"
+                | "ldmxcsr"
+                | "stmxcsr"
+        )
+    }
+
     /// One instruction. Control-transfer instructions set `self.pending`.
     fn one(&mut self, ins: &Instruction) {
         let m = ins.mnemonic();
         let nm = self.name_of(ins);
         let w = self.op_w(ins);
+
+        // SSE, scalar subset. Counted at this gate, before the modelled/refused
+        // split, so the census the gates print is "what the decoder saw".
+        if Self::sse_family(&nm) {
+            *self.rep.sse.entry(nm.clone()).or_default() += 1;
+            self.sse(&nm, ins);
+            return;
+        }
 
         // Conditional transfers: jcc / setcc / cmovcc, by canonical name.
         if matches!(
@@ -1381,6 +2117,16 @@ impl<'a> Lifter<'a> {
                 self.clear_flags();
             }
             Mnemonic::Ret => {
+                // A float/double answer leaves in XMM0. Counted at the `ret`,
+                // where the register map is this block's: XMM0 written, RAX not.
+                // Not an IR gap -- the emitted C returns the integer RAX, which
+                // is what T2 compares -- but the C++ gate prints the number,
+                // because "N of these functions answer in XMM0" is the reason
+                // their C looks like it returns nothing, and a reader should not
+                // have to infer that from the disassembly.
+                if self.regs.contains_key(&Grp::Xmm(0)) && !self.regs.contains_key(&Grp::Rax) {
+                    self.rep.ret_xmm0 += 1;
+                }
                 self.pending = Pending::Ret;
             }
             _ if nm.starts_with("set") => {
@@ -1916,6 +2662,15 @@ fn rewrite_op(op: &mut Op, old: VId, new: VId) {
     match op {
         Op::Copy(a) => *a = map(*a, old, new),
         Op::Bin(_, a, b) | Op::Cmp(_, a, b) => {
+            *a = map(*a, old, new);
+            *b = map(*b, old, new);
+        }
+        // The float pair has to be rewritten too: a phi resolution that skips a
+        // `fadd`'s operands leaves that operand naming a block-local live-in,
+        // which is exactly the dangling reference this function exists to
+        // remove. It is listed with `Bin`/`Cmp`, not in the catch-all below, so
+        // the day an op is added the compiler asks the question.
+        Op::FBin(_, a, b) | Op::FCmp(_, a, b) => {
             *a = map(*a, old, new);
             *b = map(*b, old, new);
         }

@@ -26,11 +26,149 @@ use std::collections::HashMap;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Val {
     Int(u64),
+    /// A float value. F32-typed values are carried as the `f64` that exactly
+    /// represents them (every f32 is exactly an f64), and `fbin`/`fcmp` take a
+    /// precision flag so an F32 op rounds through `f32` like the machine and
+    /// the emitted C do. The bit pattern a `Val::Fl` answers with for `bits()`
+    /// is the F64 pattern; the F32 pattern comes from `f32_bits`.
     Fl(f64),
     Bl(bool),
     /// An opaque EFLAGS value. It must never be observable in the emitted C;
     /// reading it goes through `GetFlag`.
     Fg(FlagBits),
+}
+
+/// The bit pattern a float value of the given width occupies in memory / a
+/// register cell: 32 bits for `FWidth::F32`, 64 for `FWidth::F64`.
+pub fn float_bits(w: FWidth, f: f64) -> u64 {
+    match w {
+        // The F32 narrowing is a real rounding, `as` on an out-of-range f64
+        // saturates, and both the interpreter and the emitted C use the same
+        // spelling. `f32::from_f64` is not a thing in stable Rust.
+        FWidth::F32 => (f as f32).to_bits() as u64,
+        FWidth::F64 => f.to_bits(),
+    }
+}
+
+/// The float value a memory/register bit pattern stands for at the given
+/// width. An F32 NaN's high bits are not part of the value, so they are
+/// dropped: `f32::from_bits(bits as u32) as f64`.
+pub fn float_of_bits(w: FWidth, bits: u64) -> f64 {
+    match w {
+        FWidth::F32 => f32::from_bits(bits as u32) as f64,
+        FWidth::F64 => f64::from_bits(bits),
+    }
+}
+
+/// Float arithmetic at a precision. The F32 arm rounds every answer through
+/// `f32` -- that is `addss`, and it is what the emitted C does by naming the C
+/// `float` type. Computing in f64 and truncating afterwards is double rounding
+/// and would make this reference disagree with the machine.
+pub fn fbin(o: FBinOp, a: f64, b: f64, w: FWidth) -> f64 {
+    match w {
+        FWidth::F64 => match o {
+            FBinOp::Add => a + b,
+            FBinOp::Sub => a - b,
+            FBinOp::Mul => a * b,
+            FBinOp::Div => a / b,
+            // x86's rule, not C's ternary: NaN on either side answers `b`.
+            FBinOp::Max => {
+                if a.is_nan() || b.is_nan() {
+                    b
+                } else if a > b {
+                    a
+                } else {
+                    b
+                }
+            }
+            FBinOp::Min => {
+                if a.is_nan() || b.is_nan() {
+                    b
+                } else if a < b {
+                    a
+                } else {
+                    b
+                }
+            }
+            FBinOp::Sqrt => a.sqrt(),
+        },
+        FWidth::F32 => {
+            let (a, b) = (a as f32, b as f32);
+            (match o {
+                FBinOp::Add => a + b,
+                FBinOp::Sub => a - b,
+                FBinOp::Mul => a * b,
+                FBinOp::Div => a / b,
+                FBinOp::Max => {
+                    if a.is_nan() || b.is_nan() {
+                        b
+                    } else if a > b {
+                        a
+                    } else {
+                        b
+                    }
+                }
+                FBinOp::Min => {
+                    if a.is_nan() || b.is_nan() {
+                        b
+                    } else if a < b {
+                        a
+                    } else {
+                        b
+                    }
+                }
+                FBinOp::Sqrt => a.sqrt(),
+            }) as f64
+        }
+    }
+}
+
+/// Float comparison, IEEE/C rules: every ordered predicate is false and `!=` is
+/// true when either side is NaN.
+pub fn fcmp(c: FloatCmp, a: f64, b: f64) -> bool {
+    match c {
+        FloatCmp::Eq => a == b,
+        FloatCmp::Ne => a != b,
+        FloatCmp::Lt => a < b,
+        FloatCmp::Le => a <= b,
+        FloatCmp::Gt => a > b,
+        FloatCmp::Ge => a >= b,
+    }
+}
+
+/// `cvttsd2si`/`cvttss2si`: truncate toward zero, and NaN or an out-of-range
+/// source answers the destination width's sign bit -- the SDM's
+/// "Integer Invalid Operation" result, 0x80000000 / 0x8000000000000000. Rust's
+/// `as` saturates and C's cast is undefined behaviour for these inputs; this is
+/// the machine's answer, spelled out. `x >= -2^(n-1) && x < 2^(n-1)` is the
+/// in-range window, so -2^(n-1) itself converts exactly and 2^(n-1) does not.
+pub fn fptosi_x86(x: f64, w: Width) -> u64 {
+    let bits = w.bits();
+    let magic = 1u64 << (bits - 1);
+    let lo = -(2f64.powi(bits as i32 - 1));
+    let hi = 2f64.powi(bits as i32 - 1);
+    if x.is_nan() || !(x >= lo && x < hi) {
+        magic
+    } else if bits == 64 {
+        // `as i64` is exact inside the window, and the window excludes the one
+        // value (2^63) that would not fit.
+        x.trunc() as i64 as u64
+    } else {
+        (x.trunc() as i64) as u64
+    }
+}
+
+/// The unsigned form (`cvttsd2usi`): NaN, a negative source, or a source at or
+/// above 2^n answers the sign bit, the same invalid-operation result.
+pub fn fptoui_x86(x: f64, w: Width) -> u64 {
+    let bits = w.bits();
+    let magic = 1u64 << (bits - 1);
+    let hi = 2f64.powi(bits as i32);
+    if x.is_nan() || x < 0.0 || x >= hi {
+        magic
+    } else {
+        x.trunc() as u64
+    }
 }
 
 impl Val {
@@ -303,6 +441,27 @@ impl<'a> Interp<'a> {
         self.get(v).ok_or(Fault::MissingOperand(v))
     }
 
+    /// Read a float operand. A non-float value here means the IR wired an
+    /// integer into a float op, which `verify` rejects; answering 0.0 would let
+    /// that bug run, so it is a fault.
+    fn fetch_fl(&self, v: VId) -> Result<f64, Fault> {
+        match self.get(v) {
+            Some(Val::Fl(f)) => Ok(f),
+            Some(_) => Err(Fault::MissingOperand(v)),
+            None => Err(Fault::MissingOperand(v)),
+        }
+    }
+
+    /// The precision a float op runs at: the operand's own `Ty::Float` width.
+    /// A missing type answers F64, which is the width `ty_of` records for
+    /// `Op::FBin` when the operand has no type, so the two agree.
+    fn float_width_of(&self, v: VId) -> FWidth {
+        match self.f.ty_of(v) {
+            Some(Ty::Float { w }) => w,
+            _ => FWidth::F64,
+        }
+    }
+
     fn exec_entry(&mut self, inputs: &[u64]) -> Outcome {
         // Parameters: bound in the entry block by `Op::Param`.
         for (i, &p) in self.f.params.iter().enumerate() {
@@ -343,11 +502,11 @@ impl<'a> Interp<'a> {
                     return Outcome::Budget;
                 }
                 // Borrow discipline: pull what we need, then release.
-                let (dest, op) = {
+                let (dest, op, ty) = {
                     let ins = &self.f.blocks[cur as usize].instrs[ii];
-                    (ins.dest, ins.op.clone())
+                    (ins.dest, ins.op.clone(), ins.ty.clone())
                 };
-                match self.eval_op(dest, &op) {
+                match self.eval_op(dest, &op, &ty) {
                     Ok(()) => {}
                     Err(f) => return Outcome::Fault(f),
                 }
@@ -383,9 +542,21 @@ impl<'a> Interp<'a> {
         }
     }
 
-    fn eval_op(&mut self, dest: VId, op: &Op) -> Result<(), Fault> {
+    fn eval_op(&mut self, dest: VId, op: &Op, ty: &Ty) -> Result<(), Fault> {
         match op {
-            Op::Const(c) => self.set(dest, Val::Int(*c)),
+            Op::Const(c) => {
+                // The type says how to read the bits. An integer-typed constant
+                // is an integer; a FLOAT-typed one — which is what folding a
+                // bit-cast of a constant produces (`movsd xmm0,` an immediate
+                // pattern, `movapd` of a mask) — is the SAME bits read as a
+                // float. Reading it as an integer here would leave a `Val::Int`
+                // in a float slot, and the strict interpreter would fault on the
+                // next float op that consumed it.
+                match ty {
+                    Ty::Float { w } => self.set(dest, Val::Fl(float_of_bits(*w, *c))),
+                    _ => self.set(dest, Val::Int(*c)),
+                }
+            }
             Op::ConstF(c) => self.set(dest, Val::Fl(*c)),
             // Undef is the all-zero bit pattern: a *fixed* choice, so TV is
             // deterministic. See docs/ir-semantics.md.
@@ -405,6 +576,21 @@ impl<'a> Interp<'a> {
                 let sx = self.signed_of(*a);
                 let r = self.binop(*o, x, y, w, sx)?;
                 self.set(dest, Val::Int(w.trunc(r, false)));
+            }
+            // Float arithmetic. F32 operands round the answer through `f32`,
+            // because that is what `addss` does and what the emitted C does by
+            // naming the C `float` type; computing in f64 and truncating after
+            // would make the reference answer DOUBLE-rounded (it is the classic
+            // double-rounding bug, and TV would report a clean tree that the
+            // hardware disagrees with).
+            Op::FBin(o, a, b) => {
+                let (x, y) = (self.fetch_fl(*a)?, self.fetch_fl(*b)?);
+                let w = self.float_width_of(*a);
+                self.set(dest, Val::Fl(fbin(*o, x, y, w)));
+            }
+            Op::FCmp(c, a, b) => {
+                let (x, y) = (self.fetch_fl(*a)?, self.fetch_fl(*b)?);
+                self.set(dest, Val::Bl(fcmp(*c, x, y)));
             }
             Op::Un(o, a) => {
                 let v = self.fetch_val(*a)?;
@@ -455,20 +641,61 @@ impl<'a> Interp<'a> {
                     CastKind::ZExt => Val::Int(sw.trunc(x, false)),
                     CastKind::SExt => Val::Int(sw.trunc(x, true)),
                     CastKind::Bitcast => match t {
-                        // A bitcast int<->float reinterprets the bits.
                         Ty::Float { w: FWidth::F32 } => Val::Fl(f32::from_bits(x as u32) as f64),
                         Ty::Float { w: FWidth::F64 } => Val::Fl(f64::from_bits(x)),
                         Ty::Bool => Val::Bl(x != 0),
-                        _ => Val::Int(x),
+                        // int <- float: the cell encoding is the value's OWN
+                        // width in bits, zero-extended. An F32 value occupies
+                        // the low 32 bits of the register and bits 63:32 are
+                        // zero -- that is `movss`'s architectural contract -- so
+                        // writing the f64 pattern here would put 32 bits of
+                        // exponent into a cell whose next use is a 4-byte store.
+                        _ => match self.f.ty_of(*a) {
+                            Some(Ty::Float { w: FWidth::F32 }) => {
+                                Val::Int(float_bits(FWidth::F32, f))
+                            }
+                            _ => Val::Int(x),
+                        },
                     },
-                    CastKind::SIToFp => Val::Fl(sw.trunc(x, true) as i64 as f64),
-                    CastKind::UIToFp => Val::Fl(sw.trunc(x, false) as f64),
-                    CastKind::FpToSI => {
-                        Val::Int(t.width().unwrap_or(sw).trunc(f as i64 as u64, false))
+                    CastKind::SIToFp => {
+                        // `cvtsi2sd`/`cvtsi2ss`: the integer is read at ITS own
+                        // width, the answer is at the TARGET's. An F32 target
+                        // rounds the exact value through f32, which is what the
+                        // hardware does -- keeping the unrounded f64 here would
+                        // make the reference answer differ from the machine (and
+                        // from the emitted C) for every integer above 2^24.
+                        let v = sw.trunc(x, true) as i64 as f64;
+                        Val::Fl(match t {
+                            Ty::Float { w: FWidth::F32 } => v as f32 as f64,
+                            _ => v,
+                        })
                     }
-                    CastKind::FpToUI => Val::Int(t.width().unwrap_or(sw).trunc(f as u64, false)),
+                    CastKind::UIToFp => {
+                        let v = sw.trunc(x, false) as f64;
+                        Val::Fl(match t {
+                            Ty::Float { w: FWidth::F32 } => v as f32 as f64,
+                            _ => v,
+                        })
+                    }
+                    // `cvttsd2si`/`cvttss2si`: truncate toward zero, and x86's
+                    // answer for NaN or an out-of-range source is the destination
+                    // width's sign bit (0x80000000 / 0x8000000000000000). A Rust
+                    // `as` SATURATES, so the rule is spelled out here; `emit_c`
+                    // emits the same guard in C, because the same cast is
+                    // undefined behaviour in C and must not be relied on.
+                    CastKind::FpToSI => {
+                        let dw = t.width().unwrap_or(sw);
+                        Val::Int(dw.trunc(fptosi_x86(f, dw), false))
+                    }
+                    CastKind::FpToUI => {
+                        let dw = t.width().unwrap_or(sw);
+                        Val::Int(dw.trunc(fptoui_x86(f, dw), false))
+                    }
                     CastKind::FPExt => Val::Fl(f),
-                    CastKind::FPTrunc => Val::Fl(f as f32 as f64),
+                    CastKind::FPTrunc => Val::Fl(match t {
+                        Ty::Float { w: FWidth::F32 } => f as f32 as f64,
+                        _ => f,
+                    }),
                 };
                 self.set(dest, v);
             }
@@ -497,7 +724,10 @@ impl<'a> Interp<'a> {
                 let n = t.width().map(|w| w.bytes()).unwrap_or(8);
                 let v = match self.get(*val) {
                     Some(Val::Fl(f)) => match t {
-                        Ty::Float { w: FWidth::F32 } => (f as f32) as u64,
+                        // The F32 store writes the f32 BITS. `(f as f32) as u64`
+                        // -- what this used to do -- converts the value to an
+                        // integer, so `movss` of 1.5 stored 1.
+                        Ty::Float { w: FWidth::F32 } => float_bits(FWidth::F32, f),
                         _ => f.to_bits(),
                     },
                     Some(x) => x.bits(),

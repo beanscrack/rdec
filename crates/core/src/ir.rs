@@ -51,6 +51,70 @@ pub enum BinOp {
     RotR,
 }
 
+/// Floating-point binary ops. Deliberately NOT `BinOp::Add` with float
+/// operands: every consumer of `BinOp` computes in `u64` — the interpreter's
+/// integer `binop`, the constant folder, the flag tables, `width::bits_needed`.
+/// Reusing it for floats would make `addsd` an INTEGER ADD of two bit patterns,
+/// which is not the machine's answer, and the operands' float types would not
+/// stop it. `Op::FBin` is the op that means the float thing.
+///
+/// Each op happens at the precision of its OPERANDS: `addss` takes F32 and
+/// answers F32, `addsd` takes F64 and answers F64. `Op::FBin`'s result type is
+/// the type of its first operand for exactly that reason.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum FBinOp {
+    Add,
+    Sub,
+    Mul,
+    /// IEEE division: by zero yields an infinity, it does not trap. This is why
+    /// `FBin` is safe to replicate into use sites like `Bin` is.
+    Div,
+    /// `maxsd`/`maxss`. x86 returns the SECOND operand when either side is
+    /// NaN, which is not `a > b ? a : b` — the emitter spells the NaN rule out,
+    /// so the C agrees with the hardware on NaN inputs.
+    Max,
+    /// `minsd`/`minss`, with x86's NaN rule as for `Max`.
+    Min,
+    /// `sqrtsd`/`sqrtss`, at the operand's own precision.
+    Sqrt,
+}
+
+/// Floating-point comparisons, named for the C operator they spell. Ordered:
+/// `<`/`<=`/`>`/`>=`/`==` are `false` when either operand is NaN, and `!=` is
+/// `true` — the IEEE/C rule, stated per predicate because the guard that uses
+/// them (`cvttsd2si`, `maxsd`) depends on exactly that behaviour.
+///
+/// Only the C spellings exist here, on purpose. `ucomisd`/`comisd` set
+/// ZF/CF/PF so that an unordered compare is a *three-bit* answer ("below",
+/// "equal", "above-or-equal", "unordered"), and the `jcc` spelling that reads
+/// it (`ja`/`jb`/`jp` combinations) is not one Bool. The lifter refuses those
+/// mnemonics by name; this enum cannot express a claim about them.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum FloatCmp {
+    /// `x == y` — false when either side is NaN.
+    Eq,
+    /// `x != y` — TRUE when either side is NaN (x86's UN+NEQ, C's `!=`).
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+impl FloatCmp {
+    /// C's operator for this predicate.
+    pub const fn c_op(self) -> &'static str {
+        match self {
+            FloatCmp::Eq => "==",
+            FloatCmp::Ne => "!=",
+            FloatCmp::Lt => "<",
+            FloatCmp::Le => "<=",
+            FloatCmp::Gt => ">",
+            FloatCmp::Ge => ">=",
+        }
+    }
+}
+
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum UnOp {
     Not,
@@ -61,6 +125,8 @@ pub enum UnOp {
     Lzcnt,
     /// Trailing zeros (tzcnt/bsf-idiom).
     Tzcnt,
+    /// Square root, at the operand's own type: `double` for F64, `float` for
+    /// F32 (`sqrtsd` / `sqrtss`).
     Sqrt,
 }
 
@@ -275,6 +341,13 @@ pub enum Op {
     /// propagation before C emission.
     Copy(VId),
     Bin(BinOp, VId, VId),
+    /// Floating-point arithmetic at the operands' float type (`addsd`, `mulss`,
+    /// ...). The result type is the type of the FIRST operand: the operation
+    /// happens at the operand precision, and recording F64 for an F32 `addss`
+    /// would have the IR claim a wider answer than the machine produced.
+    FBin(FBinOp, VId, VId),
+    /// Floating-point comparison -> `Ty::Bool`, at the operands' float type.
+    FCmp(FloatCmp, VId, VId),
     Un(UnOp, VId),
     Cmp(IntCmp, VId, VId),
     /// Produce a `Ty::Flags` value.
@@ -329,6 +402,8 @@ impl Op {
                 UnOp::Sqrt => f.ty_of(*a).unwrap_or(Ty::f64()),
                 _ => f.ty_of(*a).unwrap_or(Ty::u64()),
             },
+            Op::FBin(_, a, _) => f.ty_of(*a).unwrap_or(Ty::f64()),
+            Op::FCmp(..) => Ty::Bool,
             Op::Cmp(..) => Ty::Bool,
             Op::Flags(_) => Ty::Flags,
             Op::GetFlag(..) => Ty::Bool,
@@ -347,6 +422,7 @@ impl Op {
             Op::Const(_) | Op::ConstF(_) | Op::Undef | Op::Opaque(_) | Op::Param => {}
             Op::Copy(a) => out.push(a),
             Op::Bin(_, a, b) => out.extend([a, b]),
+            Op::FBin(_, a, b) | Op::FCmp(_, a, b) => out.extend([a, b]),
             Op::Un(_, a) | Op::Cast(_, _, a) => out.push(a),
             Op::Cmp(_, a, b) => out.extend([a, b]),
             Op::Flags(f) => match f {
@@ -381,6 +457,12 @@ impl Op {
         match self {
             Op::Const(_) | Op::ConstF(_) | Op::Param | Op::Undef => true,
             Op::Copy(_) => true,
+            // `FBin`/`FCmp` are in this group with `Bin`/`Cmp`: a pure
+            // recomputation. Division by zero is NOT a trap in IEEE arithmetic
+            // (it yields an infinity), so duplicating a `fdiv` cannot turn a
+            // faulting execution into a returning one -- which is exactly the
+            // reason an x86 `div` is NOT in this group.
+            Op::FBin(..) | Op::FCmp(..) => true,
             Op::Bin(..) | Op::Un(..) | Op::Cmp(..) | Op::Cast(..) | Op::Select(..) => true,
             Op::Flags(_) => true,
             Op::GetFlag(..) => true,

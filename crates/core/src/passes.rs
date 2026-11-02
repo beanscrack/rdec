@@ -124,7 +124,23 @@ pub fn const_fold(f: &mut Function) -> bool {
                 Op::Un(op, a) => f
                     .as_const(*a)
                     .map(|x| Op::Const(const_un(*op, x, ins.ty.width().unwrap_or(Width::W64)))),
-                Op::Cast(k, t, a) => f.as_const(*a).map(|x| Op::Const(const_cast(*k, t, x))),
+                // A cast whose SOURCE is a float is not foldable by this
+                // integer folder: `as_const` answers for `Op::Const` only, so a
+                // The integer folder folds the BIT-level casts (Trunc/ZExt/
+                // SExt/Bitcast), where the answer is the same bits read at the
+                // destination width. It does NOT touch a cast that crosses the
+                // int/float boundary in either direction: SIToFp/UIToFp/FPExt/
+                // FPTrunc convert a VALUE, FpToSI/FpToUI answer x86's magic
+                // constant where C is undefined, and `const_cast` is a bit
+                // truncation for them -- folding `cvtsi2sd(-1)` through it is how
+                // `-1.0` silently becomes the bit pattern 0xFFFFFFFF read as a
+                // double. The conversion stays an op: the interpreter computes it
+                // and `emit_c` emits the guarded C.
+                Op::Cast(k, t, a)
+                    if !f.ty_of(*a).map(|ty| ty.is_float()).unwrap_or(false) && !t.is_float() =>
+                {
+                    f.as_const(*a).map(|x| Op::Const(const_cast(*k, t, x)))
+                }
                 Op::Cmp(c, a, b) => match (f.as_const(*a), f.as_const(*b)) {
                     (Some(x), Some(y)) => {
                         let ta = f.ty_of(*a).unwrap_or(Ty::u64());
@@ -525,6 +541,11 @@ fn op_shape(op: &Op) -> String {
         Op::Param => "param".into(),
         Op::Copy(_) => "copy".into(),
         Op::Bin(o, _, _) => format!("bin({o:?})"),
+        // The float ops keep their own identity: a diff that says
+        // "bin(Add) -> fbin(Add)" is the decompiler's own bug report, and
+        // collapsing them into one shape would hide it.
+        Op::FBin(o, _, _) => format!("fbin({o:?})"),
+        Op::FCmp(c, _, _) => format!("fcmp({c:?})"),
         Op::Un(o, _) => format!("un({o:?})"),
         Op::Cmp(c, _, _) => format!("cmp({c:?})"),
         Op::Flags(_) => "flags".into(),
@@ -659,6 +680,15 @@ impl Op {
             Op::Const(_) | Op::ConstF(_) | Op::Undef | Op::Opaque(_) | Op::Param => {}
             Op::Copy(a) => g(a),
             Op::Bin(_, a, b) => {
+                g(a);
+                g(b);
+            }
+            // A float op's operands are VIds like any other: a pass that
+            // rewrites uses in place and skips these leaves a value whose users
+            // point at the OLD definition, which is the dangling-reference class
+            // `interp::fetch` faults on. Register promotion hit exactly this
+            // before the arm existed.
+            Op::FBin(_, a, b) | Op::FCmp(_, a, b) => {
                 g(a);
                 g(b);
             }

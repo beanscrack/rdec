@@ -56,6 +56,10 @@ pub fn format_instr(f: &Function, i: &Instr) -> String {
         Op::Param => "param".into(),
         Op::Copy(a) => format!("copy {}", vname(f, *a)),
         Op::Bin(op, a, b) => format!("{} {}, {}", bin_str(*op), vname(f, *a), vname(f, *b)),
+        // `fadd`/`fsub`/... and `fcmp==`: distinct spellings, because a dump that
+        // reads `add %a %b` for a double add is a dump that lies about the type.
+        Op::FBin(op, a, b) => format!("{} {}, {}", fbin_str(*op), vname(f, *a), vname(f, *b)),
+        Op::FCmp(c, a, b) => format!("fcmp{} {}, {}", c.c_op(), vname(f, *a), vname(f, *b)),
         Op::Un(op, a) => format!("{} {}", un_str(*op), vname(f, *a)),
         Op::Cmp(c, a, b) => format!("cmp{} {}, {}", cmp_str(*c), vname(f, *a), vname(f, *b)),
         Op::Flags(fl) => format_flags(f, *fl),
@@ -144,6 +148,22 @@ fn format_flags(f: &Function, fl: FlagsOp) -> String {
     match b {
         Some(b) => format!("{n} {}, {}", vname(f, a), vname(f, b)),
         None => format!("{n} {}", vname(f, a)),
+    }
+}
+
+/// The float op spellings in an IR dump: `fadd`, `fmax`, `fsqrt`. Separate from
+/// `bin_str` on purpose — `%3 = fadd %1 %2` and `%3 = add %1 %2` are different
+/// machines, and a dump that printed `add` for a double add would be a dump that
+/// cannot be trusted about types.
+pub fn fbin_str(op: FBinOp) -> &'static str {
+    match op {
+        FBinOp::Add => "fadd",
+        FBinOp::Sub => "fsub",
+        FBinOp::Mul => "fmul",
+        FBinOp::Div => "fdiv",
+        FBinOp::Max => "fmax",
+        FBinOp::Min => "fmin",
+        FBinOp::Sqrt => "fsqrt",
     }
 }
 

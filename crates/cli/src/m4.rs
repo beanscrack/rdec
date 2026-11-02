@@ -95,6 +95,11 @@ pub struct Subject {
     pub external: bool,
     /// The lifted IR, after `clean`.
     pub f: Function,
+    /// The lifter's own count report for this function. `clean` may drop
+    /// instructions, so the SSE census has to come from the report and not from
+    /// a scan of the surviving IR: the number is "what the decoder saw", and
+    /// that is the only number `llvm-objdump -d` can check.
+    pub rep: rdec_arch_x86::lift::Report,
 }
 
 /// Load, discover, lift and clean every function in `files`, named by
@@ -188,7 +193,7 @@ pub fn lift_all_named(
                 .cloned()
                 .unwrap_or_else(|| format!("fn_{start:x}"));
             let name = name_of(oi, &raw);
-            let (mut f, _rep) = lift_one(&name, rg.bytes, rg.base, start, end, &plan, &names);
+            let (mut f, rep) = lift_one(&name, rg.bytes, rg.base, start, end, &plan, &names);
             clean(&mut f);
             out.push(Subject {
                 obj: file.clone(),
@@ -197,6 +202,7 @@ pub fn lift_all_named(
                 start,
                 external: external.contains(&start),
                 f,
+                rep,
             });
         }
     }
@@ -363,4 +369,21 @@ pub fn cmd_c(args: &[String]) -> Result<i32, String> {
     }
     println!("OK: every lifted function emitted C that clang accepts");
     Ok(0)
+}
+
+/// The SSE census, on the same footing as the self-idiom census: counted by the
+/// lifter at its own dispatch gate, so `sum(sse)` is the number of SSE
+/// instructions the decoder saw, which is what `llvm-objdump -d` over the same
+/// objects prints. Auditable, not trusted.
+pub fn sse_line(sse: &std::collections::BTreeMap<String, u32>, zeroing: usize) -> String {
+    if sse.is_empty() {
+        return "  sse mnemonics counted: 0 (scalar subset modelled, packed refused)".to_string();
+    }
+    let mut parts: Vec<String> = sse.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    parts.sort();
+    let tot: u32 = sse.values().sum();
+    format!(
+        "  sse mnemonics counted: {tot} [{}] (scalar subset modelled, packed refused by name; zeroing idiom: {zeroing})",
+        parts.join(" ")
+    )
 }

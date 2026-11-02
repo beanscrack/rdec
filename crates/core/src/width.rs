@@ -103,6 +103,10 @@ fn one(f: &Function, v: VId, memo: &mut HashMap<VId, u32>, path: &mut HashSet<VI
         // unmodelled op, an undefined register - is as wide as its type.
         Op::Param | Op::Undef | Op::Opaque(_) | Op::Load(..) | Op::Call { .. } => w,
         Op::ConstF(_) | Op::Flags(_) => w,
+        // A float op's result is as wide as its type says (64 for F64, 32 for
+        // F32, 1 for a comparison). It is NOT the width of the integer the cast
+        // to int will produce -- that question is the cast's own arm below.
+        Op::FBin(..) | Op::FCmp(..) => w,
         Op::Cmp(..) | Op::GetFlag(..) => w, // Bool: 1 bit, via the cap
         Op::Cast(k, to, x) => {
             let m = go(*x);

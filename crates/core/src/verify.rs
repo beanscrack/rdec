@@ -106,6 +106,66 @@ pub fn verify(f: &Function) -> Verdict {
                     }
                 }
             }
+            // Float arithmetic and float comparison are typed ops, not width
+            // ops. The width pair-check above compares `Ty::Float`'s width
+            // (F32 -> W32, F64 -> W64), which catches mixing precisions; this
+            // catches the other bug, an integer wired into a float op, which is
+            // invisible to a width rule because `int` and `float` share widths.
+            // C prints either -- `(double)a + b` compiles -- so only a check
+            // here keeps a pass bug from becoming silently-wrong C.
+            if let Op::FBin(_, x, y) | Op::FCmp(_, x, y) = &i.op {
+                for v in [*x, *y] {
+                    match f.ty_of(v) {
+                        Some(t) if t.is_float() => {}
+                        other => e.hard(format!(
+                            "bb{}: %{} float op reads %{} with type {} (needs a float)",
+                            b.id,
+                            i.dest,
+                            v,
+                            other
+                                .map(|t| t.to_string())
+                                .unwrap_or_else(|| "<no type>".to_string())
+                        )),
+                    }
+                }
+            }
+            // A float conversion whose SOURCE is not a float (or whose result
+            // is not the float kind the kind names) is a pass bug: the C cast
+            // syntax accepts all of them, and the answers differ.
+            if let Op::Cast(k, t, a) = &i.op {
+                let src = f.ty_of(*a);
+                // The string, not the Option<Ty>: Ty is Clone but not Copy, and
+                // the closure below is called from several arms.
+                let src_name = src
+                    .as_ref()
+                    .map(|t| t.to_string())
+                    .unwrap_or_else(|| "<no type>".to_string());
+                let mut named = |k: &'static str| {
+                    e.soft(format!(
+                        "bb{}: %{} {k} from %{} with type {}",
+                        b.id, i.dest, a, src_name
+                    ))
+                };
+                match k {
+                    CastKind::FpToSI | CastKind::FpToUI => {
+                        if !src.map(|t| t.is_float()).unwrap_or(false) {
+                            named("FpToSI/FpToUI");
+                        }
+                    }
+                    CastKind::SIToFp | CastKind::UIToFp => {
+                        if !src.map(|t| t.is_int()).unwrap_or(false) || !t.is_float() {
+                            named("SIToFp/UIToFp");
+                        }
+                    }
+                    CastKind::FPExt | CastKind::FPTrunc
+                        if !(src.as_ref().map(|t| t.is_float()).unwrap_or(false)
+                            && t.is_float()) =>
+                    {
+                        named("FPExt/FPTrunc");
+                    }
+                    _ => {}
+                }
+            }
         }
         // Terminator targets in range.
         let mut succ = Vec::new();

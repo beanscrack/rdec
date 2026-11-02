@@ -693,6 +693,11 @@ pub fn cmd_lift(args: &[String]) -> Result<i32, String> {
     let mut scaffolding = 0usize;
     let mut ret_w32 = 0usize;
     let mut self_idioms = 0usize;
+    // The SSE census, counted by the lifter, printed next to the self-idiom
+    // census: `sum(sse)` is the number of SSE instructions the decoder saw, and
+    // `llvm-objdump -d` over the same objects is the check on it.
+    let mut sse: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+    let mut sse_zeroing = 0usize;
     // Named, not counted: where a register read resolved to `undef`.
     let mut undef_sites: Vec<(u64, rdec_arch_x86::lift::Grp)> = Vec::new();
     let (mut ret_n, mut no_ret, mut step_budget, mut holes, mut unmodeled_load, mut fault) =
@@ -801,6 +806,10 @@ pub fn cmd_lift(args: &[String]) -> Result<i32, String> {
             scaffolding += rep.scaffolding_removed;
             ret_w32 += rep.ret_w32;
             self_idioms += rep.self_idioms;
+            for (k, v) in &rep.sse {
+                *sse.entry(k.clone()).or_insert(0) += *v;
+            }
+            sse_zeroing += rep.sse_zeroing;
             undef_sites.extend(rep.undef_sites.iter().copied());
             // M3's semantic check, on top of the structural one: run the IR
             // interpreter over the lifted function. It is strict - every operand
@@ -871,6 +880,7 @@ pub fn cmd_lift(args: &[String]) -> Result<i32, String> {
     println!(
         "evidence: {gap_total} loud gaps, {exit_total} Exit terminators, {unnamed_total} unnamed call targets, {clobber_total} modelled register clobbers, {unreach_total} unreachable blocks dropped, {scaffolding} live-in placeholders resolved, {undef_live} of them `undef` (the ABI question), {self_idioms} register self-idioms translated as machine-code facts (`xor/sub r,r` write 0 without reading the register; `and/or r,r` write it back)"
     );
+    println!("{}", crate::m4::sse_line(&sse, sse_zeroing));
     println!(
         "interp: {ret_n} returned, {no_ret} ended at Exit, {step_budget} hit the step budget, {opaque} reached an unmodelled op, {unmodeled_load} unmodelled loads, {fault} arithmetic faults, {holes} used a value that is never defined"
     );

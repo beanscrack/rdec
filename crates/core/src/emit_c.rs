@@ -27,7 +27,7 @@
 //! Flags must be gone before this runs: `Op::Flags` / `Op::GetFlag` are refusals,
 //! which is the loud version of `Ty::Flags`'s own doc comment ("must not survive
 //! the flag-elimination pass").
-use crate::ir::{BbId, BinOp, Callee, CastKind, Function, IntCmp, Op, Terminator, UnOp};
+use crate::ir::{BbId, BinOp, Callee, CastKind, FBinOp, Function, IntCmp, Op, Terminator, UnOp};
 use crate::ty::{FWidth, Sx, Ty, Width};
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -352,15 +352,93 @@ impl<'a> Emitter<'a> {
                 );
                 return None;
             }
-            CastKind::Bitcast => format!("({t}){x}"),
-            CastKind::SIToFp => format!("({t})(int64_t){x}"),
-            CastKind::UIToFp => format!("({t})(uint64_t){x}"),
-            CastKind::FpToSI => format!("(uint64_t)(int64_t){x}"),
-            CastKind::FpToUI => format!("(uint64_t)(uint64_t){x}"),
-            _ => {
-                self.refuse(at, format!("cast {k:?} is not expressible"));
-                return None;
+            CastKind::Bitcast => {
+                // A bitcast between an integer and a float REINTERPRETS; a C
+                // cast CONVERTS, and the two answers are different numbers.
+                // `(float)1065353216` is 1065353216.0f, and the bit pattern a
+                // `movss` put in the cell is 1.0f. The memcpy helpers do it.
+                let from_f = matches!(src, Ty::Float { .. });
+                let to_f = matches!(to, Ty::Float { .. });
+                match (from_f, to_f) {
+                    (false, true) => match to {
+                        Ty::Float { w: FWidth::F32 } => format!("rdec_bits_f32((uint64_t){x})"),
+                        _ => format!("rdec_bits_f64((uint64_t){x})"),
+                    },
+                    (true, false) => match src {
+                        Ty::Float { w: FWidth::F32 } => format!("rdec_f32_bits({x})"),
+                        _ => format!("rdec_f64_bits({x})"),
+                    },
+                    // Int<->int and pointer views keep the plain C cast.
+                    _ => format!("({t}){x}"),
+                }
             }
+            // Integer -> float. `(double)x` on an unsigned `x` converts the
+            // unsigned value, and the machine's `cvtsi2sd` of a register the IR
+            // calls signed answers the signed one: the cast goes through the
+            // signed C type of the source width, which is the only spelling that
+            // propagates the sign bit.
+            CastKind::SIToFp => {
+                if !s_ok {
+                    self.refuse(
+                        at,
+                        format!("SIToFp from unsigned {src:?}: needs a signed source type"),
+                    );
+                    return None;
+                }
+                let s = "(int64_t)".to_string();
+                match to {
+                    Ty::Float { w: FWidth::F32 } => format!("(float)(({s})({x}))"),
+                    _ => format!("(double)(({s})({x}))"),
+                }
+            }
+            CastKind::UIToFp => match to {
+                Ty::Float { w: FWidth::F32 } => format!("(float)((uint64_t)({x}))"),
+                _ => format!("(double)((uint64_t)({x}))"),
+            },
+            // `cvttsd2si`/`cvttss2si`. The C cast `(int64_t)d` truncates toward
+            // zero, which matches, BUT it is undefined behaviour once d is NaN
+            // or outside the destination's range, where x86 answers the
+            // destination's sign bit (0x80000000 / 0x8000000000000000). A bare
+            // cast would hand the optimizer an out-of-range float and let it
+            // invent an answer, so the guard is emitted: the comparison is
+            // false for NaN, which is exactly when x86 answers the magic value.
+            // (`!(d < hi)` is written so a NaN fails the range test rather than
+            // passing it, and the code carries no NaN test that -ffast-math
+            // could delete... which is why the comment names the rule.)
+            CastKind::FpToSI => {
+                let dw = bits_of(to);
+                let magic = format!("0x{:x}ULL", 1u64 << (dw - 1));
+                let (lo, hi) = if dw >= 64 {
+                    // 2^63 is not representable as an int64_t literal; -9223372036854775808.0
+                    // is, and the window is [-2^63, 2^63).
+                    (-9_223_372_036_854_775_808f64, 9_223_372_036_854_775_808f64)
+                } else {
+                    let h = 2f64.powi(dw as i32 - 1);
+                    (-h, h)
+                };
+                format!(
+                    "((uint64_t)(!({x} >= {lo:e} && {x} < {hi:e}) ? {magic} : (uint64_t)(int64_t)({x})))"
+                )
+            }
+            CastKind::FpToUI => {
+                let dw = bits_of(to);
+                let magic = format!("0x{:x}ULL", 1u64 << (dw - 1));
+                let hi = if dw >= 64 {
+                    18_446_744_073_709_551_616_f64
+                } else {
+                    2f64.powi(dw as i32)
+                };
+                format!("((uint64_t)(!({x} >= 0.0 && {x} < {hi:e}) ? {magic} : (uint64_t)({x})))")
+            }
+            // `cvtss2sd` / `cvtsd2ss`: a precision change of the VALUE, which is
+            // what a C cast between the float types is. Every f32 is exactly an
+            // f64, so the widening is lossless and the narrowing is the same
+            // round-to-nearest the hardware does.
+            CastKind::FPExt => format!("(double)({x})"),
+            CastKind::FPTrunc => format!("(float)({x})"),
+            // No `_` arm: every CastKind is spelled above, and the day a kind is
+            // added the compiler says so here. A `_ => refuse(...)` arm that can
+            // never fire is a refusal that reads like a guard.
         };
         let _ = d_ok;
         Some(s)
@@ -377,7 +455,20 @@ impl<'a> Emitter<'a> {
                 c_ty(&ty).unwrap_or("uint64_t".into()),
                 c & mask_of(bits_of(&ty))
             )),
-            Op::ConstF(c) => Some(format!("{c:?}")),
+            Op::ConstF(c) => Some(if c.is_nan() {
+                // Rust prints a NaN as `NaN`, which is not C. `__builtin_nan("")`
+                // is the quiet NaN clang folds to a constant, and it names the
+                // intent instead of hiding it behind a magic bit pattern.
+                "__builtin_nan(\"\")".into()
+            } else if c.is_infinite() {
+                if *c > 0.0 {
+                    "__builtin_huge_val()".into()
+                } else {
+                    "(-__builtin_huge_val())".into()
+                }
+            } else {
+                format!("{c:?}")
+            }),
             // `undef` initialises to 0 and says so: the value is genuinely
             // undefined, the C has to be a number, and a comment on the same line
             // is where the difference lives.
@@ -388,6 +479,50 @@ impl<'a> Emitter<'a> {
                 Some(s) => Some(s),
                 None => return Err(self.refusals.clone()),
             },
+            // Float arithmetic. The C type of the RESULT is the operands' float
+            // type, and an F32 op must cast the result back to `float`: C's
+            // usual arithmetic conversions promote float operands to double for
+            // the arithmetic itself, so `(a + b)` at F32 would keep double
+            // precision the machine threw away. The cast is the op's precision,
+            // spelled where the semantics live.
+            Op::FBin(o, a, b) => {
+                let (x, y) = (self.use_(*a), self.use_(*b));
+                let f32 = matches!(self.ty_of(*a), Ty::Float { w: FWidth::F32 });
+                let at32 = |s: String| if f32 { format!("(float)({s})") } else { s };
+                Some(at32(match o {
+                    FBinOp::Add => format!("({x} + {y})"),
+                    FBinOp::Sub => format!("({x} - {y})"),
+                    FBinOp::Mul => format!("({x} * {y})"),
+                    FBinOp::Div => format!("({x} / {y})"),
+                    // x86's `maxsd` answers the SECOND operand when either side
+                    // is NaN. C's ternary picks the false arm on a NaN
+                    // comparison, which is the same answer -- the plain ternary
+                    // IS x86's rule, and the claim is worth writing down because
+                    // `fmax` (which ignores NaN) is NOT.
+                    FBinOp::Max => format!("({x} > {y} ? {x} : {y})"),
+                    FBinOp::Min => format!("({x} < {y} ? {x} : {y})"),
+                    // The F32 form calls `sqrtf`, not `sqrt` on a promoted
+                    // double: the latter is double rounding, and FMA contraction
+                    // in a long expression is why this is not pedantry.
+                    FBinOp::Sqrt => {
+                        if f32 {
+                            format!("__builtin_sqrtf({x})")
+                        } else {
+                            format!("__builtin_sqrt({x})")
+                        }
+                    }
+                }))
+            }
+            // Float comparison. The predicate is C's own: an ordered comparison
+            // is false and `!=` is true when either side is NaN, which is the
+            // same answer the machine gives a `je`/`jne`/`ja`/`jb` reading of
+            // `ucomisd`. The flag spellings that need the third bit (the
+            // unordered case: `jp`/`jnp`, and `jae`/`jbe` pairs) are refused by
+            // the lifter, so there is no unordered case left to spell here.
+            Op::FCmp(c, a, b) => {
+                let (x, y) = (self.use_(*a), self.use_(*b));
+                Some(format!("({x} {} {y}) ? 1 : 0", c.c_op()))
+            }
             Op::Un(o, a) => {
                 let x = self.use_(*a);
                 let w = bits_of(&ty);
@@ -450,12 +585,29 @@ impl<'a> Emitter<'a> {
                     self.refuse(at, format!("load of {t:?} has no C spelling here"));
                     return Err(self.refusals.clone());
                 }
-                Some(format!("load_{n}(RDEC_ADDR({x}))"))
+                let raw = format!("load_{n}(RDEC_ADDR({x}))");
+                Some(match t {
+                    // A float load reads a BIT PATTERN out of memory, so the C
+                    // must reinterpret (`rdec_bits_f64`), never convert:
+                    // `(double)load_8(a)` converts an integer and answers a
+                    // different number. This is the `movsd xmm, m64` case.
+                    Ty::Float { w: FWidth::F32 } => format!("rdec_bits_f32({raw})"),
+                    Ty::Float { w: FWidth::F64 } => format!("rdec_bits_f64({raw})"),
+                    _ => raw,
+                })
             }
             Op::Store(t, a, val) => {
                 let (x, y) = (self.use_(*a), self.use_(*val));
                 let n = (bits_of(t) / 8).max(1);
-                let _ = writeln!(self.body, "    store_{n}(RDEC_ADDR({x}), (uint64_t){y});");
+                // The mirror case: `movsd m64, xmm` stores the double's bits. A
+                // `(uint64_t)d` cast TRUNCATES the value to an integer, which is
+                // a conversion, and the guard against that is the helper.
+                let bits = match t {
+                    Ty::Float { w: FWidth::F32 } => format!("rdec_f32_bits({y})"),
+                    Ty::Float { w: FWidth::F64 } => format!("rdec_f64_bits({y})"),
+                    _ => format!("(uint64_t){y}"),
+                };
+                let _ = writeln!(self.body, "    store_{n}(RDEC_ADDR({x}), {bits});");
                 None
             }
             Op::Select(c, t, f) => {
@@ -641,6 +793,16 @@ static inline __attribute__((unused)) void store_1(uint64_t a,uint64_t v){uint8_
 static inline __attribute__((unused)) void store_2(uint64_t a,uint64_t v){uint16_t b=(uint16_t)v;memcpy(&rdec_mem[a],&b,2);}
 static inline __attribute__((unused)) void store_4(uint64_t a,uint64_t v){uint32_t b=(uint32_t)v;memcpy(&rdec_mem[a],&b,4);}
 static inline __attribute__((unused)) void store_8(uint64_t a,uint64_t v){memcpy(&rdec_mem[a],&v,8);}
+
+/* Float <-> bit pattern, by memcpy, never by a C cast: `(double)bits` converts
+a number and `(uint64_t)d` truncates a value, and the decompiler's job at a
+`movsd`/`cvtsd2si` is to move BITS, not to convert a value. A union type-pun
+would be the other option; memcpy is the spelling C guarantees (6.7.2 p6) and
+it is what the load_ and store_ helpers above already do. */
+static inline __attribute__((unused)) double rdec_bits_f64(uint64_t b){double d=0.0;memcpy(&d,&b,8);return d;}
+static inline __attribute__((unused)) float rdec_bits_f32(uint64_t b){uint32_t u=(uint32_t)b;float f=0.0f;memcpy(&f,&u,4);return f;}
+static inline __attribute__((unused)) uint64_t rdec_f64_bits(double d){uint64_t b=0;memcpy(&b,&d,8);return b;}
+static inline __attribute__((unused)) uint64_t rdec_f32_bits(float f){uint32_t u=0;memcpy(&u,&f,4);return u;}
 ";
 
 #[cfg(test)]
