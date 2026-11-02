@@ -756,8 +756,12 @@ impl<'a> Lifter<'a> {
             let sw = src.clone().and_then(|t| t.width()).unwrap_or(w);
             let st = Ty::int(sw, rdec_core::ty::Sx::Signed);
             if src != Some(st.clone()) {
-                self.f
-                    .emit(self.cur, Op::Cast(CastKind::Bitcast, st.clone(), v), st, self.addr())
+                self.f.emit(
+                    self.cur,
+                    Op::Cast(CastKind::Bitcast, st.clone(), v),
+                    st,
+                    self.addr(),
+                )
             } else {
                 v
             }
