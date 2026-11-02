@@ -335,3 +335,296 @@ pub fn cmd_objdump_check(args: &[String]) -> Result<i32, String> {
         Some(_) => Ok(1),
     }
 }
+
+/// `rdec discover <obj> [more...] [--corpus] [--limit N]`
+///
+/// M1 step 2's gate. Ground truth is the object's own symbol table: every
+/// function symbol must be recovered by descent alone, from entry points and
+/// call relocations. Extra starts (branch targets promoted by a call, local
+/// labels called through a pointer) are reported, not punished; *missing*
+/// starts are the failure mode, because a function we never reach is a function
+/// we cannot decompile.
+pub fn cmd_discover(args: &[String]) -> Result<i32, String> {
+    use rdec_arch_x86::discover::{discover_all, overlap_free, Code, Gap};
+    use std::collections::HashMap;
+
+    const TAKES_VALUE: [&str; 2] = ["--limit", "--syntax"];
+    let mut files: Vec<String> = Vec::new();
+    let mut skip_value = false;
+    for a in args.iter().skip(1) {
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+        if TAKES_VALUE.contains(&a.as_str()) {
+            skip_value = true;
+            continue;
+        }
+        if !a.starts_with("--") {
+            files.push(a.clone());
+        }
+    }
+    if args.iter().any(|a| a == "--corpus") {
+        let man = std::fs::read_to_string("corpus/manifest.tsv")
+            .map_err(|e| format!("corpus/manifest.tsv: {e}"))?;
+        for line in man.lines() {
+            if line.starts_with('#') || line.starts_with("name\t") {
+                continue;
+            }
+            if let Some(obj) = line.split('\t').nth(2) {
+                files.push(obj.to_string());
+            }
+        }
+    }
+    if files.is_empty() {
+        return Err(
+            "usage: rdec discover <object.obj> [more.obj ...] [--corpus] [--limit N]".to_string(),
+        );
+    }
+    let limit = args
+        .iter()
+        .position(|a| a == "--limit")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(usize::MAX);
+
+    let mut objects = 0usize;
+    let mut truth_total = 0usize;
+    let mut missing_total = 0usize;
+    let mut extra_total = 0usize;
+    let mut code_bytes = 0u64;
+    let mut covered = 0u64;
+    let mut gaps = HashMap::<&'static str, usize>::new();
+    let mut overlap_problems = 0usize;
+    let mut padding_total = 0u64;
+    let mut other_uncovered_total = 0u64;
+    let mut other_runs_total = 0usize;
+    let mut first_missing: Option<String> = None;
+    let mut budget = limit;
+
+    for file in &files {
+        let obj = loader::load(Path::new(file))?;
+        // Each code section gets its own address range. Basing every section
+        // at 0 - the first version - makes two sections' offset 0x10 look like
+        // the same byte, and the overlap check reports 30 objects "disagreeing
+        // about a boundary" that never shared a byte.
+        let mut ranges: Vec<Code> = Vec::new();
+        let mut idx_of = HashMap::new();
+        let mut base_of: Vec<u64> = Vec::new();
+        let mut next_base = 0u64;
+        for (i, sec) in obj.sections.iter().enumerate() {
+            if obj.is_code(i) && !sec.bytes.is_empty() {
+                idx_of.insert(i, ranges.len());
+                base_of.push(next_base);
+                ranges.push(Code {
+                    base: next_base,
+                    bytes: sec.bytes.as_slice(),
+                });
+                next_base += sec.bytes.len() as u64 + 16;
+            }
+        }
+        if ranges.is_empty() {
+            continue;
+        }
+        let mut seeds: HashMap<usize, (Vec<u64>, Vec<u64>)> = HashMap::new();
+        let mut truth: Vec<u64> = Vec::new();
+        for i in obj.code_symbols() {
+            let s = &obj.symbols[i];
+            let sec = s.section.unwrap();
+            if !obj.is_code(sec) || s.name.starts_with('.') || s.size == 0 {
+                continue;
+            }
+            let Some(&r) = idx_of.get(&sec) else { continue };
+            if budget == 0 {
+                break;
+            }
+            truth.push(base_of[r] + s.offset);
+            seeds.entry(r).or_default().0.push(base_of[r] + s.offset);
+        }
+        budget = budget.saturating_sub(truth.len().max(1));
+        // Call relocations naming a symbol defined in this object are function
+        // boundaries visible without symbols - the stripped-binary case.
+        for (sec, rels) in obj.sections.iter().enumerate() {
+            let Some(&r) = idx_of.get(&sec) else { continue };
+            for rl in &rels.relocations {
+                if !matches!(rl.typ, 2 | 4 | 5 | 6 | 7) {
+                    continue;
+                }
+                if let Some(t) = obj.symbols.get(rl.symbol) {
+                    if t.section == Some(sec) && !t.name.starts_with('.') {
+                        seeds.entry(r).or_default().1.push(base_of[r] + t.offset);
+                    }
+                }
+            }
+        }
+        let plan = discover_all(&ranges, &seeds);
+        let truth_n = truth.len();
+        let missing: Vec<u64> = truth
+            .iter()
+            .copied()
+            .filter(|a| !plan.functions.contains(a))
+            .collect();
+        let extra: Vec<u64> = plan
+            .functions
+            .iter()
+            .copied()
+            .filter(|a| !truth.contains(a))
+            .collect();
+        let cb: u64 = ranges.iter().map(|r| r.bytes.len() as u64).sum();
+        if !overlap_free(&plan.insns) {
+            overlap_problems += 1;
+            let cov: u64 = plan.insns.iter().map(|(_, l)| *l as u64).sum();
+            eprintln!(
+                "OVERLAP {}: covered {cov} bytes of {cb} code, {} insns, {} blocks",
+                file,
+                plan.insns.len(),
+                plan.blocks.len()
+            );
+        }
+        // Split the uncovered bytes: alignment padding is a run of 0xCC (int3)
+        // and is not a coverage failure, while any other uncovered byte is
+        // code we did not reach. Counting them together lets the coverage
+        // number be inflated by padding.
+        let mut padding = 0u64;
+        let mut other_uncovered = 0u64;
+        let mut other_runs = 0usize;
+        for r in &ranges {
+            let mut hit = vec![false; r.bytes.len()];
+            for &(a, l) in &plan.insns {
+                if a >= r.base && ((a - r.base) as usize) < hit.len() {
+                    let start = (a - r.base) as usize;
+                    for k in start..(start + l).min(hit.len()) {
+                        hit[k] = true;
+                    }
+                }
+            }
+            let mut i = 0usize;
+            while i < hit.len() {
+                if hit[i] {
+                    i += 1;
+                    continue;
+                }
+                let j = hit[i..]
+                    .iter()
+                    .position(|&h| h)
+                    .map(|p| i + p)
+                    .unwrap_or(hit.len());
+                let run = &r.bytes[i..j];
+                // int3 padding is 0xCC and can be any length; 0x00 fills are
+                // only padding when they are long enough that they cannot be
+                // an instruction stream.
+                // Padding is a *semantic* claim, so ask the decoder: LLVM
+                // aligns with multi-byte NOPs (`0f 1f 84 00 ...`, `66 66 2e 0f
+                // 1f ...`), which no byte-pattern rule names. A run whose
+                // instructions are all nops is padding; int3 (0xCC) and long
+                // 0x00 fills are padding too.
+                let all_cc = run.iter().all(|&b| b == 0xCC);
+                let all_00 = run.iter().all(|&b| b == 0x00);
+                let all_nop = {
+                    let ins = decode(run, 0, Syntax::Intel);
+                    !ins.is_empty()
+                        && ins.iter().all(|i| {
+                            i.valid()
+                                && i.text
+                                    .as_deref()
+                                    .map(|t| t.starts_with("nop"))
+                                    .unwrap_or(false)
+                        })
+                };
+                if all_cc || all_nop || (all_00 && run.len() >= 4) {
+                    padding += run.len() as u64;
+                } else {
+                    other_uncovered += run.len() as u64;
+                    other_runs += 1;
+                    if other_runs_total + other_runs <= 12 {
+                        let hex: String = run.iter().take(16).map(|b| format!("{b:02x}")).collect();
+                        println!(
+                            "  uncovered {} bytes at {:#x} in {}: {}",
+                            run.len(),
+                            r.base + i as u64,
+                            obj.sections
+                                .iter()
+                                .find(|s| s.bytes.as_slice() == r.bytes)
+                                .map(|s| s.name.as_str())
+                                .unwrap_or("?"),
+                            hex
+                        );
+                    }
+                }
+                i = j;
+            }
+        }
+        padding_total += padding;
+        other_uncovered_total += other_uncovered;
+        other_runs_total += other_runs;
+        objects += 1;
+        truth_total += truth_n;
+        missing_total += missing.len();
+        extra_total += extra.len();
+        code_bytes += cb;
+        covered += plan.covered_bytes();
+        for g in &plan.gaps {
+            let name = match g.gap {
+                Gap::IndirectBranch => "indirect branch",
+                Gap::IndirectCall => "indirect call",
+                Gap::Undecodable => "undecodable",
+                Gap::OutsideCode => "outside code",
+            };
+            *gaps.entry(name).or_default() += 1;
+        }
+        if !missing.is_empty() && first_missing.is_none() {
+            first_missing = Some(format!("{}: missing starts {:?}", file, missing));
+        }
+    }
+
+    let code_no_pad = code_bytes.saturating_sub(padding_total);
+    let pct = if code_no_pad > 0 {
+        100.0 * covered as f64 / code_no_pad as f64
+    } else {
+        0.0
+    };
+    println!(
+        "discover: {objects} objects, {truth_total} symbol-table functions, {missing_total} missing, {extra_total} extra starts"
+    );
+    println!(
+        "code bytes: {code_bytes}, padding (int3, nop sequences, long 0x00 fills): {padding_total}"
+    );
+    println!(
+        "coverage: {covered}/{code_no_pad} non-padding code bytes = {pct:.2}%; uncovered non-padding = {other_uncovered_total} bytes in {other_runs_total} runs"
+    );
+    let mut gs: Vec<_> = gaps.into_iter().collect();
+    gs.sort();
+    println!(
+        "gaps: {}",
+        if gs.is_empty() {
+            "none".to_string()
+        } else {
+            gs.iter()
+                .map(|(k, v)| format!("{k} {v}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    );
+    if overlap_problems > 0 {
+        eprintln!("FAIL: {overlap_problems} objects with overlapping instruction ranges - two sweeps disagreed about a boundary");
+        return Ok(1);
+    }
+    if truth_total == 0 {
+        return Err("no functions found - discovery checked nothing".to_string());
+    }
+    if let Some(m) = first_missing {
+        eprintln!("FAIL {m}");
+        return Ok(1);
+    }
+    // M1's gate is 99.5% coverage of non-padding code, over everything the
+    // descent can reach. Indirect sites are M5's problem; the number here is
+    // the honest denominator, so the gap is visible rather than smoothed away.
+    if pct < 99.5 {
+        eprintln!(
+            "FAIL: coverage {pct:.2}% is below the 99.5% M1 gate ({other_uncovered_total} uncovered non-padding bytes in {other_runs_total} runs)"
+        );
+        return Ok(1);
+    }
+    println!("OK: every symbol-table function is reachable, coverage above the 99.5% gate");
+    Ok(0)
+}

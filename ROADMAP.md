@@ -726,6 +726,40 @@ indirect-jump classification (jump-table recovery), the coverage measurement
 itself, and the disassembly-literal test vectors. M1's gate stays open until
 coverage ≥ 99.5% is measured on the corpus.
 
+### Measured: M1 step 2 (recursive descent), 2026-11-02 — **gate RED, by design**
+
+`rdec discover --corpus` over all 120 objects:
+
+```
+discover: 120 objects, 124 symbol-table functions, 0 missing, 17 extra starts
+code bytes: 5992, padding (int3, nop sequences, long 0x00 fills): 36
+coverage: 5830/5956 non-padding code bytes = 97.88%; uncovered non-padding = 126 bytes in 2 runs
+gaps: indirect branch 2
+FAIL: coverage 97.88% is below the 99.5% M1 gate
+```
+
+| claim | measurement |
+|---|---|
+| Function discovery | **124 of 124** symbol-table functions recovered by descent from entry points + `REL32` call relocations. 0 missing. 17 *extra* starts (call targets with no symbol — local functions and thunks), reported, not punished. |
+| Coverage | 97.88% of non-padding code. The 126-byte shortfall is **2 runs of real code behind the 2 recorded indirect jumps** — switch arms reached only through a jump table. M1's gate requires "no unclassified indirect jump remains", so M1 stays open and the gate fails on purpose; jump-table recovery is M5. The threshold was not moved to fit the measurement. |
+| Padding | Defined **semantically**, not by byte pattern: a run the decoder renders entirely as `nop` is padding (LLVM aligns with `0f 1f 84 00 …`, `66 66 2e 0f 1f …`), as are int3 runs and long 0x00 fills. 36 bytes. Counting NOP padding as coverage failure understates; counting it as covered overstates — it is now neither. |
+| Overlap invariant | Bytes are claimed once, globally (`Decoded`); a sweep that reaches an already-claimed address stops there, which makes overlap structurally impossible. Found because coverage read **114.30%**: a sweep ran past a branch target that a later sweep decoded again. `overlap_free` is checked per object and a violation fails the gate. |
+| Ground truth | The object's own symbol table (present even at `-g0`), so the claim is measured, not asserted. |
+
+Bugs found by building this, each pinned by a test:
+- iced 1.22 models a near branch as `OpKind::NearBranch32`, **not** an immediate;
+  `immediate(0)` on it panics ("Invalid operand: 0"). The first version returned
+  no targets, so discovery silently lost every call and jump edge and the corpus
+  looked fine at 124/124 (every function was a symbol seed).
+- A block's fallthrough is a property of how the block **ends**. Recording it at
+  a `call` while the sweep continued enqueued the block's own tail as a new
+  block, swept it twice, and failed `overlap_free` in a unit test.
+- Basing every code section at 0 makes two sections' offset 0x10 look like the
+  same byte.
+- A probe that loads manifest-relative paths from a crate directory loads
+  nothing: `let Ok(obj) = load(path) else { continue }` reported "no overlap
+  found" over an empty loop. Same lesson as the CI hygiene test, paid for twice.
+
 ## 10. Changes from v1
 
 | Change | Reason |

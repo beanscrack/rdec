@@ -5,5 +5,6 @@
 //! translation to RDec IR) land in M1/M2.
 
 pub mod decode;
+pub mod discover;
 pub mod flags;
 pub mod loader;

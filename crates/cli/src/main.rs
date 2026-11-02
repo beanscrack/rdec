@@ -19,6 +19,13 @@ fn main() {
         "selftest" => cmd_selftest(),
         "corpus" => cmd_corpus(&args[1..]),
         "disasm" => m1::cmd_disasm(&args),
+        "discover" => match m1::cmd_discover(&args) {
+            Ok(rc) => rc,
+            Err(e) => {
+                eprintln!("{e}");
+                1
+            }
+        },
         "objdump-check" => match m1::cmd_objdump_check(&args) {
             Ok(rc) => rc,
             Err(e) => {

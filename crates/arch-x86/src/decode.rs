@@ -20,6 +20,12 @@ pub struct Insn {
     pub text: Option<String>,
     pub code: u16,
     pub is_branch: bool,
+    /// `jmp` — transfers control and has no fallthrough.
+    pub is_jmp: bool,
+    /// `jcc` — transfers control conditionally, so it has a fallthrough.
+    pub is_jcc: bool,
+    /// An indirect branch/call: the target set is not in the bytes.
+    pub is_indirect: bool,
     pub is_call: bool,
     pub is_ret: bool,
     /// A direct branch/call target, when the operand is an immediate.
@@ -68,6 +74,9 @@ pub fn decode(bytes: &[u8], va: u64, syntax: Syntax) -> Vec<Insn> {
                 text: None,
                 code: 0,
                 is_branch: false,
+                is_jmp: false,
+                is_jcc: false,
+                is_indirect: false,
                 is_call: false,
                 is_ret: false,
                 target: None,
@@ -83,6 +92,18 @@ pub fn decode(bytes: &[u8], va: u64, syntax: Syntax) -> Vec<Insn> {
             text: Some(text),
             code: instr.code() as u16,
             is_branch: flow.0,
+            is_jmp: matches!(
+                instr.flow_control(),
+                iced_x86::FlowControl::UnconditionalBranch
+            ),
+            is_jcc: matches!(
+                instr.flow_control(),
+                iced_x86::FlowControl::ConditionalBranch
+            ),
+            is_indirect: matches!(
+                instr.flow_control(),
+                iced_x86::FlowControl::IndirectBranch | iced_x86::FlowControl::IndirectCall
+            ),
             is_call: flow.1,
             is_ret: flow.2,
             target: direct_target(&instr),
@@ -105,18 +126,22 @@ fn flow_kind(i: &Instruction) -> (bool, bool, bool) {
 
 fn direct_target(i: &Instruction) -> Option<u64> {
     use iced_x86::{FlowControl, OpKind};
-    match i.flow_control() {
-        FlowControl::UnconditionalBranch | FlowControl::ConditionalBranch | FlowControl::Call => {
-            match i.op0_kind() {
-                OpKind::Immediate8
-                | OpKind::Immediate8_2nd
-                | OpKind::Immediate16
-                | OpKind::Immediate32 => {
-                    // The target is relative to the *next* instruction.
-                    Some((i.next_ip() as i64 + i.immediate(0) as i32 as i64) as u64)
-                }
-                _ => None,
-            }
+    if !matches!(
+        i.flow_control(),
+        FlowControl::UnconditionalBranch | FlowControl::ConditionalBranch | FlowControl::Call
+    ) {
+        return None;
+    }
+    match i.op0_kind() {
+        // A near branch target is its own operand kind in iced, NOT an
+        // immediate: `immediate(0)` on it panics ("Invalid operand: 0"), which
+        // is how the first version of this function silently returned no
+        // targets and discovery lost every call edge.
+        OpKind::NearBranch16 => Some(i.near_branch16() as u64),
+        OpKind::NearBranch32 => Some(i.near_branch32() as u64),
+        OpKind::NearBranch64 => Some(i.near_branch64()),
+        OpKind::Immediate8 | OpKind::Immediate8_2nd | OpKind::Immediate16 | OpKind::Immediate32 => {
+            Some((i.next_ip() as i64 + i.immediate(0) as i32 as i64) as u64)
         }
         _ => None,
     }
