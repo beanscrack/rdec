@@ -575,7 +575,9 @@ pub const CPP_CDTOR_FLOOR: usize = 2;
 
 /// The census bucket for a demangled kind. The member-function split is the
 /// point: plain, virtual and thunk are three different amounts of work.
-fn label(k: &SymKind) -> &'static str {
+/// `pub(crate)` because `rdec t2 --cpp` names its exclusions with the same
+/// buckets: two naming schemes would make the two gates' lines incomparable.
+pub(crate) fn label(k: &SymKind) -> &'static str {
     match k {
         SymKind::FreeFunction => "FreeFunction",
         SymKind::StaticMember { .. } => "StaticMember",
@@ -875,35 +877,29 @@ fn byval_struct(d: Option<&Demangled>) -> bool {
     })
 }
 
-pub fn cmd_cpp(args: &[String]) -> Result<i32, String> {
-    if !args[1..].iter().any(|a| a == "--corpus") {
-        return Err(
-            "usage: rdec cpp --corpus [--emit DIR]   (M8: the C++ corpus through the C pipeline)"
-                .to_string(),
-        );
-    }
-    let out_dir = args
-        .iter()
-        .position(|a| a == "--emit")
-        .and_then(|i| args.get(i + 1))
-        .cloned()
-        .unwrap_or_else(|| "corpus/cpp/gen".to_string());
-    let man = std::fs::read_to_string("corpus/cpp/manifest.tsv")
-        .map_err(|e| format!("corpus/cpp/manifest.tsv: {e} (run `rdec corpus --cpp` first)"))?;
-    let mut files: Vec<String> = Vec::new();
-    for line in man.lines() {
-        if line.starts_with('#') || line.starts_with("name\t") {
-            continue;
-        }
-        if let Some(obj) = line.split('\t').nth(2) {
-            files.push(obj.to_string());
-        }
-    }
-    if files.is_empty() {
-        return Err("corpus/cpp/manifest.tsv lists no objects".to_string());
-    }
-    ensure_dir(Path::new(&out_dir))?;
+/// The C++ census, the demangled names, and the lifted subjects, in one
+/// value: `rdec cpp --corpus` and `rdec t2 --cpp` run THIS, so the emission
+/// gate and the value gate measure the same subjects under the same names.
+/// A second copy of discovery + naming in the value gate would be measuring
+/// its own copy, the exact thing `lift_all_named` exists to prevent.
+pub struct CppPipeline {
+    pub census: BTreeMap<&'static str, usize>,
+    pub unsupported: BTreeMap<String, usize>,
+    /// (object, raw COFF symbol) in manifest order, one entry per object.
+    pub symbols: Vec<(String, String)>,
+    pub dem_of: BTreeMap<String, Demangled>,
+    /// raw symbol -> the C identifier the emitted C is defined under.
+    pub c_name_of: BTreeMap<String, String>,
+    pub unique_names: usize,
+    pub named_from_decoration: usize,
+    pub collisions: Vec<(String, String, String)>,
+    pub data_tables: usize,
+    pub eh_sections: usize,
+    pub eh_symbols: usize,
+    pub subjects: Vec<crate::m4::Subject>,
+}
 
+pub fn cpp_pipeline(files: &[String]) -> Result<CppPipeline, String> {
     // ---- 1. the census: what C++ codegen is the decompiler facing? ---------
     let mut census: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut unsupported: BTreeMap<String, usize> = BTreeMap::new();
@@ -912,7 +908,7 @@ pub fn cmd_cpp(args: &[String]) -> Result<i32, String> {
     let mut data_tables = 0usize;
     let mut eh_sections = 0usize;
     let mut eh_symbols = 0usize;
-    for file in &files {
+    for file in files {
         let obj = rdec_arch_x86::loader::load(Path::new(file))?;
         if !obj.amd64() {
             return Err(format!(
@@ -959,7 +955,6 @@ pub fn cmd_cpp(args: &[String]) -> Result<i32, String> {
             symbols.push((file.clone(), sym));
         }
     }
-    let compared = symbols.len();
 
     // ---- 2. names: the demangled text is what a human is shown --------------
     // One TU holds every emitted function, so a name has to be unique across
@@ -997,12 +992,82 @@ pub fn cmd_cpp(args: &[String]) -> Result<i32, String> {
     }
 
     // ---- 3. the existing pipeline, with the demangled names ----------------
-    let subjects = crate::m4::lift_all_named(&files, &|oi: usize, raw: &str| {
+    let subjects = crate::m4::lift_all_named(files, &|oi: usize, raw: &str| {
         c_name_of
             .get(raw)
             .cloned()
             .unwrap_or_else(|| format!("o{oi}_{}", crate::m4::c_ident(raw)))
     })?;
+
+    let unique_names = c_name_of.len();
+    Ok(CppPipeline {
+        census,
+        unsupported,
+        symbols,
+        dem_of,
+        c_name_of,
+        unique_names,
+        named_from_decoration,
+        collisions,
+        data_tables,
+        eh_sections,
+        eh_symbols,
+        subjects,
+    })
+}
+
+/// The manifest of `corpus/cpp`, the same document both C++ gates read.
+pub fn cpp_corpus_files() -> Result<Vec<String>, String> {
+    let man = std::fs::read_to_string("corpus/cpp/manifest.tsv")
+        .map_err(|e| format!("corpus/cpp/manifest.tsv: {e} (run `rdec corpus --cpp` first)"))?;
+    let mut files: Vec<String> = Vec::new();
+    for line in man.lines() {
+        if line.starts_with('#') || line.starts_with("name\t") {
+            continue;
+        }
+        if let Some(obj) = line.split('\t').nth(2) {
+            files.push(obj.to_string());
+        }
+    }
+    if files.is_empty() {
+        return Err("corpus/cpp/manifest.tsv lists no objects".to_string());
+    }
+    Ok(files)
+}
+
+pub fn cmd_cpp(args: &[String]) -> Result<i32, String> {
+    if !args[1..].iter().any(|a| a == "--corpus") {
+        return Err(
+            "usage: rdec cpp --corpus [--emit DIR]   (M8: the C++ corpus through the C pipeline)"
+                .to_string(),
+        );
+    }
+    let out_dir = args
+        .iter()
+        .position(|a| a == "--emit")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| "corpus/cpp/gen".to_string());
+    let files = cpp_corpus_files()?;
+    ensure_dir(Path::new(&out_dir))?;
+
+    let p = cpp_pipeline(&files)?;
+    let compared = p.symbols.len();
+    let census = p.census;
+    let unsupported = p.unsupported;
+    let symbols = p.symbols;
+    let dem_of = p.dem_of;
+    let c_name_of = p.c_name_of;
+    let named_from_decoration = p.named_from_decoration;
+    let collisions = p.collisions;
+    let data_tables = p.data_tables;
+    let eh_sections = p.eh_sections;
+    let eh_symbols = p.eh_symbols;
+    let subjects = p.subjects;
+    let unique_names = p.unique_names;
+    // The name round-trip line counts distinct C names.
+    let mut names: Vec<&String> = c_name_of.values().collect();
+    names.sort();
 
     let mut lifted = 0usize;
     let mut pass_broken = 0usize;
@@ -1400,13 +1465,12 @@ pub fn cmd_cpp(args: &[String]) -> Result<i32, String> {
         "EH is measured, not assumed: .xdata/.pdata sections and the runtime symbols a codelet calls come from the objects, and the int3 padding that ends a codelet boundary shows up as an unmodelled instruction - a function that reaches one is refused with that instruction named, never skipped"
     );
     println!(
-        "name round-trip: {} names for {compared} symbols - {} built from demangled text, {} from the sanitized decoration (the demangler's gaps, named out loud); {} legal C identifiers under `rdec c`'s own c_ident; {} collisions disambiguated",
-        taken.len(),
-        taken.len() - named_from_decoration,
+        "name round-trip: {unique_names} names for {compared} symbols - {} built from demangled text, {} from the sanitized decoration (the demangler's gaps, named out loud); {} legal C identifiers under `rdec c`'s own c_ident; {} collisions disambiguated",
+        unique_names - named_from_decoration,
         named_from_decoration,
-        taken
-            .keys()
-            .filter(|n| crate::m4::c_ident(n) == **n)
+        names
+            .iter()
+            .filter(|n| crate::m4::c_ident(n) == ***n)
             .count(),
         collisions.len()
     );
@@ -1457,9 +1521,9 @@ pub fn cmd_cpp(args: &[String]) -> Result<i32, String> {
             first_pass_break.unwrap_or_default()
         ));
     }
-    let bad_names: Vec<&String> = taken
-        .keys()
-        .filter(|n| crate::m4::c_ident(n) != **n)
+    let bad_names: Vec<&&String> = names
+        .iter()
+        .filter(|n| crate::m4::c_ident(n) != ***n)
         .collect();
     if !bad_names.is_empty() {
         fails.push(format!(
@@ -1468,12 +1532,7 @@ pub fn cmd_cpp(args: &[String]) -> Result<i32, String> {
             &bad_names[..bad_names.len().min(5)]
         ));
     }
-    if let Some(dup) = taken
-        .keys()
-        .collect::<Vec<_>>()
-        .windows(2)
-        .find(|w| w[0] == w[1])
-    {
+    if let Some(dup) = names.windows(2).find(|w| w[0] == w[1]) {
         fails.push(format!("duplicate C name in one TU: {}", dup[0]));
     }
     for (what, got, floor) in [

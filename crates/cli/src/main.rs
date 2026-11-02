@@ -49,13 +49,20 @@ fn main() {
                 2
             }
         },
-        "t2" => match t2::cmd_t2(&args) {
-            Ok(code) => code,
-            Err(e) => {
-                eprintln!("t2: {e}");
-                2
+        "t2" => {
+            let r = if args.iter().any(|a| a == "--cpp") {
+                t2::cmd_t2_cpp(&args)
+            } else {
+                t2::cmd_t2(&args)
+            };
+            match r {
+                Ok(code) => code,
+                Err(e) => {
+                    eprintln!("t2: {e}");
+                    2
+                }
             }
-        },
+        }
         "lift" => match m1::cmd_lift(&args) {
             Ok(code) => code,
             Err(e) => {
@@ -108,6 +115,10 @@ fn print_help() {
          \x20                                   refusals and gaps by class\n\
          \x20 t2 [--corpus] [--limit N]        T2 differential gate: decompiled C vs\n\
          \x20                                   the machine code, same inputs, RAX\n\
+         \x20 t2 --cpp [--limit N]             T2 over the C++ corpus: RAX class\n\
+         \x20                                   (free/static integer functions),\n\
+         \x20                                   window class (member functions,\n\
+         \x20                                   `this` over a preloaded window)\n\
          \x20 status                          roadmap section 9's table, from commands\n\
          \n\
          coming next (M1): disasm <obj> [symbol]"
@@ -581,6 +592,44 @@ fn cmd_status() -> i32 {
         "t2 differential (C vs machine code, same inputs, RAX); gate: rdec t2".into(),
         t2_verdict,
         // Informational row: enforced by `rdec t2 --corpus`, which exits 1.
+        true,
+    ));
+    // T2 over C++: the decompiled C++ is VALUE-verified, not just compiled.
+    // Same rule as every gate row: the gate owns its exit code (`rdec t2
+    // --cpp` exits 1 on a mismatch or on zero comparisons); the scoreboard
+    // reports the verdict line and does not put a second owner on the gate.
+    let t2c_cmd: Vec<String> = if self_cmd[0] == "run" {
+        vec![
+            "run".into(),
+            "-q".into(),
+            "-p".into(),
+            "rdec-cli".into(),
+            "--".into(),
+            "t2".into(),
+            "--cpp".into(),
+        ]
+    } else {
+        vec!["t2".into(), "--cpp".into()]
+    };
+    let t2c = sh(&exe, &t2c_cmd);
+    let t2c_line = t2c
+        .1
+        .lines()
+        .find(|l| l.starts_with("compared:"))
+        .unwrap_or("no comparison ran")
+        .trim()
+        .to_string();
+    let t2c_verdict = t2c
+        .1
+        .lines()
+        .find(|l| l.starts_with("FAIL"))
+        .map(|l| format!("{t2c_line} | {l}"))
+        .unwrap_or_else(|| format!("{t2c_line} | gate green"));
+    rows.push((
+        "t2 --cpp (C++ machine code -> C, values on RAX + `this` windows); gate: rdec t2 --cpp"
+            .into(),
+        t2c_verdict,
+        // Informational row: enforced by `rdec t2 --cpp`, which exits 1.
         true,
     ));
     let local = rdec_verify::corpus::clang_stamp(&rdec_verify::corpus::clang_path()).0;
