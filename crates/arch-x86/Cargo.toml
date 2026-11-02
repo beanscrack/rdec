@@ -1,0 +1,10 @@
+[package]
+name = "rdec-arch-x86"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "x86-64 front end: decoding glue, EFLAGS semantics, lifting to RDec IR."
+
+[dependencies]
+rdec-core = { workspace = true }
+iced-x86 = { workspace = true }

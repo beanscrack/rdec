@@ -1,0 +1,10 @@
+[package]
+name = "rdec-verify"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Oracles: T1 hardware flag-table checks (and, later, T2 differential execution)."
+
+[dependencies]
+rdec-core = { workspace = true }
+rdec-arch-x86 = { workspace = true }

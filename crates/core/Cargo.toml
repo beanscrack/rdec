@@ -1,0 +1,10 @@
+[package]
+name = "rdec-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Target-agnostic decompiler core: IR, CFG, SSA, optimization passes, control-flow structuring, C emission."
+
+[dependencies]
+
+[dev-dependencies]
