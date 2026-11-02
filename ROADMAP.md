@@ -1327,3 +1327,38 @@ relocations is the only route, which is why vtable dispatch stays last.
    `cvttsd2si` guarded to the x86 magic constant because out-of-range is UB in C).
 2. T2 for C++: float/pointer args in the differential - emission is not value-equivalence.
 3. The 57 C refusals (call-clobber, `cdq`, `imul`, `div`, `lea` naming) and the 23 C++ ones.
+
+## Gate ledger — every gate, one line, measured 2026-11-02 (tree `77e363c`)
+
+Written because the roadmap recorded milestones as they were opened and left several of
+their gate verdicts unstated. Each row is the command, the verdict from running it, and
+what closing means. `grep -ric "noreturn\|tail_call\|jump_table" crates/arch-x86/src/
+lift.rs crates/arch-x86/src/discover.rs` returns 0 — that is the evidence for M3's
+"not done" items below, not a memory.
+
+| gate | command | verdict | closing condition |
+|---|---|---|---|
+| M1 step 1 decode/load | `rdec objdump-check --corpus` | **GREEN** — 124/124 boundary agreement | closed |
+| M1 step 2 discovery | `rdec discover --corpus` | **RED, by design** — 124/124 functions, coverage 97.88% vs the 99.5% requirement, 126 bytes in 2 runs, 2 indirect branches unclassified | jump-table recovery resolves those 2 sites; the threshold is not moved |
+| M2 step 1 lifter | `rdec lift --corpus` | **CLOSED — recorded late.** Criterion was "every lifted function is valid IR"; it printed `FAIL: 40 lifted functions are not valid IR` at step 1, and now prints `141 functions lifted, 141 pass verify_ssa`, exit 0. It became true at `aa0d8e7` (M3 step 1) and the roadmap never said so. | closed |
+| M3 step 1 SSA | `rdec lift --corpus` | **GREEN** — 141/141 valid IR; strict interpreter: 0 uses of a value never defined | closed |
+| M3 step 2 block splitting | `rdec lift --corpus` | **GREEN** — loops lift; Exits 64 -> 27, clean functions 63 -> 85 | closed |
+| M3 noreturn / tail calls / jump-table targets | (no gate exists yet) | **NOT DONE** — zero handling in the lifter or discovery; the roadmap moved these into M3 (`ROADMAP.md:363-367`) and they were never built. A `jmp` to a known entry is still a call-shaped exit; `abort`/`__fastfail` are not noreturn, so CFG recovery is wrong at those. | gate first, then the feature: a fixture per item, red, then green |
+| M3 stable IDs | (no gate exists yet) | **NOT DONE** — IR value numbers are per-function and not stable across passes, so cross-pass diffing is not available | needs a stable-id invariant pinned by a test |
+| M4 C emitter | `rdec c --corpus` | **RED, by design** — 84 emitted / **57 refused** / 0 invalid after passes; clang -Werror OK. Top classes: 15 call-clobber, 14 `lea` of an unnameable address, 10 `cdq`, 6 `imul`, 4 unstructured conditional branch, 4 `div` | refusals -> 0 with every gap named in between |
+| T2 differential, C | `rdec t2 --corpus` | **GREEN as a sample** — runnable 64 of 141, compared 1364, match 1364, mismatch 0, 4 faults (genuine `loop_do` infinite loops). **Proves the returned 64-bit value only.** Memory effects are NOT compared; 77 functions are not in the compared set. | add memory-effect comparison; widen coverage |
+| T2 differential, C++ | `rdec t2 --cpp` | **GREEN as a sample** — 27 functions (15 RAX-class + 12 window-class), 648 runs, 648 matches, 0 mismatch, 0 faults, buckets sum to 78. Return value only; the window class compares the return, not memory. | XMM0 class (in progress), more coverage, memory effects |
+| M8 step 0 demangler | `rdec demangle --cpp` | **GREEN** — 68/68 supported symbols agree with `llvm-nm`, 1 template unsupported (named) | closed for the corpus; templates open |
+| M8 step 1-2 C++ through the pipeline | `rdec cpp --corpus` | **RED by design, improving** — lifted 78, valid 78/78, emitted C 62, refused 16; clang -Werror OK | refusals -> 0 |
+| M8 step 3 C++ value-verified | `rdec t2 --cpp` | **GREEN as a sample** (row above) | — |
+| M8 remainder | — | **NOT DONE** — packed SIMD (refused by name: `paddd/paddq/psubd/pmuludq/pcmpeqd/shufps`, mask `andps/orps`, GPR `movd/movq`), vtable dispatch and virtual calls. Measured: this clang build names ZERO vftable symbols in `.obj`, so vtable identity needs `.rdata` + REL32 relocation recovery | relocation reader, then vtable identity, then `call [this+k]` |
+| M5 control-flow structuring | — | **NOT STARTED** — no if/while/switch recovery: output is goto-style with `(void)&&label` anchors. The roadmap's own estimate is 4-5 weeks. It is also what closes M1 (jump tables) | starts with the 2 jump-table sites |
+| M6 readability + type recovery | — | **NOT STARTED** — includes the Ghidra baseline comparison | — |
+| M7 whole binary | — | **NOT STARTED** — library signatures, SEH, cold fragments; ELF support | — |
+| M9 production | — | **NOT STARTED** — fuzzing at scale, performance budgets, the analyst loop | — |
+| P track (proof) | — | **NOT STARTED** — the formal/proof track has no measured section | — |
+
+The honest headline: the decompiler has three closed structural gates (decode, lift,
+SSA), a differential that proves returned values on 64/141 C functions and 27/78 C++
+functions with zero mismatches, and no structuring pass — so what it emits is correct
+where it is correct, and unreadable everywhere.
