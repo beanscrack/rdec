@@ -319,6 +319,64 @@ pub struct Report {
     /// is a machine-code fact (a 32-bit register write zeroes the upper half),
     /// counted so the width modelling can be watched, not assumed.
     pub ret_w32: usize,
+    /// Register self-idioms translated as the machine-code facts they are:
+    /// `xor r,r`/`sub r,r` write 0 at the operation width without reading `r`,
+    /// `and r,r`/`or r,r` write `r`'s own value. Counted because the number is
+    /// what makes `RAX` defined on paths that used to read an undefined
+    /// register, and a reader must be able to ask how many paths moved.
+    pub self_idioms: usize,
+}
+
+/// `op reg, reg` where both operands name the SAME register group. Each variant
+/// is a fact about what the hardware computes, stated where the instruction is
+/// translated - and that location is the whole point.
+///
+/// As an IR value identity (`x ^ x -> 0` in `const_fold`) the same rule is a
+/// lie about meaning: the interpreter is strict, so an `xor(undef, undef)` read
+/// FAULTS when it is reached, and deleting the read turns a faulting execution
+/// into a returning one - which translation validation correctly reports as a
+/// change in meaning. Deleting an unused `getflag` read already bit this project
+/// exactly once for the same reason. The hardware does not read the register at
+/// all here: the operand is an address whose value is never consumed, so the
+/// lifter must not emit a read of it. That is a property of the encoding, and
+/// the encoding is only visible in the lifter.
+enum SelfIdiom {
+    /// `xor r,r`: the result is 0, the register is not read.
+    ZeroXor,
+    /// `sub r,r`: the result is 0 (and no borrow), the register is not read.
+    ZeroSub,
+    /// `and r,r`: the result is the register's own value - a real read.
+    KeepAnd,
+    /// `or r,r`: the result is the register's own value - a real read.
+    KeepOr,
+}
+
+impl SelfIdiom {
+    /// Classify one instruction, or say it is not a self-idiom.
+    ///
+    /// Deliberately absent: `adc`/`sbb` (`sbb r,r` is `-CF`, so 0 only when the
+    /// carry flag is 0 - a value identity that is not true, and the general
+    /// path's `adc/sbb: carry chain not modelled` gap stays as the loud answer),
+    /// `add r,r` (the result is `2*r`, not a constant), and `cmp`/`test`, which
+    /// write no destination at all.
+    fn of(m: Mnemonic, ins: &Instruction) -> Option<SelfIdiom> {
+        if ins.op_count() != 2
+            || ins.op_kind(0) != OpKind::Register
+            || ins.op_kind(1) != OpKind::Register
+        {
+            return None;
+        }
+        if split(ins.op_register(0)) != split(ins.op_register(1)) {
+            return None;
+        }
+        match m {
+            Mnemonic::Xor => Some(SelfIdiom::ZeroXor),
+            Mnemonic::Sub => Some(SelfIdiom::ZeroSub),
+            Mnemonic::And => Some(SelfIdiom::KeepAnd),
+            Mnemonic::Or => Some(SelfIdiom::KeepOr),
+            _ => None,
+        }
+    }
 }
 
 pub struct Lifter<'a> {
@@ -524,6 +582,51 @@ impl<'a> Lifter<'a> {
     fn bin(&mut self, op: BinOp, a: VId, b: VId) -> VId {
         let t = self.f.ty_of(a).unwrap_or(Ty::u64());
         self.f.emit(self.cur, Op::Bin(op, a, b), t, self.addr())
+    }
+
+    /// Name a value without computing anything: the register's own bits, written
+    /// back where they came from.
+    fn copy(&mut self, v: VId, w: Width) -> VId {
+        self.f.emit(self.cur, Op::Copy(v), ty_u(w), self.addr())
+    }
+
+    /// Translate a register self-idiom. See `SelfIdiom` for why this is the
+    /// lifter's job and not a fold's.
+    ///
+    /// The FLAGS are still produced, with the same shape the general path gives
+    /// (`Flags(Xor{a,a})`, `Flags(Sub{a,a,borrow:false})`, `Flags(And{a,a})`),
+    /// so flag definedness is unchanged - a `jz` after `xor r,r` sees a defined
+    /// flags value on both sides - and `fuse.rs` can still lower the condition
+    /// off it. For the constant cases the operands are the zero that was just
+    /// written, which is exactly the flags hardware sets: ZF=1, SF=0, PF=1,
+    /// CF=0, OF=0.
+    fn self_idiom(&mut self, d: Grp, dw: Width, si: SelfIdiom) {
+        self.rep.self_idioms += 1;
+        match si {
+            SelfIdiom::ZeroXor | SelfIdiom::ZeroSub => {
+                // No `read` of `d`: the instruction consumes no operand value.
+                let zero = self.const_of(0, dw);
+                self.write(d, dw, zero);
+                self.set_flags(match si {
+                    SelfIdiom::ZeroXor => FlagsOp::Xor { a: zero, b: zero },
+                    _ => FlagsOp::Sub {
+                        a: zero,
+                        b: zero,
+                        borrow: false,
+                    },
+                });
+            }
+            SelfIdiom::KeepAnd | SelfIdiom::KeepOr => {
+                // These DO read the register: the answer is its own value.
+                let v = self.read(d, dw);
+                let r = self.copy(v, dw);
+                self.write(d, dw, r);
+                self.set_flags(match si {
+                    SelfIdiom::KeepAnd => FlagsOp::And { a: v, b: v },
+                    _ => FlagsOp::Or { a: v, b: v },
+                });
+            }
+        }
     }
 
     fn const_of(&mut self, v: u64, w: Width) -> VId {
@@ -904,6 +1007,15 @@ impl<'a> Lifter<'a> {
             | Mnemonic::Or
             | Mnemonic::Xor => {
                 let dst = self.reg_op(ins, 0);
+                // The self-idiom is decided BEFORE any operand is read: this is
+                // the one place that can know the two operands are the same
+                // register, and `xor r,r`/`sub r,r` must not emit a read of it.
+                if let Some((d, dw)) = dst {
+                    if let Some(si) = SelfIdiom::of(m, ins) {
+                        self.self_idiom(d, dw, si);
+                        return;
+                    }
+                }
                 let (lhs, rhs, dw, mem_addr) = match dst {
                     Some((d, dw)) => {
                         let lhs = self.read(d, dw);

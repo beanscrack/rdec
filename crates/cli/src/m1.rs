@@ -692,6 +692,7 @@ pub fn cmd_lift(args: &[String]) -> Result<i32, String> {
     let mut undef_live = 0usize;
     let mut scaffolding = 0usize;
     let mut ret_w32 = 0usize;
+    let mut self_idioms = 0usize;
     let (mut ret_n, mut no_ret, mut step_budget, mut holes, mut unmodeled_load, mut fault) =
         (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
     let mut opaque = 0usize;
@@ -797,6 +798,7 @@ pub fn cmd_lift(args: &[String]) -> Result<i32, String> {
             undef_live += rep.undef_live_ins;
             scaffolding += rep.scaffolding_removed;
             ret_w32 += rep.ret_w32;
+            self_idioms += rep.self_idioms;
             // M3's semantic check, on top of the structural one: run the IR
             // interpreter over the lifted function. It is strict - every operand
             // it consumes must already be defined - so a renaming that leaves a
@@ -864,7 +866,7 @@ pub fn cmd_lift(args: &[String]) -> Result<i32, String> {
         "return width: {ret_w32} of {lifted} functions answer at 32-bit width (a 32-bit write zeroes RAX's upper half, so the emitted C returns uint32_t)"
     );
     println!(
-        "evidence: {gap_total} loud gaps, {exit_total} Exit terminators, {unnamed_total} unnamed call targets, {clobber_total} modelled register clobbers, {unreach_total} unreachable blocks dropped, {scaffolding} live-in placeholders resolved, {undef_live} of them `undef` (the ABI question)"
+        "evidence: {gap_total} loud gaps, {exit_total} Exit terminators, {unnamed_total} unnamed call targets, {clobber_total} modelled register clobbers, {unreach_total} unreachable blocks dropped, {scaffolding} live-in placeholders resolved, {undef_live} of them `undef` (the ABI question), {self_idioms} register self-idioms translated as machine-code facts (`xor/sub r,r` write 0 without reading the register; `and/or r,r` write it back)"
     );
     println!(
         "interp: {ret_n} returned, {no_ret} ended at Exit, {step_budget} hit the step budget, {opaque} reached an unmodelled op, {unmodeled_load} unmodelled loads, {fault} arithmetic faults, {holes} used a value that is never defined"
