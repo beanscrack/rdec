@@ -744,6 +744,26 @@ impl<'a> Lifter<'a> {
     }
 
     fn cast(&mut self, k: CastKind, v: VId, w: Width) -> VId {
+        // Sign extension is a statement about the SIGNEDNESS OF THE SOURCE, and
+        // registers are modelled as one unsigned W64 value, so `movsx` used to
+        // emit SExt from a `uint32_t` - which the C emitter correctly refuses
+        // ("SExt from unsigned ... needs a signed source type", 12 corpus
+        // functions). Re-read the source as signed at its own width first: a
+        // same-width Bitcast keeps every bit and changes only how the top bit is
+        // read, which is exactly what movsx's mnemonic asserts.
+        let v = if k == CastKind::SExt {
+            let src = self.f.ty_of(v);
+            let sw = src.clone().and_then(|t| t.width()).unwrap_or(w);
+            let st = Ty::int(sw, rdec_core::ty::Sx::Signed);
+            if src != Some(st.clone()) {
+                self.f
+                    .emit(self.cur, Op::Cast(CastKind::Bitcast, st.clone(), v), st, self.addr())
+            } else {
+                v
+            }
+        } else {
+            v
+        };
         let t = ty_u(w);
         if self.f.ty_of(v) == Some(t.clone()) {
             return v;
