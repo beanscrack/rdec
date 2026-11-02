@@ -1,321 +1,643 @@
 # RDec — from-scratch x86-64 → C decompiler in Rust
 
-Goal: a production-grade decompiler. Not a toy, not a Ghidra clone — a decompiler
-whose distinguishing property is **provably equivalent output**: every decompiled
-function ships with evidence that the generated C behaves identically to the
-machine code it came from.
-
-That property is the wedge. Ghidra is ~2M LOC of accumulated heuristics; Hex-Rays
-has decades of type-recovery tuning. Neither can produce a machine-checked
-equivalence proof for its output. A verification-first architecture can, and it
-also happens to be the only architecture that lets *one* person make steady,
-non-regressing progress on a problem this size: every pass is gated by an oracle,
-so "it looks right" is never the acceptance criterion.
+**Roadmap v2 · 2026-11-01 · supersedes v1.**
+v1 is preserved in git (`git show e329819:ROADMAP.md`). This revision comes from
+an audit that ran the code, not only read it. §9 is the audited state of the
+tree, with reproduced bugs. §10 lists each change from v1 and the reason for it.
 
 ---
 
-## 0. The four things that decide this project
+## 0. Thesis, and the claim made precise
 
-Everything else is bookkeeping. These are the calls that determine whether the
-project can reach production at all, so they are made up front, not discovered.
+Goal (unchanged): a production-grade decompiler whose distinguishing property
+is **checked equivalence**. Every decompiled function ships with evidence that
+its C behaves like the machine code it came from.
 
-### 0.1 The oracle (test strategy is architecture, not a phase)
+v1 promised "provably equivalent output" and a "machine-checked equivalence
+proof", but every oracle it planned is a *test*. Tests are evidence, not proof,
+and a verification-first project cannot afford to overclaim. So the claim is
+graded, and the grade is printed per function in the output and in JSON:
 
-A decompiler is a compiler in reverse, and compiler bugs are *silent*. So the
-test harness is designed first:
-
-| Tier | Oracle | Catches |
+| Level | Claim | Requires |
 |---|---|---|
-| T0 | Unit tests on hand-written IR: every pass, golden IR dumps | pass regressions |
-| T1 | **Flag-table tests executed on real hardware**: for each flag-defining op, evaluate the Rust model over all `(a,b)` pairs in a sampled grid and compare against EFLAGS read back with `pushfq` | the #1 source of real decompiler bugs: wrong jcc semantics |
-| T2 | **Differential execution**: compile C → `.o` → decompile → recompile the C → run both binaries over N input vectors, compare return value + observable memory/stdout | semantic drift, wrong widths/signedness, flag fusion bugs |
-| T3 | `clang -Werror -c` on every emitted file | non-compilable / UB-laden output |
-| T4 | IR + SSA verifiers run after *every* pass; pass idempotence (`run(p) == run(p;p)`) | invalid IR leaking downstream |
-| T5 | Fuzzing: `cargo-fuzz` on the front-end (random bytes), plus csmith-generated C corpus through T2 | panics, unmodeled-control-flow crashes, exotic codegen |
+| **E0** | none | The function contains `Opaque`, `Exit`, an unresolved indirect jump, or exceeded a budget. C is still produced, with the gaps listed. |
+| **E1** | tested-equivalent | No E0 conditions. T2 passes ≥ 10³ vectors (boundary + random + coverage-guided) at `-O0` **and** `-O2`, with UBSan silent. |
+| **E2** | bounded-proved | E1, plus SMT proves lifted IR ≡ final IR for all inputs, with loops unrolled to *k* (*k* printed). |
+| **E3** | proved | E1, plus an unbounded SMT proof using loop synchronization (product program + invariants). |
 
-T1 and T2 are the reason this roadmap is credible. They are built in Phase 1,
-before any decompilation exists.
+**Trusted base for E2/E3**, stated so it can be attacked:
+- the lifter's per-instruction semantics (tested against silicon by T1L, not proved),
+- the SMT encoding of the IR (differentially tested against the IR interpreter),
+- the C printer (kept syntax-directed and covered by T2),
+- the solver.
 
-### 0.2 The flag model (the x86 decompiler's core problem)
+**Equivalence, defined.** Take the recovered signature and ABI, and any initial
+state on which the machine code does not fault. Both versions must produce:
+- the same return value(s),
+- the same final contents of all memory outside the function's own frame,
+- the same sequence of external calls (callee, arguments, and the return values fed back),
+- preserved callee-saved registers,
+- the same termination (return vs. noreturn call).
 
-x86 threads ~6 flag bits through EFLAGS, shared by every arithmetic op, with
-asymmetric definitions per op (`inc` leaves CF alone; `and` clears CF/OF;
-`sbb`/`adc` chain carries). Naive models produce wrong sign tests on code like
-`sub eax,ecx; jl`.
+Inputs on which the machine code faults (#DE, #GP, #PF) are outside the claim.
+On every input where the machine code is defined, the emitted C must have no UB.
 
-**Decision: revng-style typed flags.** Flag-defining ops produce an SSA value of
-type `Ty::Flags`; the only reader is `get_flag : Flags × {CF,PF,AF,ZF,SF,OF} → Bool`.
-Consequences, all mechanical:
-- dead flags are gone via plain DCE (no liveness analysis),
-- a branch condition is a boolean tree over reads of *one* Flags value, so jcc
-  fusion is a finite rewrite table (the classic `cmp`/`test` matrix), not a
-  dataflow analysis,
-- **anything the table misses lowers to an exact width-aware helper expression**
-  (`__rdec_add_cf(a,b)`), emitted on demand. Output is therefore *never silently
-  wrong*: a missing fusion costs readability, never correctness. This is a
-  permanent architectural guarantee, and it is the single most important line in
-  this document.
-
-### 0.3 Memory, stack, and the frame
-
-Flat 64-bit address space; `load`/`store` carry an access type. The readability
-of the output is decided almost entirely by **local slot promotion**: recognize
-the frame (`push rbp; mov rbp,rsp`, `sub rsp,N`, canary, callee-saved saves),
-treat `[rbp-off]` slots with provably-static offsets as variables, and run
-mem2reg over them with the same versioned-phi machinery used for registers.
-Slots that are address-taken, escaped, or dynamically indexed stay real memory —
-decompiling them as registers is exactly how decompilers produce plausible junk.
-Red zone, `rsp`-relative code without a frame pointer, and dynamic `alloca`/`_chkstk`
-probes are named cases, each with a test.
-
-### 0.4 Unmodeled things are loud
-
-Every gap has an explicit representation: `Op::Opaque`, `Terminator::Exit`,
-unresolved indirect jumps, `unmodeled` notes attached to the block, and a
-per-function **confidence report** (0..1 + list of gaps) printed with the output.
-A production decompiler is trusted because it says when it is unsure. Silent
-semantic loss is the failure mode that kills credibility and this project.
+**Defensible near-term claim:** "every function carries an evidence level: E1 on
+modern clang and MSVC codegen, E2 for loop-free functions." No current tool
+occupies that niche, and every milestone below advances it.
 
 ---
 
-## 1. Architecture
+## 1. Non-negotiables
 
-Strict one-way layering; the middle-end must link against no x86 type.
+### 1.1 The oracle stack
+
+v1 had an oracle for the flag model (T1) and one for end-to-end output (T2),
+and nothing in between. Every middle-end pass sits between two oracles that
+cannot see it, and the audit measured the cost: the existing passes contain
+silent miscompiles that the verifier accepts (§9). The fix is one component, an
+**IR interpreter**, with four oracles built on top of it.
+
+| Tier | Oracle | Validates | Lands |
+|---|---|---|---|
+| T0 | Unit tests + golden IR dumps | pass mechanics | M0 |
+| T1 | Flag model vs real EFLAGS (`pushfq` harness). **Exists.** | x86 flag model | M0 ✓, extended M2 |
+| **T1R** | Rewrite tables vs the T1-checked model: exhaustive at 8 bits (all *a*, *b*, carry-in, flag seeds), sampled at 16/32/64 | jcc fusion, `cmp_pair`, idiom tables | M2 |
+| **T1L** | Lifter vs silicon: run each instruction form's bytes in a sandbox page from random register, flag and memory states. Run the lifted IR in the interpreter from the same state. Compare GPRs, defined flags, xmm, touched memory. Faults are caught by a vectored handler and compared as faults. | lifter, every operand form | M2 |
+| **TV** | Per-pass translation validation: under `--validate` and in CI, evaluate the IR before and after every pass on *K* random states. A difference names the pass, the function and the input. | every middle-end pass | M0 |
+| T2 | Differential execution. The original object and the recompiled C are linked into one harness, with external calls bound to recording stubs. Built at `-O0` and `-O2` with clang and gcc, under UBSan. | lifter → C end to end, incl. C semantics | M4 |
+| T3 | `-std=c11 -Wall -Werror` on every emitted file | non-compilable output | M4 |
+| T4 | Verifier after **every** pass. Type errors are hard; warnings are escalated at phase boundaries. | malformed IR | M0 |
+| T5 | Fuzzing: loader/decoder on random bytes; random *valid IR* through the pipeline under TV; csmith/yarpgen C → compile matrix → T2 | panics, exotic codegen | M1, M3, M9 |
+| **T6** | SMT translation validation: lifted IR ≡ final IR | E2/E3 evidence | P track |
+
+Rules:
+- Every oracle ships with a sabotage test proving it can fail. T1 already does
+  this, and every tier must.
+- A pass enters the default pipeline only once TV covers it and T0 has a fixture
+  for each of its rewrite rules.
+- No soft error survives a phase boundary.
+- An oracle must not share code with its subject. T1R checks lowerings against
+  the T1-measured model, not against the lowering's own helpers. The SMT
+  encoding is checked against the interpreter, never against itself.
+
+### 1.2 Flags
+
+Keep v1's central decision. Flag-defining ops produce one SSA value of type
+`Flags`, read only through `get_flag`. That makes dead flags plain DCE and
+fusion a table. The audit found the representation underspecified, and v2 fixes
+it:
+
+1. **Flags ops reference their integer result** (`res: VId`), because ZF, SF and
+   PF are functions of the result. v1's `FlagsOp` has no link to the result, so
+   the lowering compares the `Flags` value itself to zero (§9 B5).
+2. **Carry/borrow-in is an operand** (`cin: VId`, a Bool), not a `bool` field.
+   `adc`/`sbb` chains are dynamic, and v1 cannot represent them.
+3. **Partial updates take the previous flags** (`prev: VId`). This covers
+   `inc`/`dec` (CF kept), `bt*` (CF only), rotates (CF/OF only) and
+   *variable-count shifts*: a count of 0 leaves every flag unchanged, so each
+   bit is `count == 0 ? prev.bit : new.bit`.
+4. **Signedness lives in the predicate.** `SF ≠ OF` after `cmp` is `slt` by
+   construction. v1 picks signed or unsigned from the operand's type, so `jl` on
+   a register typed unsigned becomes an unsigned compare.
+5. **Fusion matches the whole boolean tree at its root.** The current
+   implementation lowers each `get_flag` alone, which leaves the jcc matrix
+   unreachable (§9 B3).
+6. **The exact fallback is total.** Every (FlagsOp × flag) pair has an exact
+   lowering, including PF (`__rdec_parity8(res)`), AF, and OF for every op.
+   T1R enumerates every pair to prove totality. A `Flags`-typed value that
+   reaches C emission is an internal error, not a note.
+7. **Flags through phis.** Cross-block flag reuse (tail-merged code, carry
+   chains spanning blocks) splits the `Flags` phi into per-bit Bool phis for the
+   bits actually read.
+8. **FP compares produce flags.** `ucomis*`/`comis*` set ZF, PF and CF. `jp`
+   after `ucomisd` (the NaN check) is how real code reads PF.
+9. **Undefined flags** (per the SDM) lower to `undef`. T1 runs on both an Intel
+   and an AMD host: undefined bits differ by vendor, and defined bits must not.
+
+### 1.3 IR semantics (new)
+
+- **Signless integers** `i1…i64`. Signedness goes on operators (`sdiv/udiv`,
+  `slt/ult`, `sar/shr`, `sext/zext`). The signedness of a *variable* is an M6
+  display inference. v1 encodes signedness in both the type and the predicate,
+  which is how item 4 above goes wrong.
+- **Written semantics.** `docs/ir-semantics.md` defines every op; the interpreter
+  is its executable form. Covered cases:
+  - shift by ≥ width: the lifter masks explicitly, and the IR op is defined for every count;
+  - division by zero and `INT_MIN / -1`: trap, which gives the function a may-fault effect;
+  - `undef`: an arbitrary but fixed value (`freeze` semantics, no poison).
+- **Explicit memory ordering.** `Load`, `Store` and `Call` thread a memory token,
+  or MemorySSA is built before any code motion. M4's expression inlining, DSE
+  and load forwarding all consume it.
+- **Calls carry effects:** ABI clobbers, memory effect (none / argmem / read /
+  readwrite), noreturn, may-unwind.
+- **Constants carry their width.** Today every `Const` is `u64`.
+- **A per-pass index instead of use-lists.** Build a def/use index in O(n) when a
+  pass starts and discard it when the pass ends. This keeps v1's "no stale
+  use-lists" property without an O(n) scan per query, which makes DCE O(n²) per
+  sweep. Without the index, M9's 10⁵-instruction budget is unreachable.
+- **The fixpoint driver reports non-convergence as a gap.** It must not stop
+  silently after 32 rounds, especially since several passes make one rewrite per
+  call.
+
+### 1.4 Memory, stack, frame (v1 §0.3, kept)
+
+v1's local slot promotion stands: provably static frame offsets become
+variables, and anything address-taken, escaped or dynamically indexed stays
+memory. Additions:
+- The stack-pointer delta is computed at every program point from M2 on. An
+  unknown delta anywhere makes the function E0.
+- Win64 shadow space and the SysV red zone are ABI facts, not heuristics.
+- Stack probes (`__chkstk`, `___chkstk_ms`, `__alloca`) and canaries
+  (`__security_cookie`/`__security_check_cookie`,
+  `__stack_chk_guard`/`__stack_chk_fail`) are recognized by name plus shape, and
+  each has a corpus case.
+
+### 1.5 Loud by design (v1 §0.4, kept)
+
+Additions:
+- **Per-function isolation.** Each function runs under `catch_unwind` with time
+  and memory budgets; an overrun produces E0 with the reason. Decompilers ingest
+  hostile input, and malware analysis is a primary use.
+- **Determinism.** Output is byte-identical across runs and thread counts; CI
+  diffs two runs.
+- **The confidence report becomes the evidence record:** level, gaps, budgets
+  used, oracle versions.
+
+### 1.6 Output contract (new)
+
+Emitted C is C11 + `<stdint.h>` + one generated header, `rdec.h` (helpers and
+intrinsic shims). Equivalence is claimed only under
+`-fwrapv -fno-strict-aliasing -fno-delete-null-pointer-checks`, with clang or
+gcc. The header documents the flags and the T2 build enforces them.
+
+Why: x86 `add` wraps, but signed `+` in C is UB on overflow, and an optimizing
+compiler exploits it. Emitting every op as unsigned arithmetic with casts would
+be correct but unreadable. Two well-known flags are the honest trade.
+
+UB the emitter must still avoid by itself:
+- shift count ≥ width: mask or use a helper;
+- unaligned typed access where alignment is unproven: use `memcpy`-based
+  `rdec_load32`-style helpers;
+- out-of-bounds pointer arithmetic: keep arithmetic on `uintptr_t` until
+  provenance is proven;
+- sequencing: v1's no-inline-on-alias rule.
+
+T2 at `-O0` alone does not detect any of this, because `-O0` does not exploit
+UB. That is why E1 requires `-O2` and UBSan.
+
+---
+
+## 2. Architecture
+
+Strict one-way layering. `rdec-core` links against no x86 type, and the Cargo
+dependency graph enforces it.
 
 ```
-crates/verify   T1 flag-table harness (hardware probes), corpus generator,
-                T2 differential runner (M4), fuzz targets
-crates/arch-x86 decoder glue (`iced-x86`), per-instruction semantics → IR,
-                calling conventions (Win64 + SysV), frame analysis, idioms.
-                `flags.rs` is the EFLAGS model T1 measures.
-crates/core     IR, CFG, dominators, loops, SSA, passes, structuring, C emission.
-                Knows nothing about x86 — enforced by the Cargo dependency graph.
-crates/cli      disasm / lift / ir / cfg / decompile / verify / diff
-                (`rdec` binary; `flags`, `selftest`, `corpus` exist today)
+crates/bin       loader (goblin): PE/COFF, ELF; sections, symbols, relocations,
+                 imports; Win64 .pdata/.xdata and ELF .eh_frame as function bounds   [M1]
+crates/arch-x86  decode (iced-x86), lift, ABIs (Win64, SysV), stack delta, frame,
+                 idioms, EFLAGS model (flags.rs — exists)
+crates/core      IR, interpreter, verifier, CFG/dominators/loops, SSA, passes,
+                 structuring, C emission                          (IR + passes exist)
+crates/types     type libraries (libc, CRT, Win32 subset) generated from headers;
+                 analyst type database                                               [M4]
+crates/verify    T1 (exists), corpus generator (exists), T1R, T1L, TV, T2 runners,
+                 fuzz targets, SMT bridge (T6)
+crates/cli       rdec: flags / selftest / corpus exist; disasm / lift / ir / cfg /
+                 decompile / verify / status / diff to come
 ```
 
-Loader (PE/COFF + ELF via `goblin`) lands with M1 as `crates/bin`.
+Dependencies: `iced-x86` (MIT; note that `iced` on crates.io is an unrelated GUI
+toolkit) and `goblin` (BSD-3). clang, gcc, LLVM tools and the SMT solver
+(bitwuzla or z3, driven as an external process over SMT-LIB2) are test- and
+evidence-time tools only. None is linked into the product.
 
-Dependency licenses checked before use: `iced-x86` (MIT), `goblin` (BSD-3),
-`clang` (shell, test-only). No LLVM in the product — LLVM is a test-time tool only.
-Note: the decoder crate is `iced-x86`; `iced` on crates.io is an unrelated GUI
-toolkit.
+Pipeline: `lift → SSA (versioned phi) → prune → flag-elim → fold / copy-prop /
+DCE → frame-slot mem2reg → idioms / strength reduction → structure → cgen`.
 
-The IR is typed three-address code:
-
-```
-Op  = Const | Copy | Bin | Un | Cmp | Flags(FlagsOp) | GetFlag | Cast
-    | Load | Store | Select | Phi | Call | Undef | Opaque
-Terminator = Jump | Branch | Return | Unreachable | Exit
-```
-
-Pipeline: `lift → SSAn (versioned phi) → prune → flag-elim → fold/copyprop/DCE →
-strength-reduce/idioms → structure → cgen`. Every pass is
-`fn(&mut Function) -> bool` (changed), run to fixpoint. That shape is what makes
-a partial pass list safe: no pass depends on a later one cleaning up after it.
+Every pass is `fn(&mut Function) -> bool`, run to a fixpoint. The driver runs
+the verifier after every pass unconditionally, and TV after every pass under
+`--validate` and in CI.
 
 ---
 
-## 2. Milestones
+## 3. Corpus and ground truth (new section)
 
-Each has a **gate**: a command that is run, whose output is the evidence. No
-milestone closes on inspection of code. Estimates are focused weeks.
+The corpus defines what "works" means, so it is specified like code.
 
----
-
-### M0 — Harness skeleton · 1 wk
-Workspace, CI (`cargo test`, `cargo clippy -D warnings`, `cargo fmt --check`),
-golden-file test macro, `rdec-verify` crate, corpus directory layout, the IR
-verifier with SSA-form checks, corpus generator script (clang `-O0/-O1/-O2/-Oz`
-× a list of C snippets → `.obj`).
-
-**Gate:** `cargo test` green on an empty pipeline; corpus builds; verifier
-rejects a hand-broken function (a test proving the verifier itself works).
-
----
-
-### M1 — Decode and list · 1–2 wk
-`goblin` PE/COFF (this host's clang output) and ELF. Recursive-descent function
-discovery from symbols + entry, falling back to linear sweep. Byte-exact
-`objdump` comparison. iced formatter for Intel listing. Thunk/PLT detection.
-
-**Gate:** for 50 corpus objects, `rdec disasm` matches `objdump -d` on every
-instruction (mnemonic + operands normalized), 100%. Zero panics on 10 MB of
-random bytes (fuzz target #1).
-
----
-
-### M2 — IR + flag semantics, verified · 3–4 wk
-The IR (types, ops), lifter for the defined subset: `mov movzx movsx lea add sub
-imul neg cmp test and or xor not shl shr sar inc dec setcc cmov movzx push pop
-nop ret jmp jcc call`, plus `lea` addressing as pure arithmetic. `mul/div/idiv`
-with `rdx` pairing. Frame model.
-**T1 hardware flag-table harness** for every flag-defining op, all widths,
-grid-sampled `(a,b)` + boundary values (`0, 1, -1, INT_MIN, INT_MAX, ±2^k`).
-
-**Gate:** flag tables: 0 mismatches against real EFLAGS, ~10⁸ sampled triples per
-op (this is the proof that jcc semantics are right, not an opinion). IR dumps
-stable as goldens. Every lifted op is modeled or explicitly `Opaque` — assert
-coverage ≥ 99% on the corpus.
+- **Compiler matrix:** {clang, gcc, MSVC} × {O0, O1, O2, O3/Os/Oz; MSVC /Od /O1 /O2}.
+  - The current corpus is clang-only, and compiler diversity is the largest
+    generalization risk.
+  - MSVC codegen is most of what Windows users decompile: `/GS` cookies,
+    `__chkstk`, CFG guard dispatch, SEH, and its own switch and jump-table shapes.
+  - Host status: clang 22.1.8 and llvm-objdump are on PATH; gcc and `cl` are not.
+    gcc → WSL or Linux CI; MSVC → VS Build Tools.
+- **Ground truth from debug info.** Build every object with `-g` / `/Zi` and
+  decompile a stripped copy. Score against DWARF/PDB (signatures, types, names,
+  function bounds), and generate T2 inputs from the true prototypes. Debug info
+  is never decompiler input in a scored run. (Today `rdec corpus` compiles with
+  `-O<n> -std=c17 -c`, without `-g`.)
+- **Tiers:**
+  - feature snippets: 30 snippets × 4 opt levels = 120 objects, exists;
+  - real programs: zlib, lua, sqlite3, xxd, tcc, busybox applets;
+  - generated programs: csmith, yarpgen.
+- **Lifter priority comes from frequency.** An instruction histogram over the
+  corpus orders lifter work. Coverage is measured over instruction occurrences,
+  per compiler and opt level.
+- **Pinned and hashed.** The manifest already has an fnv1a64 per object. Add the
+  compiler version and the full flags.
 
 ---
 
-### M3 — CFG, SSA, core passes · 3–4 wk
-CFG recovery, dominators (Cooper-Harvey-Kennedy), dominance frontiers, natural
-loops. SSAn via versioned phi at block entries (registers *and* promoted frame
-slots through one mechanism) → prune to SSA. Passes: prune, **flag elimination**
-(the jcc table + exact helper fallback), const-fold, copy-prop, DCE, branch
-simplify, block merge, block dedup, dead-store elim. Idempotence + verifier
-after each.
+## 4. Milestones
 
-**Gate:** verifier green through fixpoint on the entire corpus. Flag-fusion hit
-rate ≥ 95% (measured: `getflag` trees fused / total), with the residue visible as
-helpers, never as raw flags in the C.
+Each milestone has a **gate**: a command whose output is the evidence. A gate
+must cover all code that exists at that point, not only the new code. v1's M0
+gate ("green on an empty pipeline") passed while the existing passes
+miscompiled. Estimates are focused weeks.
 
 ---
 
-### M4 — Straight-line + if/return → compilable C · 3 wk
-Expression DAG inlining (single-use, side-effect-free, dominance-checked),
-C precedence/associativity, cast placement, and **sequencing safety**: never
-inline an op that reads and writes memory into the same expression (C UB /
-unspecified evaluation order). Pointer-vs-integer display rules.
-Win64/SysV signature synthesis.
+### M0 — Harness and IR semantics · 2–3 wk (v1: 1)
 
-**Gate:** T3 clean (`clang -Werror -c` on all output) for leaf functions with no
-loops; T2 differential equivalence 100% over the leaf corpus, ~10³ vectors each.
+**Done** (e329819): workspace, T1 + sabotage (9.7 × 10⁹ probes, 0 mismatches),
+verifier selftest 5/5, corpus generator + hashed manifest, fmt + clippy clean.
 
----
+**Reopened.** v2's M0 gate covers the passes that already exist.
+- IR semantics document and interpreter.
+- TV driver; T0 harness with golden IR.
+- Verifier fixes:
+  - forward all messages (`verify_ssa` currently drops them, B7);
+  - check operand types (width agreement on `Cmp`/`Bin`, Bool operands for
+    branches and `Select`);
+  - escalate warnings at phase boundaries.
+- Fix §9's bugs **test-first**: each becomes a TV or T0 fixture that fails
+  before its fix. Until a pass has been through this, it stays out of the
+  default pipeline.
+- `rdec status` prints §9's measured table from commands, so the state section
+  is never hand-written again.
+- CI (self-hosted Windows): `cargo test`, `clippy -D warnings`, `fmt --check`,
+  and a determinism diff.
 
-### M5 — Control flow structuring · 4–5 wk
-Reducible CFG → `if/then/else`, `while`, `do/while`, sequence; goto-reduction
-(Sharir-style) as the fallback; `for` recovery (init hoist + induction inc).
-**Switch recovery**: jump-table detection, base/index/bounds extraction through
-the IR, dense-vs-sparse decision, `default` inference from the bounds check.
-Irreducible graphs keep `goto` + a warning, and are counted.
-
-**Gate:** `goto` count = 0 on every reducible corpus function (measured, printed);
-all 30 loop/switch corpus cases T2-equivalent; jump-table corpus ≥ 90% recovered
-as `switch`, remainder as an if-chain with a note.
-
----
-
-### M6 — Readability pass · 4–6 wk
-This is what a real user sees, and it is where incumbent decompilers win.
-Value-set + signedness inference (kills `0xffffffff` noise), integer width
-narrowing, pointer provenance, idiom table (`min/max`, `abs`, `strlen` main
-loops, `bswap`, division-by-constant strength reduction, `setcc`+`movzx`),
-variable naming from origin (param/loop-induction/constant), typedef + struct
-recovery from access offsets, string-literal and global recovery.
-
-**Gate:** scored corpus — emitted C vs original C, per function: signedness match,
-width match, operator-count ratio, statement-count ratio. Thresholds set from the
-first scored run and ratcheted (a score that is not measured gets worse).
+**Gate:**
+- `cargo test` green, including fixtures for B1–B7 and §9's code-reading findings.
+- `rdec selftest` green.
+- TV catches a sabotaged pass by name (e.g. a DCE that drops one random live
+  instruction).
 
 ---
 
-### M7 — Whole-binary scale · 6–8 wk
-Function discovery without symbols (code/data separation from linear sweep,
-`-ffunction-sections`, cold sections), indirect calls (vtable/PLT/switch),
-tail calls and JMP-thunks, PIC/relocation-resolved targets, interprocedural
-signature + constant propagation, nothrow/noreturn propagation, section/segment
-model, `main`-entry walking, DLL import naming.
+### M1 — Load, decode, discover · 2 wk
 
-**Gate:** decompile a real, stripped, `-O2` open-source binary (start with
-`tcc`, `sqlite3.c`, `xxd`, `lua`) and produce a compilable artifact; measure
-% functions fully modeled, % with `Exit`, % with indirect-call notes.
+- goblin PE/COFF + ELF, with relocations applied or symbolized from day one. The
+  corpus is `.obj`, so every call and RIP-relative reference is a relocation over
+  a zero displacement.
+- Function bounds from symbols, then `.pdata` (Win64) / `.eh_frame` (ELF), then
+  recursive descent, then linear sweep. Record which source found each function.
+- Intel listing via the iced formatter.
 
----
-
-### M8 — C++ and modern codegen · 8–12 wk
-Name demangling (Itanium + MSVC), vtable recovery → class + virtual dispatch
-display, RTTI, `this` inference, constructors/destructors, inlined-STL damage
-control, exceptions (landing pads, LSDA, cleanup blocks as `try/catch`),
-SSE/AVX → vector C, `memcpy`/`memcmp` recognition, TLS.
-
-**Gate:** a C++ corpus (small classes, virtual dispatch, one exception path) with
-T2 equivalence; demangle + vtable recovery reported per binary.
+**Gate:**
+- Instruction boundaries and lengths agree with `llvm-objdump` on every
+  instruction reached by recursive descent across the corpus. v1 compared
+  normalized operand text, which tests formatter conventions, not RDec.
+- iced decode → encode → decode round-trips.
+- Function-boundary precision and recall ≥ 99.5% against debug info, on the
+  stripped corpus.
+- 0 panics on 10 MB of random bytes plus 10⁶ fuzz iterations.
 
 ---
 
-### M9 — Production hardening · ongoing
-`cargo-fuzz` at scale (≥ 10⁶ seeds), T2 nightly over csmith/MITLS-generated
-corpus, performance budgets (≥ 100 leaf functions/sec, streaming for 10 MB+
-`text`), incremental decompilation, plugin/script API (Lua or Rust traits),
-JSON output + stable IDs for tooling, IDE/editor integration, docs and a
-contributor contract for the fusion/idiom tables.
+### M2 — IR, lifter, flags: verified against silicon · 4–6 wk (v1: 3–4)
 
-**Gate:** fuzz crashers = 0 open > 48 h; a public conformance score on a fixed
-benchmark suite (the same suite, versioned, every release).
+- Flag representation per §1.2; IR per §1.3.
+- Lifter, in corpus-frequency order:
+  - **Integer core:** v1's list plus `movsxd cdqe cdq cqo xchg bswap bt bts btr
+    btc rol ror shld shrd setcc cmovcc rep movs/stos endbr64`.
+  - **Scalar SSE, moved up from M8:** `movss/movsd movd/movq`,
+    `add/sub/mul/div/sqrt/min/max ss/sd`, `cvt*`, `ucomis/comis`, `xorps/pxor`
+    zeroing, and `movups/movaps` as 128-bit copies. Every `float` and `double` on
+    x86-64 is SSE, and `-O2` uses xmm registers for struct zeroing and copies.
+    Without scalar SSE, a large share of real functions is E0.
+  - **x87, AVX, other packed SIMD:** `Opaque`, counted.
+- Stack-delta analysis and the frame model.
+- T1 extensions:
+  - `adc`/`sbb` with carry-in 0 **and** 1 (today only 1);
+  - "unchanged" flags seeded both 0 and 1 per flag. Today there is one all-ones
+    seed, so a model that hard-codes CF = 1 after `inc` passes. Volume does not
+    fix this; seeds do.
+  - exhaustive 8-bit;
+  - the `--full` run nightly;
+  - both an Intel and an AMD host.
+- T1L and T1R.
+
+**Gate:**
+- T1, T1L, T1R: 0 mismatches. T1L uses ≥ 10⁴ random states per instruction
+  form, for every form in the corpus histogram.
+- T1R totality: every FlagsOp × flag pair has an exact lowering.
+- Lift coverage ≥ 99% of instruction occurrences at O0–O2 for clang and MSVC;
+  the residue is `Opaque`.
+- IR goldens stable.
 
 ---
 
-## 3. Cumulative honest timeline
+### M3 — CFG, SSA, core passes · 4–5 wk (v1: 3–4)
 
-M0–M6 ≈ 19–25 focused weeks → *genuinely useful* on x86-64 Windows/Linux ELF for
-single functions, verified-equivalent, compilable output. M0–M7 ≈ 8–11 months →
-usable on real stripped binaries. C++/SIMD/exceptions parity work is another
-year-plus. "Competitor to Hex-Rays" is a multi-year, multi-person claim; the
-defensible near-term claim is **"the decompiler that ships equivalence proofs,
-on modern codegen, with clean types."** That is a real niche, it is not occupied,
-and every milestone above advances it.
+- CFG recovery with:
+  - **noreturn** knowledge (`abort exit _exit __stack_chk_fail __fastfail
+    ExitProcess`, plus propagation). v1 left this to M7, but without it CFG
+    recovery runs off the end of one function into the next.
+  - **tail calls** (a `jmp` to a known function entry).
+  - **jump-table target resolution.** Structuring into `switch` stays in M5, but
+    an unresolved `jmp [tbl + idx*8]` leaves the CFG incomplete.
+- Dominators (Cooper–Harvey–Kennedy), dominance frontiers, natural loops, SSA,
+  and frame-slot mem2reg with escape analysis.
+- Passes behind TV; flag elimination per §1.2, under T1R; per-pass timing
+  instrumentation.
+- Decide the **stable ID scheme** now: function, block and value identities that
+  survive re-decompilation. The M9 analyst database depends on it, and it is
+  expensive to retrofit.
 
-## 4. Known killers (planned for, not discovered later)
+**Gate:**
+- Verifier and TV green through the fixpoint on the whole corpus.
+- 100% fixpoint convergence.
+- 0 `Flags` values reach cgen.
+- Fusion rate ≥ 95% (fused trees / total), with the residue visible as helpers.
 
-1. Flag semantics — M2 T1 harness. The classic decompiler graveyard.
-2. Silent semantic loss — `Opaque`/`Exit`/confidence report, loud by design.
-3. Irreducible CFG (compiler `goto`/computed-goto, obfuscated code) — goto
-   fallback, never a crash.
-4. Memory aliasing / address-taken locals — promotion is conservative.
-5. Frame analysis (`alloca`, `_chkstk`, canary, no-frame-pointer) — named cases.
-6. Jump tables — M5, with bounds inference.
-7. Type recovery — M6, the readability cliff; measured, not vibed.
-8. Sequencing UB in generated C — M4, with an explicit no-inline-on-alias rule.
-9. Performance blowups on 10⁵-instruction functions — M9 budgets, per-pass
-   timing instrumentation from M3 (cheap to add, expensive to retrofit).
-10. Scope explosion without an oracle — every feature ships with a gate.
+---
 
-## 5. State of the tree right now
+### M4 — Calls, signatures, UB-free C, T2 · 4–5 wk (v1: 3)
 
-**M0 is closed.** Every gate below was run; the numbers are output, not estimates.
+- Call lifting: arguments and returns per ABI, clobbers, stack arguments, SysV
+  varargs (`al`), Win64 shadow space. v1 limited M4 to leaf functions, but most
+  functions call something, and T2 needs a call model anyway.
+- Signature synthesis, plus type libraries for imports (`crates/types`).
+- C emission per §1.6: precedence, cast placement, expression inlining over the
+  memory token, sequencing safety, pointer-vs-integer display.
+- T2 runner:
+  - link the original object and the recompiled C into one harness, using
+    symbol prefixing;
+  - bind external calls to recording stubs;
+  - compare return value, memory and call trace;
+  - generate inputs from true prototypes;
+  - build with clang and gcc at `-O0` and `-O2`, under UBSan.
+- Evidence record per function (E0/E1).
 
-| Gate | Result |
+**Gate:**
+- T3 clean on all output.
+- T2 100% on the leaf + direct-call corpus: ≥ 10³ vectors each, at `-O2`, UBSan
+  silent.
+- Every function has an evidence record.
+
+---
+
+### M5 — Control-flow structuring · 4–5 wk
+
+- v1's scope: if/else, while, do/while, `for` recovery, and switch recovery from
+  M3's resolved tables. Irreducible regions keep `goto`, with a warning, counted.
+- Choose the algorithm against the corpus instead of by default. Candidates:
+  - Sharir-style reduction;
+  - condition-based refinement ("No More Gotos", Yakdan et al., NDSS 2015);
+  - compiler-aware structuring (SAILR, Basque et al., USENIX Security 2024).
+  SAILR's finding shapes the gate: forcing zero gotos duplicates code and adds
+  condition variables, and the source's own control flow is the better target.
+
+**Gate:**
+- Per function, gotos and duplicated statements are measured against the source.
+  v1's "goto = 0 on reducible CFGs" is kept as a ceiling check, not as the only
+  metric.
+- Every loop and switch case is T2-equivalent. Structuring is invisible to TV,
+  so T2 is its oracle.
+- ≥ 90% of jump tables come out as `switch`.
+
+---
+
+### M6 — Readability · 5–7 wk (v1: 4–6)
+
+v1's scope (value-set and signedness inference, width narrowing, pointer
+provenance, the idiom table, naming, struct recovery, strings and globals),
+plus type-library propagation from call sites.
+
+**Gate:**
+- Scored against debug info: signedness, width, pointer-ness, struct field
+  offsets, and parameter names recovered through type-library calls. Ratcheted.
+- **The same metrics computed on Ghidra headless output for the same stripped
+  corpus.** The readability target is relative to a real incumbent, not an
+  absolute number picked in advance.
+
+---
+
+### M7 — Whole binary · 6–8 wk
+
+v1's scope (noreturn and tail calls moved to M3), plus:
+- **Library function identification** (FLIRT-style signatures generated from
+  CRT/libc archives). In a stripped, statically linked `-O2` binary, library code
+  is often most of the functions.
+- Function fragments from hot/cold splitting (`.cold`, MSVC PGO chunks).
+- MSVC specifics:
+  - SEH/unwind-aware CFG (`.pdata`/`.xdata`, `__C_specific_handler` scopes);
+  - CFG guard (`__guard_dispatch_icall_fptr`) and retpoline thunks, treated as
+    indirect call or jump.
+
+**Gate:** v1's real-binary gate, plus the % of functions at E1+ and the
+precision/recall of library identification against ground truth.
+
+---
+
+### M8 — C++ and packed SIMD · 8–12 wk
+
+v1's scope: demangling (Itanium + MSVC), vtables, RTTI, `this`,
+constructors/destructors, exceptions, packed SSE/AVX → vector C, TLS. Scalar SSE
+has moved to M2.
+
+---
+
+### M9 — Production · ongoing
+
+v1's scope: fuzzing at scale, nightly T2 over generated C, performance budgets,
+JSON output + stable IDs, the plugin API, editor integration, and the
+contributor contract for the fusion and idiom tables. Additions:
+- **Analyst loop:** renames, retypes, prototypes and struct definitions stored
+  by stable ID and fed back as constraints, with incremental re-decompilation of
+  only the affected functions. This is how interactive decompilers are actually
+  used.
+- Debug info (PDB/DWARF) as optional *input* when present, separate from its use
+  as test ground truth.
+
+**Gate:** v1's (0 fuzz crashers open > 48 h; a public, versioned conformance
+score), plus the evidence-level distribution published with every release.
+
+---
+
+### P — Proof track (E2/E3) · starts after M4 · 6–10 wk to E2
+
+- **P1:** SMT encoding of the IR, differentially tested against the interpreter.
+  These are two semantics of one IR, and they must agree on random states.
+- **P2 (E2):** bounded equivalence of lifted IR ≡ final IR, for loop-free
+  functions and for loops unrolled to *k*.
+- **P3 (E3):** loop synchronization through a CFG product plus invariant
+  inference. Each function has a solver timeout and falls back to E2/E1; the
+  proof never blocks output.
+
+**Gate (P2):**
+- E2 on ≥ 80% of loop-free leaf functions, ≤ 10 s each (initial threshold,
+  ratcheted).
+- Sabotage: a deliberately wrong rewrite yields a counterexample that replays in
+  the interpreter.
+
+---
+
+## 5. Timeline
+
+| | v1 | v2 | Why it moved |
+|---|---|---|---|
+| M0 | 1 | 2–3 | IR interpreter, TV, existing bugs fixed test-first |
+| M1 | 1–2 | 2 | `.pdata`/`.eh_frame`, relocations |
+| M2 | 3–4 | 4–6 | scalar SSE, T1L, T1R, revised flags |
+| M3 | 3–4 | 4–5 | noreturn, tail calls, jump-table targets moved in |
+| M4 | 3 | 4–5 | calls, UB-free output contract, T2 runner |
+| M5 | 4–5 | 4–5 | — |
+| M6 | 4–6 | 5–7 | Ghidra baseline, type libraries |
+| **M0–M6** | **19–25** | **25–33** | scope moved in, not padding |
+
+M7 takes 6–8 weeks, M8 8–12. The P track runs in parallel with M5–M6 if there
+is a second person, and serially otherwise.
+
+**Re-baseline after M2** using measured throughput (actual vs. estimated weeks
+per milestone). Until then, any one-person estimate beyond six months is a guess.
+
+---
+
+## 6. Known killers (planned for, not discovered later)
+
+1. Flag semantics: T1, now with T1R behind it.
+2. Silent semantic loss: `Opaque`, `Exit`, evidence levels; loud by design.
+3. Irreducible CFG: goto fallback, never a crash.
+4. Memory aliasing / address-taken locals: conservative promotion over an
+   explicit memory token.
+5. Frame analysis (`alloca`, `__chkstk`, canary, no frame pointer): named cases
+   with stack-delta analysis.
+6. Jump tables: targets resolved in M3, structured in M5.
+7. Type recovery: M6, measured against debug info *and* against Ghidra.
+8. **UB in emitted C** (sequencing, signed overflow, shifts, aliasing,
+   alignment): §1.6, with T2 at `-O2` under UBSan.
+9. Performance blowups on 10⁵-instruction functions: per-pass index (§1.3),
+   per-pass timing from M3, budgets in M9.
+10. Scope explosion without an oracle: every feature ships with a gate that
+    covers all existing code.
+11. **Unverified rewrite tables.** The audit's headline: the table v1 calls "the
+    single most important line" has wrong entries and is unreachable. T1R.
+12. **Single-compiler corpus:** the §3 matrix.
+13. **Hostile input:** fuzzing from M1, budgets, per-function isolation.
+14. **Library-code noise:** M7 signatures.
+15. **Oracles sharing code with their subjects:** §1.1 rule.
+
+## 7. Non-goals (until stated otherwise)
+
+32-bit x86, ARM64, x87 `long double` semantics (lifted as `Opaque`),
+self-modifying, packed or obfuscated code (detected and reported, not
+decompiled), and kernel-mode code. Each is loud: `Opaque` plus a gap in the
+evidence record, and a corpus case proves the report fires. A non-goal is a
+tested decision, not a silence.
+
+## 8. Process rules
+
+- Every bug fix lands with the fixture that would have caught it, in the oracle
+  tier that *should* have caught it.
+- No pass enters the default pipeline without TV coverage.
+- The state section is regenerated by `rdec status`, never written by hand. It
+  has been wrong twice: v1 said "does not compile" when the tree compiled, and a
+  later edit said "SSA/IR verifier runs after every pass" when `run_pipeline`
+  never calls it.
+- Gates are commands in CI, not paragraphs.
+
+---
+
+## 9. State of the tree (audited 2026-11-01 at e329819)
+
+### Measured
+
+| Check | Result |
 |---|---|
-| `cargo test` | 5 passed, 0 failed |
-| T1 grid vs hardware | 3 passed — model == real EFLAGS over the boundary grid, all widths, shift counts 0..70 |
-| T1 full volume (`rdec flags --full 20000`) | **9,728,273,400 probes, 69,666,730,981 flag comparisons, 17,835,591,539 undefined-skips, 0 mismatches**, 331 s |
-| Sabotage test | passes — one injected bad OF bit is caught, reported confined to the injected op/width |
-| M0 verifier self-test (`rdec selftest`) | 5/5 — valid function verifies; 4 hand-broken functions each rejected for the *right* reason |
-| Corpus (`rdec corpus`) | 30 snippets × 4 opt levels → **120/120 objects, 93,928 bytes**, all headers = `IMAGE_FILE_MACHINE_AMD64` (verified by parsing the COFF machine field, not by trusting clang's exit code) |
-| `cargo fmt --check` | clean |
-| `cargo clippy --all-targets -- -D warnings` | clean |
-| Toolchain | rustc 1.99 `x86_64-pc-windows-msvc`; clang 22.1.8 → MSVC COFF |
+| `cargo build` | ok (rustc 1.99.0) |
+| `cargo test` | 5 passed, all in `rdec-verify`. **`rdec-core`: 0 tests.** |
+| `rdec selftest` | 5/5 (fixed in d403f9e; it had failed because branch-on-non-bool was a soft error) |
+| `rdec flags` (default grid) | 593,400 probes, 0 mismatches; `--sabotage` → 15,129 mismatches, all `add.32 OF` |
+| `rdec flags --full 20000` (per v1 §5) | 9.7 × 10⁹ probes, 0 mismatches, 331 s |
+| T1 coverage | add sub and or xor adc sbb mul imul inc dec neg shl shr sar, 8–64 bits. **Gaps:** `adc`/`sbb` only with carry-in = 1; one all-ones flag seed |
+| Corpus | 30 snippets × clang {O0, O1, O2, Oz} = 120 COFF objects, hashed manifest; no `-g`, so no ground truth yet |
+| `run_pipeline` | never calls the verifier; DSE is not included; stops silently after 32 rounds |
 
-**What T1 already bought.** The grid found five genuine semantics bugs on first
-contact. Every one would have been a silent miscompile in the output:
+### Confirmed bugs
 
-1. `add` OF and 2. `sub` OF — Rust precedence (`&` binds tighter than `>>` in the
-   expression as written) made the sign tests compute garbage. Fixed with an
-   explicit `bit()` helper so intent can't hide.
-3. `shl` CF at count == width — the last bit out is bit 0, so CF = 1, not 0.
-4. `inc`/`dec` OF — INT_MAX and INT_MIN were swapped.
-5. **Shift-count mask is 6 bits for 64-bit operands, 5 bits otherwise** —
-   `shl rax, 36` was being modeled as `shl rax, 4`. No amount of reading your own
-   code finds this; only the hardware does.
+Each was reproduced by building IR through `rdec-core`'s public API, running one
+pass, and printing the result (scratch crate outside the tree). Bold rows are
+the ones the verifier accepts.
 
-The verifier self-test also earned its keep immediately: it had been *soft*-warning
-on a non-bool branch condition. That is a hard error — emitted C (`if (x)` on an
-int32) still compiles, so the type model would have been lying and a pass bug
-would have hidden behind legal C.
+| # | Where | Input → output | Verifier |
+|---|---|---|---|
+| B1 | `Function::uses_of` / `replace_use_all` ignore `Return` operands | `return a+b` → DCE deletes the add; `ret %2` dangles | rejects (but see B7) |
+| **B2** | `dedup_blocks` key renumbers *free* operands and omits the returned value | `c ? p0+p1 : p2+p3` → always `p0+p1` | **accepts** |
+| **B3** | `flag_elimination` lowers each `get_flag` alone (the "tree root" is the leaf) | jcc matrix unreachable; `cmp a,b; jl` → `(a <s 0) ^ opaque` | **accepts** |
+| **B4** | `atom(SF)` for `cmp` | `cmp a,b; js` → `a < 0` (correct: `a − b <s 0`) | **accepts** |
+| B5 | `FlagCtx.res` and the exact path use the `Flags` value as the arithmetic result | `test a,b; ja` → compares the `Flags` value to 0 | rejects, with no message (B7) |
+| **B6** | Exact fallback covers only CF/OF/ZF/SF of add/sub | `test; jp` and `inc; jc` leave `get_flag` and a live `Flags` value | **accepts** |
+| B7 | `verify_ssa` maps `verify()`'s errors to `Err(vec![])` | structural failures reported with zero messages | — |
 
-Corpus is generated, not hand-written assembly: the only honest corpus for a
-decompiler is real compiler output over known source. `corpus/manifest.tsv`
-(name, opt, obj, size, fnv1a64) is the contract — gates consume the manifest, so a
-corpus change shows up as a diff instead of a silent behavior change. The 30
-snippets are chosen per milestone: flag fusion (signed/unsigned compares, setcc,
-cmov, carry chains), div/mul wide, loops (reducible, bottom-tested, nested-break,
-gcd), switch dense/sparse/fallthrough, address-taken locals, struct offsets,
-recursion, calls, and one two-entry loop to force the irreducible-CFG path.
+### Found by reading
 
-**Next: M1** — goblin PE/COFF load, recursive-descent function discovery, decode
-via `iced-x86`, gated on `rdec disasm` matching `objdump -d` on all 120 objects
-plus zero panics on 10 MB of random bytes.
+Each needs a fixture before it is fixed.
+
+- `cmp_pair`: **8 of 16 entries are wrong.** `(ult ∧ ne)` and `(slt ∧ ne)` map to
+  `≤` instead of `<`. `(uge ∨ ne)` maps to `ugt`, but it is constant true.
+  `(sgt ∨ ne)` maps to `≥`, but it is `≠`. Each appears in both operand orders.
+  It is latent today only because B3 makes it unreachable.
+- `joint_pair`: `¬SF ∧ ¬OF` → `ge`, but `ge` is SF = OF. Test class:
+  `CF ∧ ¬ZF` → `ZF` and `OF ∧ ¬SF` → `SF`; the correct results are `0`, or
+  `¬ZF`/`¬SF` when the left side is negated.
+- The signedness of `SF ⊕ OF` comes from the operand's type (§1.3).
+- OF after `cmp` lowers to `Opaque` instead of the exact helper.
+- `add_value_op` puts new ops in the entry block, so operands defined later don't
+  dominate their use. `add_const` can reuse a constant from a non-dominating block.
+- `simplify_branches`, `merge_blocks` and `dedup_blocks` don't update phi
+  incoming lists.
+- `const_bin`: `MulHi`/`MulSmul` shift by 64 at every width.
+- `FlagsOp::Add { carry: bool }`: carry-in is not an operand, and `Inc`/`Dec`
+  have no previous-flags operand.
+- Every `Op::Const` is typed `u64` whatever type is requested, so narrow
+  constants are never reused and comparisons mix widths.
+- `def()` and `uses_of()` are linear scans: DCE is O(n²) per sweep, and the
+  fixpoint multiplies that.
+- The doc comment on `Call::pure` describes the opposite of the field.
+
+**What this shows.** v1's thesis is right, and the tree demonstrates it from the
+other side. About 1.1 kLOC of passes were written before any oracle could see
+them, and four of the confirmed bugs produce wrong logic or leave raw flags
+while every existing check passes. The flag model *had* an oracle, and its five
+bugs were caught on the first run.
+
+---
+
+## 10. Changes from v1
+
+| Change | Reason |
+|---|---|
+| "Provably equivalent" → graded evidence levels E0–E3, with a definition of equivalence and a stated trusted base | v1's oracles are tests. The claim must match the evidence. |
+| IR interpreter + TV, T1R, T1L added to the oracle stack | Nothing validated the passes, the rewrite tables or the lifter; §9 shows the result |
+| Flag representation: result link, carry-in operand, prev-flags operand, phi splitting, total fallback, FP compares | B3–B6 and the read-through findings; `adc`, `inc`, variable shifts and `jp` were unrepresentable |
+| Signless IR integers; signedness on predicates | Signedness taken from the type turned `jl` into an unsigned compare |
+| Explicit memory token, call effects, per-pass index, convergence reporting | Code motion and inlining need memory order; scans don't scale; silent non-convergence |
+| Output contract (C11 + `rdec.h` + `-fwrapv -fno-strict-aliasing -fno-delete-null-pointer-checks`); T2 at `-O2` with UBSan | x86 wraps and C doesn't; `-O0` hides UB |
+| Corpus section: clang/gcc/MSVC matrix, debug-info ground truth, frequency-ordered lifting | A single-compiler corpus doesn't generalize; scoring needs ground truth |
+| Scalar SSE: M8 → M2 | All x86-64 floating point and much `-O2` struct code is SSE |
+| noreturn, tail calls, jump-table targets: M5/M7 → M3 | CFG recovery is wrong without them |
+| Calls and type libraries in M4; T2 runner specified (stubs, call trace, symbol prefixing) | Most functions aren't leaves; T2 needs a call model |
+| M1 gate: llvm-objdump boundary agreement + round-trip, not operand-text match; `.pdata`/`.eh_frame` bounds | Text matching tests the formatter, not RDec; unwind tables give near-exact bounds |
+| M5: algorithm chosen on the corpus; gotos measured against the source | Zero gotos can cost readability (SAILR) |
+| M6: Ghidra baseline | Readability has to be relative to an incumbent |
+| M7: library signatures, MSVC SEH/CFG-guard, cold fragments | Real stripped Windows binaries are dominated by these |
+| M9: analyst loop; stable IDs decided in M3 | Interactive use is the product; IDs are expensive to retrofit |
+| P track for E2/E3 | Makes the proof claim real rather than rhetorical |
+| Gates must cover all existing code; `rdec status` generates §9 | v1's M0 gate passed over miscompiling passes; the state section was wrong twice |
+| Non-goals listed | A production tool says what it doesn't do, loudly |
+| M0–M6: 19–25 → 25–33 weeks, re-baseline after M2 | Scope moved in |

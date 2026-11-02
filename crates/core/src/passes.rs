@@ -89,457 +89,21 @@ fn new_undef(f: &mut Function, ty: Ty) -> VId {
 // ---------------------------------------------------------------------------
 // flag elimination
 // ---------------------------------------------------------------------------
+//
+// v1's implementation lived here and roadmap SS9 confirmed it broken four ways
+// (B3-B6): per-leaf lowering made the jcc matrix unreachable, SF of a `cmp` was
+// read as "a < 0", the `Flags` value was used as the instruction's integer
+// result, and the exact fallback covered only CF/OF/ZF/SF of add/sub so a
+// `Flags`-typed value could survive the pass. It is deleted, not patched: the
+// replacement lives in `crate::fuse` and is correct by construction (match the
+// tree at its root, recompute the result from the operands, total fallback with
+// loud `Opaque` gaps).
 
-/// The heart of x86 decompilation.
-///
-/// A `Ty::Flags` value is an opaque, local record of one instruction's flag
-/// definition; the only reader is `get_flag`. Consequences, all mechanical:
-///  1. dead flags vanish under plain DCE,
-///  2. a branch condition is a boolean tree over reads of *one* flags value, so
-///     it can be matched against the exact jcc matrix (see `FlagExpr`),
-///  3. anything the table misses lowers to a width-exact helper expression
-///     (`__rdec_add_cf(a, b)`), never to a guess. Helpers are emitted on demand,
-///     so output always compiles and an unfused case is visible in the source.
+pub use crate::fuse::cmp_pair;
+
+/// Lower flag reads into comparisons over the operands. See `crate::fuse`.
 pub fn flag_elimination(f: &mut Function) -> bool {
-    // Rewriting one getflag can enable another, so do one rewrite per call and
-    // let the driver iterate to the fixpoint.
-    for bi in 0..f.blocks.len() {
-        let n = f.blocks[bi].instrs.len();
-        for ii in 0..n {
-            if !matches!(f.blocks[bi].instrs[ii].op, Op::GetFlag(..)) {
-                continue;
-            }
-            let bb = f.blocks[bi].id;
-            if let Some(rep) = simplify_getflag(f, bb, ii) {
-                f.blocks[bi].instrs[ii].op = rep;
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// What a flags value records, in terms of its operands.
-#[derive(Copy, Clone, Debug)]
-struct FlagCtx {
-    kind: FlagClass,
-    a: VId,
-    b: VId,
-    /// The defining op's integer result, when it has one.
-    res: VId,
-    w: Width,
-    signed: bool,
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-enum FlagClass {
-    /// a - b, no borrow-in: the `cmp a, b` case.
-    Cmp,
-    /// a & b / a | b / a ^ b: CF = OF = 0.
-    Test,
-    /// a + b: flags need the carry chain, so only ZF/SF fuse here.
-    Add,
-}
-
-fn ctx_of(f: &Function, fop: FlagsOp, res: VId) -> Option<FlagCtx> {
-    let (kind, a, b) = match fop {
-        FlagsOp::Sub {
-            a,
-            b,
-            borrow: false,
-        } => (FlagClass::Cmp, a, b),
-        FlagsOp::And { a, b } | FlagsOp::Or { a, b } | FlagsOp::Xor { a, b } => {
-            (FlagClass::Test, a, b)
-        }
-        FlagsOp::Add { a, b, carry: false } => (FlagClass::Add, a, b),
-        _ => return None,
-    };
-    let ty = f.ty_of(a).unwrap_or(Ty::u64());
-    let w = ty.width().unwrap_or(Width::W64);
-    let signed = ty.sx() == Some(Sx::Signed);
-    Some(FlagCtx {
-        kind,
-        a,
-        b,
-        res,
-        w,
-        signed,
-    })
-}
-
-/// Rewrite the `get_flag` at (`bb`, `ii`) - as the root of its boolean tree -
-/// into comparisons. Only at the tree root, so inner reads are replaced by the
-/// same lowering instead of racing it.
-fn simplify_getflag(f: &mut Function, bb: BbId, ii: usize) -> Option<Op> {
-    let ins = f.blocks[bb as usize].instrs[ii].clone();
-    let Op::GetFlag(_, fv) = ins.op else {
-        return None;
-    };
-    let addr = ins.addr;
-    let root = ins.dest;
-    if f.def(root)? != (bb, ii) {
-        return None;
-    }
-    let (def_bb, def_ii) = f.def(fv)?;
-    let flags_ins = f.blocks[def_bb as usize].instrs[def_ii].clone();
-    let Op::Flags(fop) = flags_ins.op.clone() else {
-        return None;
-    };
-    let tree = collect_flag_expr(f, root, fv);
-    if let Some(ctx) = ctx_of(f, fop, flags_ins.dest) {
-        if let Some(op) = lower_flag_expr(f, &tree, ctx, addr) {
-            return Some(op);
-        }
-    }
-    // No table hit: exact per-flag helpers, so no Ty::Flags survives.
-    lower_flag_expr_exact(f, &tree, &flags_ins, addr)
-}
-
-/// Lower a boolean tree over one flags value using the comparison table.
-fn lower_flag_expr(f: &mut Function, e: &FlagExpr, ctx: FlagCtx, addr: u64) -> Option<Op> {
-    if let Some(op) = joint_pair(f, e, ctx) {
-        return Some(op);
-    }
-    match e {
-        FlagExpr::One(fl) => atom(*fl, ctx, f, addr),
-        FlagExpr::Not(x) => {
-            let inner = lower_flag_expr(f, x, ctx, addr)?;
-            Some(negate_bool(f, inner, addr))
-        }
-        FlagExpr::And(l, r) => bool_combine(f, BinOp::And, l, r, ctx, addr),
-        FlagExpr::Or(l, r) => bool_combine(f, BinOp::Or, l, r, ctx, addr),
-        FlagExpr::Xor(l, r) => bool_combine(f, BinOp::Xor, l, r, ctx, addr),
-        FlagExpr::Opaque => None,
-    }
-}
-
-fn bool_combine(
-    f: &mut Function,
-    op: BinOp,
-    l: &FlagExpr,
-    r: &FlagExpr,
-    ctx: FlagCtx,
-    addr: u64,
-) -> Option<Op> {
-    let a = lower_flag_expr(f, l, ctx, addr)?;
-    let b = lower_flag_expr(f, r, ctx, addr)?;
-    // Constant folding of the boolean algebra: this is what turns `SF ^ OF`
-    // into `SF` for a `test`, where OF is known 0.
-    match (a.as_const(), b.as_const()) {
-        (Some(x), Some(y)) => {
-            let v = match op {
-                BinOp::And => (x & 1) & (y & 1),
-                BinOp::Or => (x & 1) | (y & 1),
-                BinOp::Xor => (x & 1) ^ (y & 1),
-                _ => return None,
-            };
-            return Some(Op::Const(v));
-        }
-        (Some(x), None) => {
-            if let Some(o) = unit_fold(op, x, b.clone(), f, addr) {
-                return Some(o);
-            }
-        }
-        (None, Some(y)) => {
-            if let Some(o) = unit_fold(op, y, a.clone(), f, addr) {
-                return Some(o);
-            }
-        }
-        _ => {}
-    }
-    // Two comparisons of the same pair fold into one when the combination names
-    // a single comparison (a<b && a!=b -> a<=b, etc).
-    if let (Op::Cmp(c1, x1, y1), Op::Cmp(c2, x2, y2)) = (&a, &b) {
-        if x1 == x2 && y1 == y2 {
-            if let Some(c) = cmp_pair(*c1, *c2, op) {
-                return Some(Op::Cmp(c, *x1, *y1));
-            }
-        }
-    }
-    let x = f.add_value_op(a, Ty::Bool, addr);
-    let y = f.add_value_op(b, Ty::Bool, addr);
-    Some(Op::Bin(op, x, y))
-}
-
-/// `x` is a boolean constant: fold it against `other`.
-fn unit_fold(op: BinOp, x: u64, other: Op, f: &mut Function, addr: u64) -> Option<Op> {
-    match (op, x & 1) {
-        (BinOp::And, 0) => Some(Op::Const(0)),
-        (BinOp::Or, 1) => Some(Op::Const(1)),
-        (BinOp::And, 1) | (BinOp::Or, 0) => Some(other),
-        (BinOp::Xor, 0) => Some(other),
-        (BinOp::Xor, 1) => Some(negate_bool(f, other, addr)),
-        _ => None,
-    }
-}
-
-/// `(c1 op c2)` as a single comparison, when it is one.
-fn cmp_pair(c1: IntCmp, c2: IntCmp, op: BinOp) -> Option<IntCmp> {
-    use IntCmp::*;
-    let tab: &[((IntCmp, IntCmp), IntCmp)] = match op {
-        BinOp::Or => &[
-            ((Ult, Eq), Ule),
-            ((Eq, Ult), Ule),
-            ((Uge, Ne), Ugt),
-            ((Ne, Uge), Ugt),
-            ((Lt, Eq), Le),
-            ((Eq, Lt), Le),
-            ((Gt, Ne), Ge),
-            ((Ne, Gt), Ge),
-        ],
-        BinOp::And => &[
-            ((Uge, Ne), Ugt),
-            ((Ne, Uge), Ugt),
-            ((Ult, Ne), Ule),
-            ((Ne, Ult), Ule),
-            ((Ge, Ne), Gt),
-            ((Ne, Ge), Gt),
-            ((Lt, Ne), Le),
-            ((Ne, Lt), Le),
-        ],
-        _ => return None,
-    };
-    tab.iter()
-        .find(|((l, r), _)| *l == c1 && *r == c2)
-        .map(|(_, c)| *c)
-}
-
-fn negate_bool(f: &mut Function, op: Op, addr: u64) -> Op {
-    match op {
-        Op::Cmp(c, a, b) => Op::Cmp(c.negate(), a, b),
-        Op::Const(v) => Op::Const((v & 1) ^ 1),
-        other => {
-            let v = f.add_value_op(other, Ty::Bool, addr);
-            Op::Un(UnOp::Not, v)
-        }
-    }
-}
-
-/// One flag bit -> a C-visible op, from the flag's exact definition.
-fn atom(fl: Flag, ctx: FlagCtx, f: &mut Function, addr: u64) -> Option<Op> {
-    let zero = f.add_const(Ty::uint(ctx.w), 0, addr);
-    match ctx.kind {
-        FlagClass::Cmp => match fl {
-            Flag::ZF => Some(Op::Cmp(IntCmp::Eq, ctx.a, ctx.b)),
-            Flag::CF => Some(Op::Cmp(IntCmp::Ult, ctx.a, ctx.b)),
-            Flag::SF => Some(Op::Cmp(IntCmp::Lt, ctx.a, zero)),
-            Flag::OF => Some(Op::Opaque(
-                format!("signed overflow of a={:#x} - b={:#x}", ctx.a, ctx.b).into_boxed_str(),
-            )),
-            Flag::PF | Flag::AF => None,
-        },
-        FlagClass::Test => match fl {
-            Flag::ZF => Some(Op::Cmp(IntCmp::Eq, ctx.res, zero)),
-            Flag::SF => Some(Op::Cmp(IntCmp::Lt, ctx.res, zero)),
-            // and/or/xor clear CF and OF.
-            Flag::CF | Flag::OF => Some(Op::Const(0)),
-            Flag::PF | Flag::AF => None,
-        },
-        FlagClass::Add => match fl {
-            Flag::ZF => Some(Op::Cmp(IntCmp::Eq, ctx.res, zero)),
-            Flag::SF => Some(Op::Cmp(IntCmp::Lt, ctx.res, zero)),
-            _ => None,
-        },
-    }
-}
-
-/// The classic jcc matrix: flag-read pairs that name one comparison.
-fn joint_pair(f: &mut Function, e: &FlagExpr, ctx: FlagCtx) -> Option<Op> {
-    let (op, l, r) = match e {
-        FlagExpr::And(l, r) => (BinOp::And, l, r),
-        FlagExpr::Or(l, r) => (BinOp::Or, l, r),
-        FlagExpr::Xor(l, r) => (BinOp::Xor, l, r),
-        _ => return None,
-    };
-    let (a, b) = (as_flag(l)?, as_flag(r)?);
-    let (neg_l, neg_r) = (is_not(l), is_not(r));
-
-    if ctx.kind == FlagClass::Cmp {
-        // CF = a<b (unsigned), ZF = a==b, SF^OF = a<b (signed).
-        let c = match (a, b, neg_l, neg_r, op) {
-            (Flag::CF, Flag::ZF, false, false, BinOp::Or)
-            | (Flag::ZF, Flag::CF, false, false, BinOp::Or) => Some(IntCmp::Ule),
-            (Flag::CF, Flag::ZF, true, true, BinOp::And)
-            | (Flag::ZF, Flag::CF, true, true, BinOp::And) => Some(IntCmp::Ugt),
-            (Flag::SF, Flag::OF, false, false, BinOp::Xor)
-            | (Flag::OF, Flag::SF, false, false, BinOp::Xor) => {
-                Some(if ctx.signed { IntCmp::Lt } else { IntCmp::Ult })
-            }
-            (Flag::SF, Flag::OF, true, true, BinOp::And)
-            | (Flag::OF, Flag::SF, true, true, BinOp::And) => {
-                Some(if ctx.signed { IntCmp::Ge } else { IntCmp::Uge })
-            }
-            _ => None,
-        };
-        if let Some(c) = c {
-            return Some(Op::Cmp(c, ctx.a, ctx.b));
-        }
-        // CF && ZF is unsatisfiable for a subtraction (a<b and a==b at once).
-        if op == BinOp::And
-            && !neg_l
-            && !neg_r
-            && matches!((a, b), (Flag::CF, Flag::ZF) | (Flag::ZF, Flag::CF))
-        {
-            return Some(Op::Const(0));
-        }
-    }
-
-    if ctx.kind == FlagClass::Test {
-        // CF and OF are constant 0 here, so CF|ZF collapses to ZF and SF^OF to
-        // SF. lower_flag_expr does the constant folding; this shortcut keeps the
-        // common shapes one lookup deep.
-        let keep = match (a, b, neg_l, neg_r, op) {
-            (Flag::CF, Flag::ZF, _, true, BinOp::And)
-            | (Flag::CF, Flag::ZF, false, false, BinOp::Or)
-            | (Flag::ZF, Flag::CF, false, false, BinOp::Or) => FlagExpr::One(Flag::ZF),
-            (Flag::SF, Flag::OF, false, false, BinOp::Xor)
-            | (Flag::OF, Flag::SF, false, false, BinOp::Xor)
-            | (Flag::OF, Flag::SF, _, true, BinOp::And)
-            | (Flag::SF, Flag::OF, _, true, BinOp::And) => FlagExpr::One(Flag::SF),
-            _ => return None,
-        };
-        return lower_flag_expr(f, &keep, ctx, 0);
-    }
-    None
-}
-
-fn is_not(e: &FlagExpr) -> bool {
-    matches!(e, FlagExpr::Not(_))
-}
-
-fn as_flag(e: &FlagExpr) -> Option<Flag> {
-    match e {
-        FlagExpr::One(fl) => Some(*fl),
-        FlagExpr::Not(x) => match &**x {
-            FlagExpr::One(fl) => Some(*fl),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-/// Exact lowering for flag definitions the table does not cover. These are
-/// *semantically exact* at the operand width, which is why leaving a fusion off
-/// the table costs readability only, never correctness.
-fn lower_flag_expr_exact(
-    f: &mut Function,
-    e: &FlagExpr,
-    flags_ins: &Instr,
-    addr: u64,
-) -> Option<Op> {
-    let (a, b, chain) = match flags_ins.op {
-        Op::Flags(FlagsOp::Add { a, b, carry }) => (a, b, carry),
-        Op::Flags(FlagsOp::Sub { a, b, borrow }) => (a, b, borrow),
-        _ => return None,
-    };
-    let is_add = matches!(flags_ins.op, Op::Flags(FlagsOp::Add { .. }));
-    let w = f.ty_of(a).and_then(|t| t.width()).unwrap_or(Width::W64);
-    let cf_name = match (is_add, chain) {
-        (true, true) => "__rdec_adc_cf",
-        (true, false) => "__rdec_add_cf",
-        (false, true) => "__rdec_sbb_cf",
-        (false, false) => "__rdec_sub_cf",
-    };
-    let of_name = if is_add {
-        "__rdec_add_of"
-    } else {
-        "__rdec_sub_of"
-    };
-    let helper = |n: &str, args: Vec<VId>| Op::Call {
-        callee: Callee::Symbol(n.to_string()),
-        ret_ty: Ty::Bool,
-        args: args.into_boxed_slice(),
-        pure: true,
-    };
-    let mut one = |fl: Flag| -> Option<Op> {
-        match fl {
-            Flag::CF => Some(helper(cf_name, vec![a, b])),
-            Flag::OF => Some(helper(of_name, vec![a, b])),
-            Flag::ZF => Some(Op::Cmp(
-                IntCmp::Eq,
-                flags_ins.dest,
-                f.add_const(Ty::uint(w), 0, addr),
-            )),
-            Flag::SF => Some(Op::Cmp(
-                IntCmp::Lt,
-                flags_ins.dest,
-                f.add_const(Ty::uint(w), 0, addr),
-            )),
-            _ => None,
-        }
-    };
-    let mut leaf = |e: &FlagExpr| -> Option<Op> {
-        match e {
-            FlagExpr::One(fl) => one(*fl),
-            FlagExpr::Not(x) => match &**x {
-                FlagExpr::One(fl) => one(*fl).map(|o| match o {
-                    Op::Cmp(c, a, b) => Op::Cmp(c.negate(), a, b),
-                    Op::Const(v) => Op::Const((v & 1) ^ 1),
-                    other => other,
-                }),
-                _ => None,
-            },
-            _ => None,
-        }
-    };
-    match e {
-        FlagExpr::One(_) | FlagExpr::Not(_) => leaf(e),
-        FlagExpr::Or(l, r) | FlagExpr::And(l, r) | FlagExpr::Xor(l, r) => {
-            let (x, y) = (leaf(l)?, leaf(r)?);
-            let bin = match e {
-                FlagExpr::Or(..) => BinOp::Or,
-                FlagExpr::And(..) => BinOp::And,
-                _ => BinOp::Xor,
-            };
-            let x = f.add_value_op(x, Ty::Bool, addr);
-            let y = f.add_value_op(y, Ty::Bool, addr);
-            Some(Op::Bin(bin, x, y))
-        }
-        FlagExpr::Opaque => None,
-    }
-}
-
-/// A boolean expression over reads of one flags value.
-#[derive(Clone, Debug)]
-pub enum FlagExpr {
-    One(Flag),
-    Not(Box<FlagExpr>),
-    And(Box<FlagExpr>, Box<FlagExpr>),
-    Or(Box<FlagExpr>, Box<FlagExpr>),
-    Xor(Box<FlagExpr>, Box<FlagExpr>),
-    /// Anything not modeled (a phi of flags, a flag stored to memory, ...).
-    Opaque,
-}
-
-/// Walk uses downward from a flags value to the boolean tree consuming it.
-pub fn collect_flag_expr(f: &Function, root: VId, flags_val: VId) -> FlagExpr {
-    let Some((bb, ii)) = f.def(root) else {
-        return FlagExpr::Opaque;
-    };
-    match f.blocks[bb as usize].instrs[ii].op.clone() {
-        Op::GetFlag(g, fv) => {
-            if fv == flags_val {
-                FlagExpr::One(g)
-            } else {
-                FlagExpr::Opaque
-            }
-        }
-        Op::Bin(BinOp::And, a, b) => FlagExpr::And(
-            Box::new(collect_flag_expr(f, a, flags_val)),
-            Box::new(collect_flag_expr(f, b, flags_val)),
-        ),
-        Op::Bin(BinOp::Or, a, b) => FlagExpr::Or(
-            Box::new(collect_flag_expr(f, a, flags_val)),
-            Box::new(collect_flag_expr(f, b, flags_val)),
-        ),
-        Op::Bin(BinOp::Xor, a, b) => FlagExpr::Xor(
-            Box::new(collect_flag_expr(f, a, flags_val)),
-            Box::new(collect_flag_expr(f, b, flags_val)),
-        ),
-        Op::Un(UnOp::Not, a) => FlagExpr::Not(Box::new(collect_flag_expr(f, a, flags_val))),
-        Op::Copy(a) => collect_flag_expr(f, a, flags_val),
-        _ => FlagExpr::Opaque,
-    }
+    crate::fuse::flag_elimination(f)
 }
 
 // ---------------------------------------------------------------------------
@@ -854,31 +418,69 @@ pub(crate) fn redirect(t: &mut Terminator, from: BbId, to: BbId) {
 
 /// Fold blocks with identical instruction streams (the duplicated join tails
 /// that if/else lowering produces).
+///
+/// Two blocks are mergeable when they are isomorphic *modulo the positional
+/// mapping of their local values*, which is exactly what `block_key` computes.
+/// The merge is therefore only sound if the uses are rewritten along that
+/// mapping: v1 redirected the edges and dropped the block but left every use of
+/// its locals pointing at values that no longer existed in a live block, so
+/// `x = a + 1` / `return x` and `y = b + 1` / `return y` collapsed to whichever
+/// `%1` hashed first and the function returned a constant 3 for every input
+/// (§9 B2).
 pub fn dedup_blocks(f: &mut Function) -> bool {
-    let mut seen: HashMap<String, BbId> = HashMap::new();
-    for b in f.blocks.clone() {
-        if b.instrs.is_empty() || matches!(b.term, Terminator::Unreachable) {
+    let mut seen: HashMap<String, (BbId, Vec<VId>)> = HashMap::new();
+    for bi in 0..f.blocks.len() {
+        let bid = f.blocks[bi].id;
+        if f.blocks[bi].instrs.is_empty() || matches!(f.blocks[bi].term, Terminator::Unreachable) {
             continue;
         }
-        let key = block_key(f, &b);
-        if let Some(&other) = seen.get(&key) {
-            for blk in f.blocks.iter_mut() {
-                redirect(&mut blk.term, b.id, other);
+        // A phi's incoming values come from its predecessors, so two phi blocks
+        // can share a canonical shape while reading different values. Positional
+        // canonicalisation cannot see that, so phi blocks are not deduped here;
+        // phi-aware value numbering is M3's GVN.
+        if f.blocks[bi]
+            .instrs
+            .iter()
+            .any(|i| matches!(i.op, Op::Phi(_)))
+        {
+            continue;
+        }
+        let (key, map) = block_key_map(f, &f.blocks[bi]);
+        let hit = seen.get(&key).cloned();
+        if let Some((other, map_o)) = hit {
+            for (i, v) in map.iter().enumerate() {
+                if map_o[i] != *v {
+                    f.replace_use_all(*v, map_o[i]);
+                }
             }
-            f.blocks[b.id as usize].instrs.clear();
-            f.blocks[b.id as usize].term = Terminator::Unreachable;
+            for blk in f.blocks.iter_mut() {
+                redirect(&mut blk.term, bid, other);
+            }
+            f.blocks[bi].instrs.clear();
+            f.blocks[bi].term = Terminator::Unreachable;
             return true;
         }
-        seen.insert(key, b.id);
+        seen.insert(key, (bid, map));
     }
     false
 }
 
-/// Structural key: op shape with operands and dests renumbered by order of
-/// appearance, so two copies of the same tail hash identically.
-fn block_key(f: &Function, b: &Block) -> String {
+/// Structural key plus the canonical mapping (index -> value) it implies.
+///
+/// Only values **defined inside the block** may be renumbered positionally: two
+/// blocks that compute the same expression from *different* inputs are not the
+/// same computation, whatever the shape looks like after renumbering. So free
+/// operands (params, anything defined in a dominating block) and successor
+/// targets are encoded by identity, exactly like constants. v1 renumbered those
+/// too, which is how `add p0,p1` and `add p2,p3` hashed equal (§9 B2).
+pub fn block_key_map(f: &Function, b: &Block) -> (String, Vec<VId>) {
+    let locals: Vec<VId> = b.instrs.iter().map(|i| i.dest).collect();
     let mut ids: Vec<u32> = Vec::new();
     let enc = |v: u32, ids: &mut Vec<u32>| -> String {
+        if !locals.contains(&v) {
+            // Free operand: identity, not position.
+            return format!("v{v}");
+        }
         if let Some(i) = ids.iter().position(|x| *x == v) {
             format!("%{i}")
         } else {
@@ -907,12 +509,12 @@ fn block_key(f: &Function, b: &Block) -> String {
     }
     let mut succ = Vec::new();
     b.term.successors(&mut succ);
-    let succ: Vec<String> = succ.iter().map(|x| enc(*x, &mut ids)).collect();
+    let succ: Vec<String> = succ.iter().map(|x| format!("bb{x}")).collect();
     s.push_str(&format!(
         "term {:?} {succ:?}",
         std::mem::discriminant(&b.term)
     ));
-    s
+    (s, ids)
 }
 
 fn op_shape(op: &Op) -> String {

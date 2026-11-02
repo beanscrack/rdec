@@ -124,12 +124,13 @@ pub fn verify(f: &Function) -> Verdict {
 pub fn verify_ssa(f: &Function) -> Verdict {
     let mut e = Errs::default();
     let cfg = Cfg::build(f);
-    verify(f).map_err(|errs| {
+    // B7: structural failures used to be routed into a local `Errs` and then
+    // discarded, so callers saw `Err(vec![])` -- a rejection with no reason.
+    if let Err(errs) = verify(f) {
         for x in errs {
             e.hard(x);
         }
-        Vec::new()
-    })?;
+    }
 
     for b in &f.blocks {
         // Phis form a contiguous prefix.

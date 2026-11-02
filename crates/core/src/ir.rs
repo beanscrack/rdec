@@ -593,17 +593,20 @@ impl Function {
                     }
                 }
             }
-            let mut ops: Vec<VId> = Vec::new();
-            if let Terminator::Branch { cond, .. } = b.term {
-                if cond == v {
-                    out.push(UseSite {
-                        bb: b.id,
-                        instr: usize::MAX,
-                        slot: 0,
-                    });
-                }
+            // Terminator operands are uses. `Return` was missing here, which is
+            // how DCE came to delete the expression a function returns (B1).
+            let top: Option<VId> = match b.term {
+                Terminator::Branch { cond, .. } => Some(cond),
+                Terminator::Return(x) if x != NO_VAL => Some(x),
+                _ => None,
+            };
+            if top == Some(v) {
+                out.push(UseSite {
+                    bb: b.id,
+                    instr: usize::MAX,
+                    slot: 0,
+                });
             }
-            let _ = &mut ops;
         }
         out
     }
@@ -621,10 +624,11 @@ impl Function {
                     }
                 });
             }
-            if let Terminator::Branch { cond, .. } = &mut b.term {
-                if *cond == old {
-                    *cond = new;
-                }
+            // Match with a guard so the rewrite is one arm per terminator.
+            match &mut b.term {
+                Terminator::Branch { cond, .. } if *cond == old => *cond = new,
+                Terminator::Return(x) if *x == old => *x = new,
+                _ => {}
             }
         }
     }
