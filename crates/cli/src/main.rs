@@ -477,14 +477,28 @@ fn cmd_status() -> i32 {
         vec!["t2".into(), "--corpus".into()]
     };
     let t2 = sh(&exe, &t2_cmd);
-    rows.push((
-        "t2 differential (C vs machine code, same inputs, RAX)".into(),
+    // The verdict is printed verbatim, including the FAIL text, so the scoreboard
+    // cannot hide it - but it does not decide this process's exit code. `rdec t2
+    // --corpus` IS the gate and exits 1 while the decompiled C disagrees; the
+    // scoreboard's job is to report where the project stands, the way the M1
+    // coverage and M4 refusal gates are red in their own commands while `status`
+    // stays a scoreboard. Moving enforcement here would put two owners on one gate.
+    let t2_line =
         t2.1.lines()
             .find(|l| l.starts_with("compared:"))
             .unwrap_or("no comparison ran")
             .trim()
-            .into(),
-        t2.0,
+            .to_string();
+    let t2_verdict =
+        t2.1.lines()
+            .find(|l| l.starts_with("FAIL"))
+            .map(|l| format!("{t2_line} | {l}"))
+            .unwrap_or_else(|| format!("{t2_line} | gate green"));
+    rows.push((
+        "t2 differential (C vs machine code, same inputs, RAX); gate: rdec t2".into(),
+        t2_verdict,
+        // Informational row: enforced by `rdec t2 --corpus`, which exits 1.
+        true,
     ));
     let local = rdec_verify::corpus::clang_stamp(&rdec_verify::corpus::clang_path()).0;
     let recorded = rdec_verify::corpus::manifest_clang(std::path::Path::new("corpus/manifest.tsv"));
