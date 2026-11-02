@@ -637,6 +637,12 @@ struct Sub<'a> {
     /// Index into the decompiled side's function table.
     c_sym: usize,
     loops: bool,
+    /// Declared parameter kinds (XMM0 class; the shape came from the
+    /// signature, and the harness prototypes are spelled from it).
+    xargs: Vec<XArg>,
+    /// Declared return kind (XMM0 class): Int = compare RAX, F32/F64 =
+    /// compare XMM0's bits at that width.
+    xret: XRet,
 }
 
 /// Zero-extend every argument to 32 bits.
@@ -797,6 +803,9 @@ pub fn cmd_t2(args: &[String]) -> Result<i32, String> {
             text: out.text.clone(),
             c_sym: subs.len(),
             loops: loop_shaped(&s.f),
+            // The C corpus has no declared shapes: the integer model.
+            xargs: Vec::new(),
+            xret: XRet::Int,
         });
     }
     if subs.is_empty() {
@@ -1179,15 +1188,19 @@ pub fn cmd_t2(args: &[String]) -> Result<i32, String> {
 //    with the same bytes before every call. The RETURN value is what is
 //    compared; memory equivalence is NOT claimed — each side mutates its own
 //    window and nothing compares the windows afterwards.
-//  * **XMM0 class** — the honest float/double comparison (bitwise on XMM0's
-//    raw bits, so -0.0 vs 0.0 and NaN payloads are compared as bits, which is
-//    what the machine answers). The count is 0 and stays 0 until the lifter
-//    models it: ARG_REGS is RCX/RDX/R8/R9, so a float argument is an undef
-//    live-in (refused), and `ret` with XMM0 written and RAX unwritten lands in
-//    "returns RAX unwritten" — the emitted C returns the integer RAX. The
-//    gate prints the class line with its real count so the gap is a number,
-//    not a comment; a comparison over a set the lifter cannot express is a
-//    gate over nothing.
+//  * **XMM0 class** — signatures that carry `float`/`double`. The lifter
+//    seeds them from the DEMANGLED SIGNATURE (integers in RCX/RDX/R8/R9,
+//    floats in XMM0-3, in parallel; a float answers `ret` in XMM0), the
+//    emitted C declares the same types, and the comparison is BITWISE on
+//    XMM0's raw bits: 64 bits for a `double`, 32 for a `float` — the width
+//    the type names, per function, printed. `-0.0` vs `0.0` and NaN payloads
+//    compare as bits because that is the machine's answer. Member functions
+//    with float signatures join the window rules (`this` in RCX, buffer on
+//    one side, address integer on the other). The vectors are exactly
+//    representable values (small, negative, halves, 2^10, 2^20, -0.0): a
+//    bitwise agreement then means the bits travelled through the
+//    decompilation, and a disagreement means they did not — `0.1 + 0.2`
+//    would measure IEEE rounding, not this decompiler.
 //
 // Accounting closes: every lifted function lands in exactly one bucket
 // (compared+match, compared+mismatch, faulted, excluded-with-a-name, refused,
@@ -1196,7 +1209,13 @@ pub fn cmd_t2(args: &[String]) -> Result<i32, String> {
 /// The demangled text's signature: (return type, parameters). `"int add(int,
 /// int)"` -> `("int", ["int", "int"])`, `"int& Buffer::slot(int)"` ->
 /// `("int&", ["int"])`. The demangler spells parameters without names, so a
-/// plain comma split is the whole parse for the supported set.
+/// plain comma split is the whole parse for the supported set. The RETURN type
+/// is peeled off the end of the head (`crate::m8::return_type_of_head`, one
+/// parser, one rule): the name is the trailing identifier, its `Class::`
+/// segments and a destructor's `~`, so a declarator that spells the type
+/// against the name — `void *f(int)` — reports `void *`, not the empty string
+/// the constructor carries. Read as "no return type", a pointer-returning
+/// function is a class the comparison rules were written for, and it is not.
 fn split_signature(text: &str) -> Option<(String, Vec<String>)> {
     let open = text.find('(')?;
     let close = text.rfind(')')?;
@@ -1205,14 +1224,13 @@ fn split_signature(text: &str) -> Option<(String, Vec<String>)> {
     }
     let head = text[..open].trim_end();
     let params_s = text[open + 1..close].trim();
-    let qual = head.split_whitespace().last().unwrap_or(head);
-    let ret = head[..head.len() - qual.len()].trim();
+    let ret = crate::m8::return_type_of_head(head);
     let params = if params_s.is_empty() || params_s == "void" {
         Vec::new()
     } else {
         params_s.split(',').map(|p| p.trim().to_string()).collect()
     };
-    Some((ret.to_string(), params))
+    Some((ret, params))
 }
 
 /// The builtin integer types, as the demangler spells them (MSVC: `long` is
@@ -1246,14 +1264,6 @@ fn is_float_type(t: &str) -> bool {
     matches!(t.trim(), "float" | "double" | "long double")
 }
 
-fn takes_float(params: &[String]) -> Option<String> {
-    params
-        .iter()
-        .find(|p| is_float_type(p))
-        .cloned()
-        .or_else(|| params.iter().find(|p| p.contains("...")).cloned())
-}
-
 fn takes_pointerish(params: &[String]) -> Option<String> {
     params
         .iter()
@@ -1269,64 +1279,476 @@ fn takes_pointerish(params: &[String]) -> Option<String> {
         .cloned()
 }
 
-/// Why this signature is outside a class's comparison, `None` when it is
-/// inside. `max_params` is the register budget: 4 for the RAX class
-/// (RCX/RDX/R8/R9), 3 for the window class (`this` takes RCX).
+/// Which comparison class a signature falls in: `Ok(false)` = the RAX/window
+/// classes (builtin-integer in, builtin-integer out — the comparison is the
+/// full 64-bit RAX), `Ok(true)` = the XMM0 class (the signature carries
+/// `float`/`double`, and the lifter seeds XMM0-3 as parameters and answers
+/// from XMM0 under the shape the DEMANGLED SIGNATURE declares), `Err` = why
+/// the signature is outside every class.
 ///
-/// The float exclusions name the XMM0 class explicitly: the honest class
-/// exists (compare XMM0's raw bits), the lifter cannot express its inputs
-/// yet, and the reader should see that sentence, not infer it.
-fn signature_gap(text: &str, max_params: usize) -> Option<String> {
+/// `max_params` is the register budget: 4 for the RAX/XMM classes
+/// (RCX/RDX/R8/R9, and XMM0-3 in parallel — a declared float does NOT spend
+/// an integer slot, and a signature at the 4-parameter budget can use four of
+/// each class), 3 for the window classes (`this` takes RCX).
+fn signature_shape(text: &str, max_params: usize) -> Result<bool, String> {
     let (ret, params) = match split_signature(text) {
         Some(s) => s,
-        None => return Some("demangled text carries no parseable signature".to_string()),
+        None => return Err("demangled text carries no parseable signature".to_string()),
     };
     let ret = ret.trim();
     if ret == "void" {
-        return Some("returns void: no value to compare".to_string());
+        return Err("returns void: no value to compare".to_string());
     }
     if ret.contains('*') || ret.contains('&') {
-        return Some(
+        return Err(
             "returns a pointer/reference (address identity: the two sides do not share an address space)"
                 .to_string(),
         );
     }
-    if is_float_type(ret) {
-        return Some(
-            "returns float/double: the XMM0 comparison class (bitwise on XMM0's raw bits) — the lifter models the answer in RAX only, so no emitted C spells this value"
-                .to_string(),
-        );
+    let mut has_float = is_float_type(ret) && ret.trim() != "long double";
+    if ret.trim() == "long double" {
+        return Err("returns `long double` (x87 register stack, not modelled)".to_string());
     }
-    if !is_int_type(ret) {
-        return Some(format!(
-            "return type `{ret}` is not a builtin integer (the type model)"
+    if !has_float && !is_int_type(ret) {
+        return Err(format!(
+            "return type `{ret}` is not a builtin integer/float (the type model)"
         ));
     }
     if params.len() > max_params {
-        return Some(format!(
+        return Err(format!(
             "{} parameters: beyond the {} argument registers the model has",
             params.len(),
             max_params
         ));
     }
-    if let Some(p) = takes_float(&params) {
-        return Some(format!(
-            "takes a float/double parameter `{p}`: XMM0-3 are not modelled as arguments (ARG_REGS is RCX/RDX/R8/R9) — XMM0 class"
-        ));
-    }
-    if let Some(p) = takes_pointerish(&params) {
-        return Some(format!(
-            "takes a pointer/reference/by-value parameter `{p}`"
-        ));
+    if params.iter().any(|p| p.contains("...")) {
+        return Err("variadic (the stack area is not modelled)".to_string());
     }
     for p in &params {
+        let p = p.trim();
+        if p == "long double" {
+            return Err("takes a `long double` (x87 register stack, not modelled)".to_string());
+        }
+        if is_float_type(p) {
+            has_float = true;
+            continue;
+        }
+        if takes_pointerish(std::slice::from_ref(&p.to_string())).is_some() {
+            return Err(format!(
+                "takes a pointer/reference/by-value parameter `{p}`"
+            ));
+        }
         if !is_int_type(p) {
-            return Some(format!(
-                "parameter `{p}` is not a builtin integer (the type model)"
+            return Err(format!(
+                "parameter `{p}` is not a builtin integer/float (the type model)"
             ));
         }
     }
+    Ok(has_float)
+}
+
+/// The gap form: why this signature is outside EVERY comparison class.
+/// The classifier's tests read gaps; the pipeline reads `signature_shape`.
+#[cfg(test)]
+fn signature_gap(text: &str, max_params: usize) -> Option<String> {
+    signature_shape(text, max_params).err()
+}
+
+// ---------------------------------------------------------------------------
+// The XMM0 class: the harness side of the float ABI.
+// ---------------------------------------------------------------------------
+//
+// The rule, printed by the gate: **compare the 64-bit BIT PATTERN of XMM0 on
+// both sides for a `double`; for a `float` compare the 32-bit pattern** (the
+// width the type names — the `movss` the ABI caller must use zeroes bits
+// 127:32, so the low 32 are the whole answer; the gate prints which width it
+// compared, per function, and widens nothing to hide a disagreement).
+// `-0.0` vs `0.0` and NaN payloads compare BITWISE: that is the machine's
+// answer, and a float comparison that rounded it away would be measuring a
+// different question.
+//
+// The vectors are the same values on both sides, chosen to be EXACTLY
+// representable in binary — small values, negatives, halves, and a large
+// magnitude (2^20, 2^10). `0.1 + 0.2` is deliberately absent: its answer is
+// an IEEE-754 rounding event, and a gate built on rounding constants would
+// measure the rounding rules of two compilers, not this decompiler. Exact
+// values make a bitwise agreement mean "the bits travelled", and a bitwise
+// disagreement mean "the decompiler changed them". `-0.0` is a value, not a
+// rounding event: it is the cheapest proof that the comparison is bitwise.
+//
+// Two machine facts the corpus teaches, both measured with `llvm-objdump -d`
+// on the driver's own call sequence (see `xmm_machine_proto` for the bytes):
+// Windows x64 homes declared parameter `pos` in the register PAIR of that
+// position — pair k owns `RCX/RDX/R8/R9[k]` and `XMM0-3[k]` — so a
+// `__thiscall` member's first `double` is XMM1 (`?grow@Circle@@QEAANN@Z` opens
+// `movsd %xmm1, 0x8(%rsp)`) and a free `f(int, double)`'s double is XMM1 as
+// well. The driver therefore passes the declared arguments at their declared
+// positions and lets the compiler's call lowering write the pairs: hand-pinned
+// register variables land in the register named, and the call lowering then
+// overwrites the pair it owns, which is how a padded prototype fed the callee a
+// 0.0 dummy and made `grow` answer `radius + 0.0` on the machine side.
+// Second fact: clang's `-O0` shuffles a parameter through the NEXT pair
+// (`movsd [rsp+8], xmm1; movsd xmm0, [rsp+8]`), reading a register the ABI
+// declares caller-saved garbage. The IR models that read as `undef`, and the C
+// model reads undef as zero bits; the driver pins every float pair the
+// signature does NOT declare to 0.0 bits at the call, so both sides evaluate the
+// same convention — and the class line says exactly that, because a contract
+// the harness made must not read as a property of the machine.
+
+/// The float class of one parameter of a lifted XMM-class function, read off
+/// the DECLARED types the lifter recorded (`Function::param_tys` — the shape
+/// came from the demangled signature, so the harness prototype is symbol
+/// evidence on both sides of the comparison).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum XArg {
+    Int,
+    F32,
+    F64,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum XRet {
+    Int,
+    F32,
+    F64,
+}
+
+fn xarg_of(t: &Ty) -> XArg {
+    match t {
+        Ty::Float {
+            w: rdec_core::ty::FWidth::F32,
+        } => XArg::F32,
+        Ty::Float {
+            w: rdec_core::ty::FWidth::F64,
+        } => XArg::F64,
+        _ => XArg::Int,
+    }
+}
+
+/// The declared parameter kinds, in declaration order (member functions:
+/// `this` first, as the lifter seeded it). The source is `param_tys` — the
+/// DECLARED types (a float parameter's IR value is the u64 bit cell; only
+/// the declared type says it is a float).
+fn xmm_params(f: &Function) -> Vec<XArg> {
+    (0..f.params.len())
+        .map(|i| xarg_of(f.param_tys.get(i).unwrap_or(&Ty::u64())))
+        .collect()
+}
+
+fn xmm_ret(f: &Function) -> XRet {
+    match f.ret_ty {
+        Ty::Float {
+            w: rdec_core::ty::FWidth::F32,
+        } => XRet::F32,
+        Ty::Float {
+            w: rdec_core::ty::FWidth::F64,
+        } => XRet::F64,
+        _ => XRet::Int,
+    }
+}
+
+fn c_spelling(a: XArg) -> &'static str {
+    match a {
+        XArg::Int => "uint64_t",
+        XArg::F32 => "float",
+        XArg::F64 => "double",
+    }
+}
+
+/// The float vector rows, shared by every XMM-class function: the same eight
+/// rows per register slot, exactly representable (see the class comment).
+const FLOAT_ROWS: [[f64; 4]; 8] = [
+    [0.0, 1.0, 2.0, -1.0],
+    [0.5, -1.5, 2.25, 7.0],
+    [-0.0, 1048576.0, 0.5, 1024.0],
+    [-1024.0, -0.5, 3.0, 0.0],
+    [1.0, 0.0, -0.0, 0.5],
+    [2.0, 0.5, -1.5, -1024.0],
+    [-1.0, 2.25, 1048576.0, 3.0],
+    [7.0, -1024.0, -0.5, 1048576.0],
+];
+
+/// The shared float table for one function: slot k carries row value
+/// `FLOAT_ROWS[j][k]` encoded for that parameter's declared type — f64 bits
+/// for a double, f32 bits (zero-extended) for a float, raw bits for an
+/// integer slot (any defined bit pattern is fair for an integer: both sides
+/// see these exact words). Row 0 doubles as the all-zeros row an int slot
+/// reads as 0.
+fn xmm_vector(args: &[XArg]) -> Vec<[u64; 4]> {
+    FLOAT_ROWS
+        .iter()
+        .map(|row| {
+            let mut q = [0u64; 4];
+            for (k, v) in row.iter().enumerate() {
+                q[k] = match args.get(k).copied().unwrap_or(XArg::Int) {
+                    XArg::Int => v.to_bits(),
+                    // The generator's own conversion, at generation time, on
+                    // values exact in both widths: k/2^m with a small exponent
+                    // needs no rounding, so the f32 slot holds the same value.
+                    XArg::F32 => (*v as f32).to_bits() as u64,
+                    XArg::F64 => v.to_bits(),
+                };
+            }
+            q
+        })
+        .collect()
+}
+
+fn xmm_c_array(name: &str, vecs: &[[u64; 4]]) -> String {
+    // `unused` for one reason: a function that reads only some slots (a
+    // member with one declared double uses slot 0) leaves the rest of the
+    // shared table unread in that TU, and -Werror does not grade intent.
+    let mut s = format!("__attribute__((unused)) static const uint64_t {name}[][4] = {{\n");
+    for v in vecs {
+        s.push_str(&format!(
+            "  {{ {:#018x}ULL, {:#018x}ULL, {:#018x}ULL, {:#018x}ULL }},\n",
+            v[0], v[1], v[2], v[3]
+        ));
+    }
+    s.push_str("};\n");
+    s
+}
+
+/// The prototype the machine side declares for one XMM-class subject: the
+/// declared parameters, in declaration order, a member's `this` spelled as the
+/// address integer in slot 0. Nothing is padded, and that is a measurement,
+/// not a preference.
+///
+/// Windows x64 gives every parameter its home in the register PAIR of its
+/// POSITION: pair k owns `RCX/RDX/R8/R9[k]` and `XMM0-3[k]`, so declared
+/// parameter `pos` (`this` = 0) is register `pos` of its class — a member's
+/// first `double` is XMM1, and a free `f(int, double)`'s double is XMM1 too.
+/// The declared signature is therefore already the shape the callee reads.
+/// Padding it by counting the float class separately — the mistake that lived
+/// here — pushes the real argument one pair right: the callee reads the dummy.
+///
+/// clang 22.1.8, `-std=c17 -O0`, the corpus `?grow@Circle@@QEAANN@Z` linked in
+/// (the callee opens `movsd %xmm1, 0x8(%rsp)`, so the double must be in XMM1 at
+/// the call), `llvm-objdump -d` of the call sequence:
+///
+/// ```text
+/// extern double f(uint64_t, double, double);   // padded: what shipped
+///     movsd 0x30(%rsp), %xmm2                  ; the real double lands in XMM2
+///     xorps  %xmm1, %xmm1                      ; XMM1 = 0.0 AT THE CALL
+///     movq   0x28(%rsp), %rcx                  ; RCX = this
+///     call   f                                 ; callee answers radius + 0.0
+///
+/// extern double f(uint64_t, double);           // the declared signature
+///     movsd 0x30(%rsp), %xmm1                  ; XMM1 = p
+///     movq   0x28(%rsp), %rcx                  ; RCX = this
+///     call   f                                 ; radius 1.5 + p 0.5 -> 2.0
+/// ```
+///
+/// (Measured running, not read off the lowering: the padded shape answers
+/// 1.5 = `radius + 0.0`, the declared shape answers 2.0.)
+///
+/// Err names the parameter that has no register pair to live in; the pipeline
+/// has already bounded the signature to four pairs, so this is the net, not a
+/// second opinion.
+fn xmm_machine_proto(args: &[XArg]) -> Result<Vec<XArg>, String> {
+    if let Some(pos) = (0..args.len()).find(|p| *p >= 4) {
+        return Err(format!(
+            "declared parameter {pos} has no register pair (Windows x64 has four)"
+        ));
+    }
+    Ok(args.to_vec())
+}
+
+const X_ARG_INT_REGS: [&str; 4] = ["rcx", "rdx", "r8", "r9"];
+const X_ARG_FLOAT_REGS: [&str; 4] = ["xmm0", "xmm1", "xmm2", "xmm3"];
+
+/// Where the TARGET ABI delivers declared parameter `pos` (the register pair,
+/// above) versus where the LIFTER seeded it, for a FREE function: the lifter
+/// counts each register class separately (`int f(int, double)` = RCX + XMM0),
+/// the paired-slot rule spells that RCX + XMM1. A member needs no check — the
+/// lifter seeds members by pair, which is the ABI rule.
+///
+/// Wherever the two disagree, the C side and the machine side would read
+/// different registers, and the comparison would measure the model gap. Name
+/// it and keep the function out of the match column.
+fn xmm_home_mismatch(args: &[XArg]) -> Option<String> {
+    let (mut ic, mut fc) = (0usize, 0usize);
+    for (pos, a) in args.iter().enumerate() {
+        let (seeded, delivered) = match a {
+            XArg::Int => (
+                X_ARG_INT_REGS.get(ic).copied(),
+                X_ARG_INT_REGS.get(pos).copied(),
+            ),
+            _ => (
+                X_ARG_FLOAT_REGS.get(fc).copied(),
+                X_ARG_FLOAT_REGS.get(pos).copied(),
+            ),
+        };
+        match (seeded, delivered) {
+            (Some(s), Some(d)) if s == d => {}
+            (Some(s), Some(d)) => {
+                return Some(format!(
+                    "the lifter seeds parameter {pos} ({}) in {s}, the target ABI delivers it in {d} (paired slots vs per-class seeding): the two sides would read different registers",
+                    match a {
+                        XArg::Int => "integer",
+                        XArg::F32 => "float",
+                        XArg::F64 => "double",
+                    }
+                ))
+            }
+            // Past the four pairs: the signature classifier already refuses it.
+            _ => return None,
+        }
+        match a {
+            XArg::Int => ic += 1,
+            _ => fc += 1,
+        }
+    }
     None
+}
+
+/// The machine side's float extern: declared types from the signature
+/// (`xmm_machine_proto` — the declared parameters at their declared positions,
+/// bound to the decorated COFF symbol by the asm label).
+fn native_extern_x(alias: &str, sym: &str, ret: XRet, proto: &[XArg]) -> String {
+    let rs = match ret {
+        XRet::Int => "uint64_t",
+        XRet::F32 => "float",
+        XRet::F64 => "double",
+    };
+    let ps: Vec<String> = proto.iter().map(|a| c_spelling(*a).to_string()).collect();
+    format!(
+        "extern {rs} {alias}({}) __asm__(\"{sym}\");\n",
+        ps.join(", ")
+    )
+}
+
+fn xmm_call_bits(ret: XRet, call: &str) -> String {
+    match ret {
+        XRet::Int => format!("  uint64_t bits = (uint64_t){call};\n  return bits;\n"),
+        XRet::F64 => format!(
+            "  double r = {call};\n  uint64_t bits; memcpy(&bits, &r, 8);\n  return bits;\n"
+        ),
+        XRet::F32 => format!(
+            "  float r = {call};\n  uint32_t b32; memcpy(&b32, &r, 4);\n  return (uint64_t)b32;\n"
+        ),
+    }
+}
+
+/// The machine-side XMM wrapper: build the typed arguments by bit-memcpy from
+/// the shared table at their DECLARED positions, call through the declared
+/// prototype, and leave the answer's bits as a u64 for the shared one-line
+/// protocol. `win` (the window+float class) wraps `this` with a real 4 KiB
+/// buffer preloaded from `W[j]` — the same bytes the C side preloads into its
+/// `rdec_mem` window, regenerated before EVERY call, so the two sides start
+/// each call from one image.
+///
+/// Nothing is hand-pinned to a register any more, and the measurement is in
+/// `xmm_machine_proto`: the register pins this wrapper used to emit
+/// (`register double x1 __asm__("xmm1") = t1;` + `"+x"`) DO land their value in
+/// the named register — and then the call lowering overwrites the pair it owns,
+/// because the pin was paired with a padded prototype: `movsd 0x40(%rsp),%xmm2`
+/// (the real double), `movsd 0x50(%rsp),%xmm1` (the dummy's 0.0) at the `call`.
+/// Passing the declared arguments at their declared positions makes clang write
+/// the pairs the callee reads, with no inline asm in the driver.
+fn native_wrapper_x(idx: usize, sym_alias: &str, args: &[XArg], ret: XRet, win: bool) -> String {
+    let mut s = format!("static uint64_t x{idx}(unsigned j) {{\n");
+    if win {
+        s.push_str("  uint64_t buf[512]; memcpy(buf, W[j], sizeof buf);\n");
+    }
+    let mut call_args: Vec<String> = Vec::new();
+    // The float pairs the signature declares: the rest are pinned to 0.0.
+    let mut declared_pairs: Vec<usize> = Vec::new();
+    for (pos, &kind) in args.iter().enumerate() {
+        // The shared table's slot k is declared parameter k for a free
+        // function and k-1 for a member (`this` is the window, not a slot).
+        let slot = if win { pos.saturating_sub(1) } else { pos };
+        match kind {
+            XArg::Int if win && pos == 0 => {
+                // `this` = the buffer's address; RCX is pair 0's integer home,
+                // which is exactly where clang lowers a first argument.
+                call_args.push("(uint64_t)(uintptr_t)buf".to_string());
+            }
+            XArg::Int => call_args.push(format!("FV{idx}[j][{slot}]")),
+            k => {
+                declared_pairs.push(pos);
+                let ty = c_spelling(k);
+                let n = if k == XArg::F32 { 4 } else { 8 };
+                s.push_str(&format!(
+                    "  {ty} p{pos}; memcpy(&p{pos}, &FV{idx}[j][{slot}], {n});\n"
+                ));
+                call_args.push(format!("p{pos}"));
+            }
+        }
+    }
+    // Float pairs the signature does not declare are pinned to 0.0 bits,
+    // matching the C model's undef = 0 (the class comment owns the rule). A
+    // register-asm variable plus `"+x"` is what actually reaches xmm{k}: the
+    // measured `__asm__ volatile("" : "+x"(v))` with a plain local lets clang
+    // pick the register, and it picks xmm0 for all four.
+    for k in 0..4 {
+        if !declared_pairs.contains(&k) {
+            s.push_str(&format!(
+                "  register double z{k} __asm__(\"xmm{k}\") = 0.0;\n  __asm__ volatile(\"\" : \"+x\"(z{k}));\n"
+            ));
+        }
+    }
+    s.push_str(&xmm_call_bits(
+        ret,
+        &format!("{}({})", sym_alias, call_args.join(", ")),
+    ));
+    s.push_str("}\n");
+    s
+}
+
+/// The decompiled side's XMM wrapper: same table, same bit-memcpy, calling
+/// the emitter's own C text (whose declared prototype the emitter spelled
+/// from the same signature-declared shape). `sabotage` flips one bit of the
+/// FIRST XMM wrapper's answer: the gate's proof that it can fail.
+fn c_wrapper_x(
+    idx: usize,
+    cname: &str,
+    args: &[XArg],
+    ret: XRet,
+    win: bool,
+    sabotage: bool,
+) -> String {
+    let mut s = format!("static uint64_t w{idx}(unsigned j) {{\n");
+    if win {
+        s.push_str(&format!(
+            "  memcpy(&rdec_mem[RDEC_ADDR({WIN_ADDR}ULL)], W[j], sizeof(W[j]));\n"
+        ));
+    }
+    let mut call_args: Vec<String> = Vec::new();
+    if win {
+        call_args.push(format!("(uint64_t)RDEC_ADDR({WIN_ADDR}ULL)"));
+    }
+    for (k, a) in args.iter().enumerate() {
+        if win && k == 0 {
+            continue;
+        }
+        let slot = if win { k - 1 } else { k };
+        if *a == XArg::Int {
+            call_args.push(format!("FV{idx}[j][{slot}]"));
+        } else {
+            let ty = c_spelling(*a);
+            let n = if *a == XArg::F32 { 4 } else { 8 };
+            s.push_str(&format!(
+                "  {ty} p{k}; memcpy(&p{k}, &FV{idx}[j][{slot}], {n});\n"
+            ));
+            call_args.push(format!("p{k}"));
+        }
+    }
+    let flip = sabotage && idx == 0;
+    let bits = xmm_call_bits(ret, &format!("{cname}({})", call_args.join(", ")));
+    // The sabotage flips one bit of the bits the wrapper RETURNS — the
+    // compared quantity — exactly once, on the DECOMPILED-C side (index 0 =
+    // the first subject). Both return spellings are covered: an F32 answer
+    // returns the 32-bit pattern, and the flip lands inside those 32 bits.
+    let bits = if flip {
+        bits.replace("return bits;", "return bits ^ 1ULL;")
+            .replace("return (uint64_t)b32;", "return (uint64_t)(b32 ^ 1u);")
+    } else {
+        bits
+    };
+    s.push_str(&bits);
+    s.push_str("}\n");
+    s
 }
 
 /// Evaluate a statically-named address: a constant, or arithmetic on
@@ -1563,11 +1985,19 @@ fn native_extern(alias: &str, sym: &str) -> String {
     format!("extern uint64_t {alias}(uint64_t, uint64_t, uint64_t, uint64_t) __asm__(\"{sym}\");\n")
 }
 
-fn c_wrapper_cpp(idx: usize, cname: &str, sabotage: bool) -> String {
+fn c_wrapper_cpp(idx: usize, cname: &str, n_args: usize, sabotage: bool) -> String {
     let flip = if sabotage && idx == 0 { "^ 1ULL" } else { "" };
+    // The call passes exactly the emitted signature's arity: clang -Werror
+    // counts arguments, and under a declared shape `int add(int, int)`
+    // really has two parameters (the machine side's driver may still declare
+    // the ABI's four registers — the callee just does not read the rest).
+    let args: Vec<String> = (0..n_args.min(4))
+        .map(|k| ["(int64_t)a", "(int64_t)b", "(int64_t)c", "(int64_t)d"][k].to_string())
+        .collect();
     format!(
         "static uint64_t w{idx}(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {{\n\
-         \x20 return (uint64_t){cname}((int64_t)a, (int64_t)b, (int64_t)c, (int64_t)d) {flip};\n}}\n"
+         \x20 return (uint64_t){cname}({}) {flip};\n}}\n",
+        args.join(", ")
     )
 }
 
@@ -1583,6 +2013,10 @@ pub(crate) struct T2CppReport {
     pub rax_runs: usize,
     pub win_functions: usize,
     pub win_runs: usize,
+    /// XMM0 class: free functions and window members together — the
+    /// comparison is the bit pattern of XMM0, at the declared width.
+    pub xmm_functions: usize,
+    pub xmm_runs: usize,
     pub compared: usize,
     pub matched: usize,
     pub mismatched: usize,
@@ -1654,8 +2088,8 @@ pub fn cmd_t2_cpp(args: &[String]) -> Result<i32, String> {
         return Ok(1);
     }
     println!(
-        "OK: the decompiled C computes the same 64-bit RAX as the C++ machine code on all {} runs, over {} RAX-class + {} window-class functions",
-        rep.compared, rep.rax_functions, rep.win_functions
+        "OK: the decompiled C computes the same machine answer as the C++ machine code on all {} runs (64-bit RAX for the RAX/window classes, the bit pattern of XMM0 for the XMM0 class), over {} RAX-class + {} window-class + {} XMM0-class functions",
+        rep.compared, rep.rax_functions, rep.win_functions, rep.xmm_functions
     );
     Ok(0)
 }
@@ -1678,6 +2112,10 @@ pub(crate) fn t2_cpp_run(
     // ---- 1. classify every lifted function into exactly one bucket ---------
     let mut subs: Vec<Sub> = Vec::new(); // RAX class
     let mut wsubs: Vec<Sub> = Vec::new(); // window class
+    let mut xsubs: Vec<Sub> = Vec::new(); // XMM0 class (free functions)
+    let mut wxsubs: Vec<Sub> = Vec::new(); // XMM0 class over the window (`this` + floats)
+    let mut xfv: Vec<Vec<[u64; 4]>> = Vec::new(); // the shared float tables, per XMM function
+    let mut wxfv: Vec<Vec<[u64; 4]>> = Vec::new();
     let mut taken_names: HashSet<String> = HashSet::new();
     let mut refusal_keys: BTreeMap<String, usize> = BTreeMap::new();
     let mut path_tot = 0usize;
@@ -1762,21 +2200,25 @@ pub(crate) fn t2_cpp_run(
             skip(&mut rep, &g, &tag);
             continue;
         }
-        // Class assignment: kind decides, the signature refines.
+        // Class assignment: kind decides, the signature refines. A signature
+        // that carries float/double is the XMM0 class — its parameter kinds
+        // and return kind were declared by the demangled signature and
+        // seeded by the lifter; the comparison is bitwise on XMM0's bits.
         let class: Result<&str, String> = match kind {
             rdec_demangle::SymKind::FreeFunction | rdec_demangle::SymKind::StaticMember { .. } => {
-                match signature_gap(text, 4) {
-                    None => Ok("rax"),
-                    Some(g) => Err(g),
+                match signature_shape(text, 4) {
+                    Err(g) => Err(g),
+                    Ok(false) => Ok("rax"),
+                    Ok(true) => Ok("xmm"),
                 }
             }
             rdec_demangle::SymKind::MemberFunction { thunk: true, .. } => {
                 Err("vcall/displacement thunk (the offset adjustment is not modelled)".to_string())
             }
-            rdec_demangle::SymKind::MemberFunction { .. } => match signature_gap(text, 3) {
-                Some(g) => Err(g),
-                None => match this_window_taint(&s.f) {
-                    Ok(()) => Ok("win"),
+            rdec_demangle::SymKind::MemberFunction { .. } => match signature_shape(text, 3) {
+                Err(g) => Err(g),
+                Ok(has_float) => match this_window_taint(&s.f) {
+                    Ok(()) => Ok(if has_float { "wxmm" } else { "win" }),
                     Err(g) => Err(g),
                 },
             },
@@ -1796,7 +2238,7 @@ pub(crate) fn t2_cpp_run(
                 continue;
             }
         };
-        if touches_memory_outside_the_frame(&s.f) && class == "rax" {
+        if touches_memory_outside_the_frame(&s.f) && matches!(class, "rax" | "xmm") {
             skip(&mut rep, "memory outside the modelled frame", &tag);
             continue;
         }
@@ -1808,22 +2250,52 @@ pub(crate) fn t2_cpp_run(
             );
             continue;
         }
-        if subs.len() + wsubs.len() >= limit {
+        if subs.len() + wsubs.len() + xsubs.len() + wxsubs.len() >= limit {
             skip(&mut rep, "--limit reached", &tag);
             continue;
+        }
+        let xargs = xmm_params(&s.f);
+        let xret = xmm_ret(&s.f);
+        // A FREE function's parameter homes: the lifter seeds each register
+        // class separately, the target ABI delivers by register PAIR. Where the
+        // two disagree, the C side and the machine side read different
+        // registers, and the comparison measures the model gap instead of the
+        // decompilation — so it is not run, and the reason is printed. (No
+        // corpus function hits it today: every compared float parameter sits at
+        // a position where the two rules name the same register.)
+        if class == "xmm" {
+            if let Some(g) = xmm_home_mismatch(&xargs) {
+                skip(&mut rep, &g, &tag);
+                continue;
+            }
         }
         let sub = Sub {
             s,
             text: out.text.clone(),
             c_sym: match class {
                 "rax" => subs.len(),
-                _ => wsubs.len(),
+                "win" => wsubs.len(),
+                "xmm" => xsubs.len(),
+                _ => wxsubs.len(),
             },
             loops: loop_shaped(&s.f),
+            xargs: xargs.clone(),
+            xret,
         };
         match class {
             "rax" => subs.push(sub),
-            _ => wsubs.push(sub),
+            "win" => wsubs.push(sub),
+            "xmm" => {
+                // The table the wrappers read: slot k encoded for parameter k.
+                xfv.push(xmm_vector(&xargs));
+                xsubs.push(sub);
+            }
+            _ => {
+                // Window+float: slot k of the table is DECLARED parameter
+                // k+1 (`this` is the window/buffer, not a table slot).
+                wxfv.push(xmm_vector(&xargs[1.min(xargs.len())..]));
+                wxsubs.push(sub);
+            }
         }
     }
 
@@ -1845,6 +2317,25 @@ pub(crate) fn t2_cpp_run(
             wjobs.push((k, v));
         }
     }
+    // XMM0-class jobs run the eight float vectors. A loop-shaped float
+    // function runs them too: eight rows is a bounded loop, and the loop
+    // guard exists to keep the integer stress values out of loop bodies
+    // (huge magnitudes, 2^63), which the float rows do not contain.
+    let mut xjobs: Vec<(usize, usize)> = Vec::new();
+    for (k, rows) in xfv.iter().enumerate() {
+        for v in 0..rows.len() {
+            xjobs.push((k, v));
+        }
+    }
+    let mut wxjobs: Vec<(usize, usize)> = Vec::new();
+    for (k, rows) in wxfv.iter().enumerate() {
+        for v in 0..rows.len() {
+            wxjobs.push((k, v));
+        }
+    }
+    // Global job ids: [0, jobs) RAX, then window, then XMM, then window+XMM.
+    let xbase = jobs.len() + wjobs.len();
+    let wxbase = xbase + xjobs.len();
     let ret32 = subs
         .iter()
         .chain(wsubs.iter())
@@ -1861,7 +2352,12 @@ pub(crate) fn t2_cpp_run(
     );
     decomp.push_str(PRELUDE);
     decomp.push('\n');
-    for sb in subs.iter().chain(wsubs.iter()) {
+    for sb in subs
+        .iter()
+        .chain(wsubs.iter())
+        .chain(xsubs.iter())
+        .chain(wxsubs.iter())
+    {
         decomp.push_str(&sb.text);
         decomp.push('\n');
     }
@@ -1880,7 +2376,12 @@ pub(crate) fn t2_cpp_run(
         src.push_str(&c_array(&vecs));
         src.push_str("typedef uint64_t (*Fn)(uint64_t, uint64_t, uint64_t, uint64_t);\n");
         for sb in &subs {
-            src.push_str(&c_wrapper_cpp(sb.c_sym, &sb.s.cname, sabotage));
+            src.push_str(&c_wrapper_cpp(
+                sb.c_sym,
+                &sb.s.cname,
+                sb.s.f.params.len(),
+                sabotage,
+            ));
         }
         src.push_str("static const Fn FN[] = {\n");
         for sb in &subs {
@@ -1932,6 +2433,82 @@ pub(crate) fn t2_cpp_run(
         wdecomp_exe = ep;
     }
 
+    // --- XMM0 class: the free shape and the window shape --------------------
+    // One runner per shape (the wrappers differ by the `this` argument), the
+    // same one-line protocol as the window runner: the wrapper takes the
+    // vector index, preloads the window (where there is one), builds the
+    // typed arguments by BIT-memcpy from the function's FV table, calls, and
+    // reports the answer's bits.
+    let mut xdecomp_exe = PathBuf::new();
+    if !xsubs.is_empty() {
+        let mut src = decomp.clone();
+        for sb in &xsubs {
+            src.push_str(&xmm_c_array(&format!("FV{}", sb.c_sym), &xfv[sb.c_sym]));
+        }
+        src.push_str("typedef uint64_t (*FnX)(unsigned);\n");
+        for sb in &xsubs {
+            src.push_str(&c_wrapper_x(
+                sb.c_sym,
+                &sb.s.cname,
+                &sb.xargs,
+                sb.xret,
+                false,
+                sabotage,
+            ));
+        }
+        src.push_str("static const FnX FN[] = {\n");
+        for sb in &xsubs {
+            src.push_str(&format!("  w{},\n", sb.c_sym));
+        }
+        src.push_str("};\n");
+        src.push_str(&job_tables(&xjobs));
+        src.push_str(&main_body_win(xjobs.len()));
+        let sp = PathBuf::from(format!("{out_dir}/t2cpp_xdecomp.c"));
+        let ep = PathBuf::from(format!("{out_dir}/t2cpp_xdecomp.exe"));
+        std::fs::write(&sp, &src).map_err(|e| format!("{}: {e}", sp.display()))?;
+        builds.push(Build {
+            src: sp,
+            exe: ep.clone(),
+            obj: None,
+        });
+        xdecomp_exe = ep;
+    }
+    let mut wxdecomp_exe = PathBuf::new();
+    if !wxsubs.is_empty() {
+        let mut src = decomp.clone();
+        src.push_str(&window_c_array(&wins));
+        for sb in &wxsubs {
+            src.push_str(&xmm_c_array(&format!("FV{}", sb.c_sym), &wxfv[sb.c_sym]));
+        }
+        src.push_str("typedef uint64_t (*FnX)(unsigned);\n");
+        for sb in &wxsubs {
+            src.push_str(&c_wrapper_x(
+                sb.c_sym,
+                &sb.s.cname,
+                &sb.xargs,
+                sb.xret,
+                true,
+                sabotage,
+            ));
+        }
+        src.push_str("static const FnX FN[] = {\n");
+        for sb in &wxsubs {
+            src.push_str(&format!("  w{},\n", sb.c_sym));
+        }
+        src.push_str("};\n");
+        src.push_str(&job_tables(&wxjobs));
+        src.push_str(&main_body_win(wxjobs.len()));
+        let sp = PathBuf::from(format!("{out_dir}/t2cpp_wxdecomp.c"));
+        let ep = PathBuf::from(format!("{out_dir}/t2cpp_wxdecomp.exe"));
+        std::fs::write(&sp, &src).map_err(|e| format!("{}: {e}", sp.display()))?;
+        builds.push(Build {
+            src: sp,
+            exe: ep.clone(),
+            obj: None,
+        });
+        wxdecomp_exe = ep;
+    }
+
     // --- the machine side: one driver per object per class ---
     let mut order: Vec<String> = Vec::new();
     let mut by_obj: HashMap<String, Vec<usize>> = HashMap::new();
@@ -1947,6 +2524,20 @@ pub(crate) fn t2_cpp_run(
             order.push(sb.s.obj.clone());
         }
         wby_obj.entry(sb.s.obj.clone()).or_default().push(k);
+    }
+    let mut xby_obj: HashMap<String, Vec<usize>> = HashMap::new();
+    for (k, sb) in xsubs.iter().enumerate() {
+        if !xby_obj.contains_key(&sb.s.obj) {
+            order.push(sb.s.obj.clone());
+        }
+        xby_obj.entry(sb.s.obj.clone()).or_default().push(k);
+    }
+    let mut wxby_obj: HashMap<String, Vec<usize>> = HashMap::new();
+    for (k, sb) in wxsubs.iter().enumerate() {
+        if !wxby_obj.contains_key(&sb.s.obj) {
+            order.push(sb.s.obj.clone());
+        }
+        wxby_obj.entry(sb.s.obj.clone()).or_default().push(k);
     }
     for obj in &order {
         let ks = by_obj.get(obj).cloned().unwrap_or_default();
@@ -2038,6 +2629,138 @@ pub(crate) fn t2_cpp_run(
             });
             drivers.push((format!("{obj} [window]"), wep, wid_ids.clone()));
         }
+        // --- XMM0-class drivers: declared prototypes, bit-precise args ---
+        let xks = xby_obj.get(obj).cloned().unwrap_or_default();
+        if !xks.is_empty() {
+            let mut xsrc = format!(
+                "/* rdec t2 --cpp: the machine-code XMM side of {obj}. The externs\n\
+                 \x20  carry the DECLARED prototypes (the demangled signature). */\n\
+                 #include <stdint.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n"
+            );
+            for &k in &xks {
+                xsrc.push_str(&xmm_c_array(
+                    &format!("FV{}", xsubs[k].c_sym),
+                    &xfv[xsubs[k].c_sym],
+                ));
+            }
+            let mut syms: Vec<String> = Vec::new();
+            for &k in &xks {
+                let sym = xsubs[k].s.sym.clone();
+                if !syms.contains(&sym) {
+                    syms.push(sym);
+                }
+            }
+            for (i, sym) in syms.iter().enumerate() {
+                let k = *xks.iter().find(|kk| xsubs[**kk].s.sym == *sym).unwrap();
+                xsrc.push_str(&native_extern_x(
+                    &format!("xn{i}"),
+                    sym,
+                    xsubs[k].xret,
+                    &xsubs[k].xargs,
+                ));
+            }
+            for &k in &xks {
+                let i = syms.iter().position(|s| *s == xsubs[k].s.sym).unwrap();
+                xsrc.push_str(&native_wrapper_x(
+                    xsubs[k].c_sym,
+                    &format!("xn{i}"),
+                    &xsubs[k].xargs,
+                    xsubs[k].xret,
+                    false,
+                ));
+            }
+            xsrc.push_str("typedef uint64_t (*FnX)(unsigned);\n");
+            xsrc.push_str("static const FnX FN[] = {\n");
+            for &k in &xks {
+                xsrc.push_str(&format!("  x{},\n", xsubs[k].c_sym));
+            }
+            xsrc.push_str("};\n");
+            let mut xlocal: Vec<(usize, usize)> = Vec::new();
+            let mut xids: Vec<usize> = Vec::new();
+            for (g, (k, v)) in xjobs.iter().enumerate() {
+                if xks.contains(k) {
+                    xlocal.push((xks.iter().position(|kk| kk == k).unwrap(), *v));
+                    xids.push(xbase + g);
+                }
+            }
+            xsrc.push_str(&job_tables(&xlocal));
+            xsrc.push_str(&main_body_win(xlocal.len()));
+            let sp = PathBuf::from(format!("{out_dir}/t2cpp_xnative_{}.c", stem_of(obj)));
+            let ep = PathBuf::from(format!("{out_dir}/t2cpp_xnative_{}.exe", stem_of(obj)));
+            std::fs::write(&sp, &xsrc).map_err(|e| format!("{}: {e}", sp.display()))?;
+            builds.push(Build {
+                src: sp,
+                exe: ep.clone(),
+                obj: Some(obj.clone()),
+            });
+            drivers.push((format!("{obj} [xmm]"), ep, xids));
+        }
+        let wxks = wxby_obj.get(obj).cloned().unwrap_or_default();
+        if !wxks.is_empty() {
+            let mut xsrc = format!(
+                "/* rdec t2 --cpp: the machine-code window+XMM side of {obj}. */\n\
+                 #include <stdint.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n"
+            );
+            xsrc.push_str(&window_c_array(&wins));
+            for &k in &wxks {
+                xsrc.push_str(&xmm_c_array(
+                    &format!("FV{}", wxsubs[k].c_sym),
+                    &wxfv[wxsubs[k].c_sym],
+                ));
+            }
+            let mut syms: Vec<String> = Vec::new();
+            for &k in &wxks {
+                let sym = wxsubs[k].s.sym.clone();
+                if !syms.contains(&sym) {
+                    syms.push(sym);
+                }
+            }
+            for (i, sym) in syms.iter().enumerate() {
+                let k = *wxks.iter().find(|kk| wxsubs[**kk].s.sym == *sym).unwrap();
+                xsrc.push_str(&native_extern_x(
+                    &format!("xm{i}"),
+                    sym,
+                    wxsubs[k].xret,
+                    &xmm_machine_proto(&wxsubs[k].xargs)
+                        .expect("the signature classifier bounded the register pairs"),
+                ));
+            }
+            for &k in &wxks {
+                let i = syms.iter().position(|s| *s == wxsubs[k].s.sym).unwrap();
+                xsrc.push_str(&native_wrapper_x(
+                    wxsubs[k].c_sym,
+                    &format!("xm{i}"),
+                    &wxsubs[k].xargs,
+                    wxsubs[k].xret,
+                    true,
+                ));
+            }
+            xsrc.push_str("typedef uint64_t (*FnX)(unsigned);\n");
+            xsrc.push_str("static const FnX FN[] = {\n");
+            for &k in &wxks {
+                xsrc.push_str(&format!("  x{},\n", wxsubs[k].c_sym));
+            }
+            xsrc.push_str("};\n");
+            let mut wxlocal: Vec<(usize, usize)> = Vec::new();
+            let mut wxids: Vec<usize> = Vec::new();
+            for (g, (k, v)) in wxjobs.iter().enumerate() {
+                if wxks.contains(k) {
+                    wxlocal.push((wxks.iter().position(|kk| kk == k).unwrap(), *v));
+                    wxids.push(wxbase + g);
+                }
+            }
+            xsrc.push_str(&job_tables(&wxlocal));
+            xsrc.push_str(&main_body_win(wxlocal.len()));
+            let sp = PathBuf::from(format!("{out_dir}/t2cpp_wxnative_{}.c", stem_of(obj)));
+            let ep = PathBuf::from(format!("{out_dir}/t2cpp_wxnative_{}.exe", stem_of(obj)));
+            std::fs::write(&sp, &xsrc).map_err(|e| format!("{}: {e}", sp.display()))?;
+            builds.push(Build {
+                src: sp,
+                exe: ep.clone(),
+                obj: Some(obj.clone()),
+            });
+            drivers.push((format!("{obj} [xmm-window]"), ep, wxids));
+        }
         if !ks.is_empty() {
             let sp = PathBuf::from(format!("{out_dir}/t2cpp_native_{}.c", stem_of(obj)));
             let ep = PathBuf::from(format!("{out_dir}/t2cpp_native_{}.exe", stem_of(obj)));
@@ -2085,22 +2808,35 @@ pub(crate) fn t2_cpp_run(
     println!(
         "paths: RAX defined on {path_def} of {path_tot} return paths over the lifted functions; runnable only when EVERY path is defined"
     );
+    let f64n = xsubs
+        .iter()
+        .chain(wxsubs.iter())
+        .filter(|s| s.xret == XRet::F64)
+        .count();
+    let f32n = xsubs
+        .iter()
+        .chain(wxsubs.iter())
+        .filter(|s| s.xret == XRet::F32)
+        .count();
     println!(
-        "classes: RAX-compared: {rf} functions ({rs} runs) | WINDOW-compared: {wf} functions ({ws} runs) | XMM0-compared: 0 functions / 0 runs",
+        "classes: RAX-compared: {rf} functions ({rs} runs) | WINDOW-compared: {wf} functions ({ws} runs) | XMM0-compared: {xf} functions ({xs} runs: {f64n} F64 compare the 64-bit XMM0, {f32n} F32 compare its 32 bits)",
         rf = subs.len(),
         rs = jobs.len(),
         wf = wsubs.len(),
-        ws = wjobs.len()
+        ws = wjobs.len(),
+        xf = xsubs.len() + wxsubs.len(),
+        xs = xjobs.len() + wxjobs.len(),
     );
     println!(
-        "XMM0 class: 0 is the honest count while the lifter's ARG_REGS is RCX/RDX/R8/R9: a float argument is an undef live-in (refused) and a float answer reaches `ret` with RAX unwritten (excluded, named). The comparison itself is ready to wire (bitwise on XMM0's raw bits, so -0.0 vs 0.0 and NaN payloads compare as bits — the machine's answer); the class opens the day the lifter models XMM0-3 as arguments and an XMM0 return."
+        "XMM0 class rule: the BIT PATTERN of XMM0 is compared (a `double` answers in its 64 low bits, a `float` in its 32 — the width the type names is the width compared, nothing is widened to hide a disagreement); -0.0 vs 0.0 and NaN payloads compare as bits, which is the machine's answer. Parameters arrive in the register PAIR of their declared position (pair k owns RCX/RDX/R8/R9[k] AND XMM0-3[k], so a member's first `double` is XMM1 and a free `f(int,double)`'s is XMM1): the driver passes the declared arguments at their declared positions and the compiler's own call lowering writes the pairs — measured, `movsd 0x30(%rsp),%xmm1; movq 0x28(%rsp),%rcx; call` against a callee that opens `movsd %xmm1,0x8(%rsp)`. Float pairs the signature does NOT declare are pinned to 0.0 bits at the machine call (a clang -O0 shuffle reads a pair the ABI leaves undefined: the C model reads undef as zero, the driver supplies the same zero — that is a harness contract, printed here, and the IR records the undef read that forced it)."
     );
     let skipped_n: usize = rep.excluded.values().map(|v| v.len()).sum();
     println!(
-        "runnable: {} functions on both sides ({} RAX + {} window), {skipped_n} not runnable ({})",
-        subs.len() + wsubs.len(),
+        "runnable: {} functions on both sides ({} RAX + {} window + {} XMM0), {skipped_n} not runnable ({})",
+        subs.len() + wsubs.len() + xsubs.len() + wxsubs.len(),
         subs.len(),
         wsubs.len(),
+        xsubs.len() + wxsubs.len(),
         rep.excluded
             .iter()
             .map(|(k, v)| format!("{} {k}", v.len()))
@@ -2108,12 +2844,12 @@ pub(crate) fn t2_cpp_run(
             .join(" | ")
     );
     println!(
-        "inputs: {} shared integer vectors, {} shared 4 KiB window byte images (regenerated before EVERY window call; the RETURN value is what is compared, memory equivalence is NOT claimed)",
+        "inputs: {} shared integer vectors, {} shared 4 KiB window byte images (regenerated before EVERY window call; the RETURN value is what is compared, memory equivalence is NOT claimed), 8 shared float vectors (exactly representable values: small, negative, halves, 2^10, 2^20, and -0.0 — chosen so bitwise agreement means the bits travelled, not that two compilers rounded alike)",
         vecs.len(),
         wins.len()
     );
     println!(
-        "return width: {ret32}/{} of the runnable functions declare uint32_t (their answer reaches RAX through a 32-bit write), the rest int64_t",
+        "return width: {ret32}/{} of the runnable integer-class functions declare uint32_t (their answer reaches RAX through a 32-bit write), the rest int64_t",
         subs.len() + wsubs.len()
     );
     println!(
@@ -2150,6 +2886,24 @@ pub(crate) fn t2_cpp_run(
         crun_vals.extend(r.vals);
         c_faults.extend(r.faults);
     }
+    if !xjobs.is_empty() {
+        let r = drain(
+            &xdecomp_exe,
+            &(0..xjobs.len()).map(|g| xbase + g).collect::<Vec<_>>(),
+        );
+        restarts += r.restarts;
+        crun_vals.extend(r.vals);
+        c_faults.extend(r.faults);
+    }
+    if !wxjobs.is_empty() {
+        let r = drain(
+            &wxdecomp_exe,
+            &(0..wxjobs.len()).map(|g| wxbase + g).collect::<Vec<_>>(),
+        );
+        restarts += r.restarts;
+        crun_vals.extend(r.vals);
+        c_faults.extend(r.faults);
+    }
     let mut native: BTreeMap<usize, u64> = BTreeMap::new();
     let mut n_faults: Vec<(usize, String)> = Vec::new();
     for (obj, exe, ids) in &drivers {
@@ -2162,19 +2916,34 @@ pub(crate) fn t2_cpp_run(
     }
     rep.native_values = native.clone();
 
-    // Global job ids: [0, jobs.len()) are RAX-class, the rest window-class.
-    let all_jobs: Vec<(bool, usize, usize)> = jobs
+    // Global job ids: [0, jobs) RAX, [jobs, jobs+wjobs) window,
+    // [xbase, xbase+xjobs) XMM0, [wxbase, ...) window+XMM0.
+    #[derive(Copy, Clone)]
+    enum Cls {
+        Rax,
+        Win,
+        Xmm,
+        Wxmm,
+    }
+    let all_jobs: Vec<(Cls, usize, usize)> = jobs
         .iter()
-        .map(|(k, v)| (false, *k, *v))
-        .chain(wjobs.iter().map(|(k, v)| (true, *k, *v)))
+        .map(|(k, v)| (Cls::Rax, *k, *v))
+        .chain(wjobs.iter().map(|(k, v)| (Cls::Win, *k, *v)))
+        .chain(xjobs.iter().map(|(k, v)| (Cls::Xmm, *k, *v)))
+        .chain(wxjobs.iter().map(|(k, v)| (Cls::Wxmm, *k, *v)))
         .collect();
 
     println!(
-        "compare: the full 64-bit RAX on every shared vector; the C side widened from its declared return type; nothing masked, nothing truncated"
+        "compare: RAX-class jobs on the full 64-bit RAX (the C side widened from its declared return type); XMM0-class jobs on the BIT PATTERN of XMM0 — 64 bits for a `double`, 32 for a `float`; nothing masked, nothing truncated"
     );
     let mut fn_runs: BTreeMap<String, (usize, usize, usize)> = BTreeMap::new(); // tag -> (runs, mismatch, fault)
-    for (g, (is_win, k, v)) in all_jobs.iter().enumerate() {
-        let sb = if *is_win { &wsubs[*k] } else { &subs[*k] };
+    for (g, (cls, k, v)) in all_jobs.iter().enumerate() {
+        let sb = match cls {
+            Cls::Rax => &subs[*k],
+            Cls::Win => &wsubs[*k],
+            Cls::Xmm => &xsubs[*k],
+            Cls::Wxmm => &wxsubs[*k],
+        };
         let tag = format!("{} :: {}", sb.s.obj, sb.s.sym);
         let row = fn_runs.entry(tag.clone()).or_insert((0, 0, 0));
         let (Some(&x), Some(&y)) = (native.get(&g), crun_vals.get(&g)) else {
@@ -2189,9 +2958,41 @@ pub(crate) fn t2_cpp_run(
         } else {
             rep.mismatched += 1;
             row.1 += 1;
+            // A mismatch names its width: the integer classes compare the
+            // 64-bit RAX, the XMM0 class the declared width's bit pattern.
+            let (width, args_s) = match cls {
+                Cls::Rax | Cls::Win => (
+                    "RAX/64",
+                    format!(
+                        "args=[{:#x},{:#x},{:#x},{:#x}]",
+                        vecs[*v][0], vecs[*v][1], vecs[*v][2], vecs[*v][3]
+                    ),
+                ),
+                Cls::Xmm => (
+                    match sb.xret {
+                        XRet::Int => "RAX/64",
+                        XRet::F32 => "XMM0/32",
+                        XRet::F64 => "XMM0/64",
+                    },
+                    format!(
+                        "fv=[{:#x},{:#x},{:#x},{:#x}]",
+                        xfv[*k][*v][0], xfv[*k][*v][1], xfv[*k][*v][2], xfv[*k][*v][3]
+                    ),
+                ),
+                Cls::Wxmm => (
+                    match sb.xret {
+                        XRet::Int => "RAX/64",
+                        XRet::F32 => "XMM0/32",
+                        XRet::F64 => "XMM0/64",
+                    },
+                    format!(
+                        "fv=[{:#x},{:#x},{:#x},{:#x}]",
+                        wxfv[*k][*v][0], wxfv[*k][*v][1], wxfv[*k][*v][2], wxfv[*k][*v][3]
+                    ),
+                ),
+            };
             rep.mismatches.push(format!(
-                "{} :: {}  args=[{:#x},{:#x},{:#x},{:#x}]  machine={:#018x}  C={:#018x}",
-                sb.s.obj, sb.s.sym, vecs[*v][0], vecs[*v][1], vecs[*v][2], vecs[*v][3], x, y
+                "{width}  {tag}  {args_s}  machine={x:#018x}  C={y:#018x}"
             ));
         }
     }
@@ -2199,6 +3000,8 @@ pub(crate) fn t2_cpp_run(
     rep.rax_runs = jobs.len();
     rep.win_functions = wsubs.len();
     rep.win_runs = wjobs.len();
+    rep.xmm_functions = xsubs.len() + wxsubs.len();
+    rep.xmm_runs = xjobs.len() + wxjobs.len();
 
     // Function-level buckets: the accounting the task demands, in priority
     // order: a mismatch outranks a fault, a fault outranks "compared+match".
@@ -2238,8 +3041,13 @@ pub(crate) fn t2_cpp_run(
     {
         let mut seen: BTreeSet<String> = BTreeSet::new();
         for (g, why) in n_faults.iter().chain(c_faults.iter()) {
-            if let Some((is_win, k, v)) = all_jobs.get(*g) {
-                let sb = if *is_win { &wsubs[*k] } else { &subs[*k] };
+            if let Some((cls, k, v)) = all_jobs.get(*g) {
+                let sb = match cls {
+                    Cls::Rax => &subs[*k],
+                    Cls::Win => &wsubs[*k],
+                    Cls::Xmm => &xsubs[*k],
+                    Cls::Wxmm => &wxsubs[*k],
+                };
                 let who = format!("{} :: {} vec {v}", sb.s.obj, sb.s.sym);
                 if seen.insert(who.clone()) {
                     println!("  FAULT {who}: {why}");
@@ -2264,7 +3072,109 @@ mod tests {
     use rdec_core::ir::{BinOp, Function, Op, Terminator};
     use rdec_core::ty::Ty;
 
-    /// The RAX-class signature filter, on the corpus' own demangled texts.
+    /// The machine-side prototype IS the declared signature: Windows x64 homes
+    /// declared parameter `pos` in the register PAIR of position `pos` (pair k
+    /// owns RCX/RDX/R8/R9[k] AND XMM0-3[k]), so a member's first `double` is
+    /// already XMM1 and padding only pushes the real argument a pair right.
+    /// Measured on clang 22.1.8 `-O0` with the corpus `grow` linked in —
+    /// `llvm-objdump -d` of the call, and both shapes RUN:
+    ///   `(u64, double, double)` -> `movsd 0x30(%rsp),%xmm2; xorps %xmm1,%xmm1`
+    ///     = XMM1 0.0 at the call, callee answers radius + 0.0 = 1.5.
+    ///   `(u64, double)`         -> `movsd 0x30(%rsp),%xmm1; movq 0x28(%rsp),%rcx`
+    ///     = callee answers radius 1.5 + p 0.5 = 2.0.
+    #[test]
+    fn the_machine_prototype_is_the_declared_signature_in_register_pairs() {
+        // grow: this + one double. No dummy, no padding — XMM1 is pair 1.
+        assert_eq!(
+            xmm_machine_proto(&[XArg::Int, XArg::F64]).unwrap(),
+            vec![XArg::Int, XArg::F64]
+        );
+        // this + int + double: the int is pair 1 (rdx), the double pair 2 (xmm2).
+        assert_eq!(
+            xmm_machine_proto(&[XArg::Int, XArg::Int, XArg::F64]).unwrap(),
+            vec![XArg::Int, XArg::Int, XArg::F64]
+        );
+        // A free function is its own prototype too.
+        assert_eq!(
+            xmm_machine_proto(&[XArg::Int, XArg::F64]).unwrap(),
+            vec![XArg::Int, XArg::F64]
+        );
+        // A fifth parameter has no pair: loud, never a guess.
+        assert!(
+            xmm_machine_proto(&[XArg::F64, XArg::F64, XArg::F64, XArg::F64, XArg::F64]).is_err()
+        );
+        // The wrapper declares that prototype, passes the table at the declared
+        // positions, and pins nothing: no register-asm argument is left in it.
+        let w = native_wrapper_x(3, "xm0", &[XArg::Int, XArg::F64], XRet::F64, true);
+        assert!(
+            w.contains("double r = xm0((uint64_t)(uintptr_t)buf, p1);"),
+            "{w}"
+        );
+        assert!(w.contains("memcpy(buf, W[j], sizeof buf)"), "{w}");
+        assert!(!w.contains("xmm1\""), "{w}");
+        // The float pairs the signature does not declare ARE pinned to 0.0 bits
+        // (the C model reads an undef read of one as zero), pair 1 is not.
+        assert!(
+            w.contains("register double z0 __asm__(\"xmm0\") = 0.0;"),
+            "{w}"
+        );
+        assert!(
+            w.contains("register double z2 __asm__(\"xmm2\") = 0.0;"),
+            "{w}"
+        );
+        assert!(!w.contains("z1 __asm__"), "{w}");
+        // The SAME window image on both sides, reloaded before every call.
+        let c = c_wrapper_x(
+            3,
+            "Circle_grow_double",
+            &[XArg::Int, XArg::F64],
+            XRet::F64,
+            true,
+            false,
+        );
+        assert!(
+            c.contains("memcpy(&rdec_mem[RDEC_ADDR(8192ULL)], W[j], sizeof(W[j]));"),
+            "{c}"
+        );
+        assert!(
+            c.contains("Circle_grow_double((uint64_t)RDEC_ADDR(8192ULL), p1)"),
+            "{c}"
+        );
+    }
+
+    /// The free-function home check: the lifter seeds each register CLASS
+    /// separately, the target ABI delivers by register PAIR. Where the two name
+    /// different registers the two sides would read different bytes, so the
+    /// function is not run and the reason is printed.
+    #[test]
+    fn a_free_function_is_compared_only_where_the_two_home_rules_agree() {
+        assert_eq!(xmm_home_mismatch(&[XArg::F64]), None);
+        assert_eq!(xmm_home_mismatch(&[XArg::F64, XArg::F64]), None);
+        assert_eq!(xmm_home_mismatch(&[XArg::Int, XArg::Int]), None);
+        assert_eq!(
+            xmm_home_mismatch(&[XArg::F64, XArg::F64, XArg::F64, XArg::F64]),
+            None
+        );
+        // `double f(int, double)`: seeded XMM0 (the lifter's per-class count),
+        // delivered XMM1 (pair 1). The corpus has no such function; if one
+        // appears, this is the named reason that keeps it out of the match
+        // column instead of a mismatch that blames the decompiler.
+        let g = xmm_home_mismatch(&[XArg::Int, XArg::F64]).unwrap();
+        assert!(g.contains("parameter 1"), "{g}");
+        assert!(g.contains("xmm0") && g.contains("xmm1"), "{g}");
+        // The mirror case: a float at pair 0, an int at pair 1 — the lifter
+        // seeds the int RCX, the ABI delivers it in RDX.
+        assert!(
+            xmm_home_mismatch(&[XArg::F64, XArg::Int])
+                .unwrap()
+                .contains("rcx"),
+            "{}",
+            xmm_home_mismatch(&[XArg::F64, XArg::Int]).unwrap()
+        );
+    }
+
+    /// The signature classifier, on the corpus' own demangled texts. Floats
+    /// are the XMM0 class now (`Ok(true)`), not a gap.
     #[test]
     fn the_signature_rule_admits_builtins_and_names_everything_else() {
         assert_eq!(signature_gap("int add(int, int)", 4), None);
@@ -2274,12 +3184,13 @@ mod tests {
             None
         );
         assert_eq!(signature_gap("int window(int, int, int, int)", 4), None);
-        assert!(signature_gap("double add(double, double)", 4)
+        assert_eq!(signature_shape("double add(double, double)", 4), Ok(true));
+        assert_eq!(signature_shape("float fl(float)", 4), Ok(true));
+        assert_eq!(signature_shape("int pick(int, double)", 4), Ok(true));
+        assert_eq!(signature_shape("int only(int)", 4), Ok(false));
+        assert!(signature_gap("long double ld(long double)", 4)
             .unwrap()
-            .contains("XMM0"));
-        assert!(signature_gap("float fl(float)", 4)
-            .unwrap()
-            .contains("XMM0"));
+            .contains("long double"));
         assert!(signature_gap("int chain(signed char, unsigned char, char, short, unsigned short, int, unsigned int, long, unsigned long, __int64, unsigned __int64, float, double, bool, wchar_t)", 4)
             .is_some());
         assert!(signature_gap("int byval(struct P2)", 4)
@@ -2411,9 +3322,20 @@ mod tests {
     /// The sabotage hook exists and lands on wrapper 0 of the C side only.
     #[test]
     fn the_sabotage_hook_flips_exactly_one_bit_of_the_first_c_wrapper() {
-        assert!(c_wrapper_cpp(0, "f", true).contains("^ 1ULL"));
-        assert!(!c_wrapper_cpp(1, "f", true).contains('^'));
-        assert!(!c_wrapper_cpp(0, "f", false).contains('^'));
+        assert!(c_wrapper_cpp(0, "f", 4, true).contains("^ 1ULL"));
+        assert!(!c_wrapper_cpp(1, "f", 4, true).contains('^'));
+        assert!(!c_wrapper_cpp(0, "f", 4, false).contains('^'));
+        // A declared-shape function is called at its own arity.
+        let two = c_wrapper_cpp(1, "add", 2, false);
+        assert!(two.contains("(int64_t)a, (int64_t)b)"), "{two}");
+        assert!(!two.contains("(int64_t)c)"), "{two}");
+        // The XMM0 class's own sabotage hook: the flip lands in the
+        // compared bits at the width the type names (32 for F32).
+        let f32w = c_wrapper_x(0, "f3", &[XArg::F32], XRet::F32, false, true);
+        assert!(f32w.contains("b32 ^ 1u"), "{f32w}");
+        let f64w = c_wrapper_x(0, "sq", &[XArg::F64], XRet::F64, false, true);
+        assert!(f64w.contains("bits ^ 1ULL"), "{f64w}");
+        assert!(!c_wrapper_x(1, "sq", &[XArg::F64], XRet::F64, false, true).contains('^'));
     }
 
     /// The window table is deterministic (both harnesses embed it verbatim)
@@ -2529,6 +3451,206 @@ mod tests {
 
     fn refuse_not_broken(rep: &T2CppReport) -> usize {
         rep.refused + rep.broken
+    }
+
+    /// The XMM0 comparison class, hermetic: `float f3(float)` and
+    /// `double sq(double)`, both `x + x`, hand-assembled (`addss/addss` and
+    /// `addsd` on XMM0, then `ret`). Lifted under the shapes their decorated
+    /// names declare — parameter in XMM0, answer in XMM0 — emitted as C that
+    /// declares `float`/`double`, run on both sides, and compared on the BIT
+    /// PATTERN of XMM0: 32 bits for the float, 64 for the double. `-0.0` is
+    /// in the table on purpose: `-0.0 + -0.0 = -0.0` must match bits, and any
+    /// implementation that compared values (or normalised the sign) would
+    /// pass it — a flipped bit must not, and the sabotage pass proves the
+    /// gate sees one.
+    #[test]
+    fn float_and_double_answers_are_value_verified_on_the_bits_of_xmm0() {
+        let cc = std::env::var("CC").unwrap_or_else(|_| "clang".to_string());
+        if Command::new(&cc).arg("--version").output().is_err() {
+            eprintln!("SKIP: {cc} is not on PATH");
+            return;
+        }
+        let dir = std::env::temp_dir().join("rdec_t2xmm_hermetic");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let asm = concat!(
+            ".file \"xmm_demo.s\"\n",
+            ".text\n",
+            ".globl \"?f3@@YAMM@Z\"\n",
+            "\"?f3@@YAMM@Z\":\n",
+            ".byte 0xF3, 0x0F, 0x58, 0xC0\n", // addss xmm0, xmm0
+            ".byte 0xC3\n",
+            ".globl \"?sq@@YANN@Z\"\n",
+            "\"?sq@@YANN@Z\":\n",
+            ".byte 0xF2, 0x0F, 0x58, 0xC0\n", // addsd xmm0, xmm0
+            ".byte 0xC3\n",
+        );
+        let sp = dir.join("xmm_demo.s");
+        let op = dir.join("xmm_demo.obj");
+        std::fs::write(&sp, asm).expect("write .s");
+        let out = Command::new(&cc)
+            .arg("-target")
+            .arg("x86_64-pc-windows-msvc")
+            .arg("-c")
+            .arg(&sp)
+            .arg("-o")
+            .arg(&op)
+            .output()
+            .expect("run clang");
+        assert!(
+            out.status.success(),
+            "clang must assemble the hand-written object: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let obj = op.to_str().unwrap().to_string();
+        let out_dir = dir.join("gen");
+        let rep = t2_cpp_run(
+            std::slice::from_ref(&obj),
+            out_dir.to_str().unwrap(),
+            8,
+            usize::MAX,
+            false,
+        )
+        .expect("the gate runs on the hermetic float object");
+        assert_eq!(rep.xmm_functions, 2, "both are XMM0 class: {rep:?}");
+        assert_eq!(rep.rax_functions, 0);
+        assert_eq!(rep.win_functions, 0);
+        assert_eq!(refuse_not_broken(&rep), 0, "nothing refused/broken");
+        assert_eq!(rep.compared, 16, "8 vectors per function");
+        assert_eq!(rep.mismatched, 0, "mismatches: {:?}", rep.mismatches);
+        // The machine's own answers, known from the bytes: f3 is the first
+        // symbol (job ids 0..8), sq the second (8..16). Slot 0 of row v is
+        // FLOAT_ROWS[v][0]; the answer is 2x.
+        let f3 = |v: usize| -> u64 {
+            let x = FLOAT_ROWS[v][0] as f32;
+            (x + x).to_bits() as u64
+        };
+        let sq = |v: usize| -> u64 {
+            let x = FLOAT_ROWS[v][0];
+            (x + x).to_bits()
+        };
+        for v in 0..8 {
+            assert_eq!(rep.native_values.get(&v), Some(&f3(v)), "f3 vec {v}");
+            assert_eq!(rep.native_values.get(&(8 + v)), Some(&sq(v)), "sq vec {v}");
+        }
+        // The bitwise rule, spelled out on the rows that make it real:
+        assert_eq!(f3(2), 0x8000_0000, "-0.0f keeps its sign bit");
+        assert_eq!(sq(2), 0x8000_0000_0000_0000, "-0.0 keeps its sign bit");
+        assert_eq!(f3(3), (-2048.0f32).to_bits() as u64, "a large magnitude");
+        // The sabotage the task demands: one flipped bit on the C side, in
+        // the compared bits at the declared width (32 for F32 — the flip
+        // lands inside the 32 that are compared, never in the ignored upper
+        // half). The gate must catch it on every vector of f3 and leave sq
+        // matching: 8 mismatches, 8 matches.
+        let bad = t2_cpp_run(
+            std::slice::from_ref(&obj),
+            out_dir.to_str().unwrap(),
+            8,
+            usize::MAX,
+            true,
+        )
+        .expect("the sabotage pass runs");
+        assert_eq!(bad.compared, 16, "the same jobs run");
+        assert_eq!(
+            bad.mismatched, 8,
+            "f3 flipped, every vector: {:?}",
+            bad.mismatches
+        );
+        assert_eq!(bad.matched, 8, "sq untouched");
+    }
+
+    /// The XMM0 class OVER THE WINDOW — the shape `Circle::grow(double)` has,
+    /// and the shape no other test in this file covered: a member whose `this`
+    /// is a window and whose declared `double` must arrive in XMM1 (pair 1,
+    /// because `this` spends pair 0). Hand-assembled `addsd xmm1,[rcx];
+    /// movapd xmm0,xmm1; ret` = `this->d + p`, so the answer is pinned:
+    /// `W[v][0] + FLOAT_ROWS[v][0]` bitwise.
+    ///
+    /// This is the gate that catches the delivery bug it was written for. With
+    /// a padded machine prototype the callee reads XMM1 = 0.0 and answers
+    /// `W[v][0] + 0.0` while the decompiled C answers `W[v][0] + p` — the exact
+    /// 5-mismatch signature the corpus `grow` printed. The free-function float
+    /// test above cannot see that: its parameter is pair 0 either way.
+    /// The sabotage pass proves the comparison can fail.
+    #[test]
+    fn a_member_float_answer_is_value_verified_through_the_window_and_xmm1() {
+        let cc = std::env::var("CC").unwrap_or_else(|_| "clang".to_string());
+        if Command::new(&cc).arg("--version").output().is_err() {
+            eprintln!("SKIP: {cc} is not on PATH");
+            return;
+        }
+        let dir = std::env::temp_dir().join("rdec_t2wxmm_hermetic");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let asm = concat!(
+            ".file \"wx_demo.s\"\n",
+            ".text\n",
+            ".globl \"?grow@Circle@@QEAANN@Z\"\n",
+            "\"?grow@Circle@@QEAANN@Z\":\n",
+            // movq %rcx, %rax                -> RAX defined on the path (the
+            //                                  gate runs only functions whose
+            //                                  every return path writes it)
+            ".byte 0x48, 0x89, 0xC8\n",
+            // addsd xmm1, qword ptr [rax]    -> xmm1 = p + this->d
+            ".byte 0xF2, 0x0F, 0x58, 0x08\n",
+            // movapd xmm0, xmm1              -> the answer leaves in XMM0
+            ".byte 0x66, 0x0F, 0x28, 0xC1\n",
+            ".byte 0xC3\n",
+        );
+        let sp = dir.join("wx_demo.s");
+        let op = dir.join("wx_demo.obj");
+        std::fs::write(&sp, asm).expect("write .s");
+        let out = Command::new(&cc)
+            .arg("-target")
+            .arg("x86_64-pc-windows-msvc")
+            .arg("-c")
+            .arg(&sp)
+            .arg("-o")
+            .arg(&op)
+            .output()
+            .expect("run clang");
+        assert!(
+            out.status.success(),
+            "clang must assemble the hand-written object: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let obj = op.to_str().unwrap().to_string();
+        let out_dir = dir.join("gen");
+        let rep = t2_cpp_run(
+            std::slice::from_ref(&obj),
+            out_dir.to_str().unwrap(),
+            8,
+            usize::MAX,
+            false,
+        )
+        .expect("the gate runs on the hand-written member");
+        assert_eq!(rep.xmm_functions, 1, "the window+float class: {rep:?}");
+        assert_eq!(rep.rax_functions, 0);
+        assert_eq!(rep.win_functions, 0, "`this` is a float member's");
+        assert_eq!(refuse_not_broken(&rep), 0, "nothing refused/broken");
+        assert_eq!(rep.compared, 8, "eight float vectors");
+        assert_eq!(rep.mismatched, 0, "mismatches: {:?}", rep.mismatches);
+        // The machine's own answers, from the bytes and the shared tables: the
+        // window's first word is `this->d`, slot 0 of the row is `p`.
+        let wins = window_table(8);
+        for v in 0..8 {
+            let d = f64::from_bits(wins[v][0]);
+            let p = FLOAT_ROWS[v][0];
+            assert_eq!(
+                rep.native_values.get(&v),
+                Some(&(d + p).to_bits()),
+                "vec {v}: the callee must add the delivered double, not 0.0"
+            );
+        }
+        // One flipped bit on the C side of a window+float job: caught.
+        let bad = t2_cpp_run(
+            std::slice::from_ref(&obj),
+            out_dir.to_str().unwrap(),
+            8,
+            usize::MAX,
+            true,
+        )
+        .expect("the sabotage pass runs");
+        assert_eq!(bad.compared, 8, "the same jobs run");
+        assert_eq!(bad.mismatched, 8, "{:?}", bad.mismatches);
     }
 
     #[test]
