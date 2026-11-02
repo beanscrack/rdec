@@ -216,6 +216,72 @@ pub fn clang_path() -> String {
     std::env::var("RDEC_CLANG").unwrap_or_else(|_| "clang".to_string())
 }
 
+/// The compiler that produced the corpus, as `(version, target triple)`.
+///
+/// Object hashes are a function of the compiler, so a manifest that moves
+/// between clang 20 and clang 22 is *expected*, not a regression: recording the
+/// version turns "the hashes changed" into "different compiler", and a gate that
+/// wants stability compares two runs on the same toolchain (see
+/// `.github/workflows/ci.yml`). Asserting byte-identical codegen across compiler
+/// versions tests clang, not RDec.
+pub fn clang_stamp(clang: &str) -> (String, String) {
+    let ver = Command::new(clang)
+        .arg("--version")
+        .output()
+        .ok()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        })
+        .unwrap_or_else(|| "unknown".into());
+    let tgt = Command::new(clang)
+        .arg("-dumpmachine")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|| "unknown".into());
+    (ver, tgt)
+}
+
+/// The `# clang:` line a manifest was written with, if present.
+pub fn manifest_clang(path: &Path) -> String {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| {
+            t.lines()
+                .find(|l| l.starts_with("# clang:"))
+                .map(|l| l["# clang:".len()..].trim().to_string())
+        })
+        .unwrap_or_else(|| "unrecorded".into())
+}
+
+/// Zero the COFF `TimeDateStamp` (offset 4) of an AMD64 object.
+///
+/// COFF objects embed the build clock, so an unnormalized corpus is not a
+/// fingerprint of anything: measured locally, two runs of the same clang over
+/// the same sources produced 120/120 different hashes at *identical sizes* --
+/// the signature of a fixed-width volatile field, not a codegen change. The
+/// manifest is the contract the gates consume, so the stamp is normalized and
+/// that fact is recorded in the manifest header. The check is guarded on the
+/// Machine field, so this never rewrites something that is not an AMD64 object.
+pub fn normalize_coff_stamp(bytes: &mut [u8]) -> bool {
+    // A COFF *object* header starts at offset 0 with Machine (there is no image
+    // signature field), and TimeDateStamp follows at offset 4. Checking offset 2
+    // reads NumberOfSections and silently disables the normalization.
+    if bytes.len() < 20 || u16::from_le_bytes([bytes[0], bytes[1]]) != 0x8664 {
+        return false;
+    }
+    if bytes[4..8] == [0, 0, 0, 0] {
+        return false; // already normalized; report "unchanged"
+    }
+    bytes[4..8].copy_from_slice(&[0, 0, 0, 0]);
+    true
+}
+
 /// Compile every snippet at every requested `-O` level.
 pub fn generate(out: &Path, opts: &[&str], clang: &str) -> Report {
     let src_dir = out.join("src");
@@ -241,6 +307,12 @@ pub fn generate(out: &Path, opts: &[&str], clang: &str) -> Report {
             let status = Command::new(clang)
                 .arg(format!("-{opt}"))
                 .arg("-std=c17")
+                // No CodeView debug sections: they embed the source path, which
+                // is a reproducibility hazard and not machine code.
+                // (Reproducible *stamps* are normalized afterwards; clang cannot
+                // be told from this driver -- `/Brepro` is clang-cl only, and
+                // `-Xclang -brepro` is unknown in clang 22. Both measured.)
+                .arg("-g0")
                 .arg("-c")
                 .arg(&src)
                 .arg("-o")
@@ -260,7 +332,13 @@ pub fn generate(out: &Path, opts: &[&str], clang: &str) -> Report {
                 }
             }
             match fs::read(&obj) {
-                Ok(bytes) => {
+                Ok(mut bytes) => {
+                    if normalize_coff_stamp(&mut bytes) {
+                        // Write the normalized object back, so the artifact on
+                        // disk and the manifest hash agree, and a downstream
+                        // byte diff of two builds is empty.
+                        let _ = fs::write(&obj, &bytes);
+                    }
                     let h = fnv1a64(&bytes);
                     rep.built += 1;
                     rep.entries.push(Entry {
@@ -284,7 +362,10 @@ pub fn generate(out: &Path, opts: &[&str], clang: &str) -> Report {
 
     // manifest.tsv: gates consume this, so write it even when some builds failed
     // (a partial manifest with a failure list is more debuggable than none).
-    let mut m = String::from("name\topt\tobj\tbytes\tfnv1a64\n");
+    let (ver, tgt) = clang_stamp(clang);
+    let mut m = format!(
+        "# clang: {ver}\n# target: {tgt}\n# normalized: COFF TimeDateStamp zeroed at object offset 4\nname\topt\tobj\tbytes\tfnv1a64\n"
+    );
     for ((name, opt), (path, bytes, hash)) in &manifest {
         m.push_str(&format!(
             "{name}\t{opt}\t{}\t{bytes}\t{hash:016x}\n",
@@ -298,6 +379,27 @@ pub fn generate(out: &Path, opts: &[&str], clang: &str) -> Report {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coff_stamp_normalization_targets_the_real_field() {
+        // Offsets are the whole point: Machine at 0, TimeDateStamp at 4 in a
+        // COFF object. A guard on the wrong offset silently disables the
+        // normalization and the corpus stops being reproducible.
+        let mut obj = vec![0u8; 20];
+        obj[0..2].copy_from_slice(&0x8664u16.to_le_bytes());
+        obj[2..4].copy_from_slice(&6u16.to_le_bytes()); // NumberOfSections
+        obj[4..8].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        assert!(normalize_coff_stamp(&mut obj));
+        assert_eq!(&obj[4..8], &[0, 0, 0, 0]);
+        assert!(!normalize_coff_stamp(&mut obj), "already normalized");
+
+        // Anything that is not an AMD64 object must survive untouched.
+        let mut other = vec![0u8; 20];
+        other[0..2].copy_from_slice(&0x014cu16.to_le_bytes()); // i386
+        other[4..8].copy_from_slice(&0xdead_beefu32.to_le_bytes());
+        assert!(!normalize_coff_stamp(&mut other));
+        assert_eq!(&other[4..8], &0xdead_beefu32.to_le_bytes());
+    }
 
     /// Corpus integrity checks that must hold without invoking a compiler:
     /// unique names, every snippet exports `f`, no libc dependency (the corpus

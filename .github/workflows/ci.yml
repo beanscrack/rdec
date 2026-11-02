@@ -43,10 +43,20 @@ jobs:
       - name: flags (T1 grid against real EFLAGS)
         run: cargo run -q -p rdec-cli -- flags
 
-      - name: corpus (rebuild, and the manifest must not move)
+      - name: corpus (two builds, same toolchain, byte-identical manifest)
+        # The determinism claim worth testing: the same compiler, twice, must
+        # produce the same corpus. The old step ran `git diff --exit-code`, which
+        # asserted byte-identical codegen against the committed manifest -- that
+        # compares clang versions (the runner has 20.1.8, the manifest was built
+        # with 22.1.8), not RDec. The manifest now records its compiler, and
+        # `status` re-parses every object's Machine field.
         run: |
           cargo run -q -p rdec-cli -- corpus
-          git diff --exit-code corpus/manifest.tsv
+          cargo run -q -p rdec-cli -- corpus --out corpus-a
+          Copy-Item corpus-a/manifest.tsv m1.tsv
+          cargo run -q -p rdec-cli -- corpus --out corpus-a
+          Copy-Item corpus-a/manifest.tsv m2.tsv
+          fc.exe /b m1.tsv m2.tsv
 
       - name: status (prints section 9's table from the commands above)
         run: cargo run -q -p rdec-cli -- status

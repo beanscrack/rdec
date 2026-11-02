@@ -1,3 +1,7 @@
 target/
 corpus/obj/
 *.obj
+corpus-a/
+corpus-b/
+m1.tsv
+m2.tsv

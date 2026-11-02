@@ -392,6 +392,19 @@ fn cmd_status() -> i32 {
     ));
 
     rows.push(corpus_row());
+    let local = rdec_verify::corpus::clang_stamp(&rdec_verify::corpus::clang_path()).0;
+    let recorded = rdec_verify::corpus::manifest_clang(std::path::Path::new("corpus/manifest.tsv"));
+    let same = recorded == local;
+    rows.push((
+        "corpus toolchain".into(),
+        if same {
+            format!("manifest written by this clang ({local})")
+        } else {
+            format!("recorded: {recorded} | local: {local} (hashes track the compiler)")
+        },
+        // Informational: object bytes are a function of the compiler version.
+        true,
+    ));
 
     println!("| check | result |");
     println!("|---|---|");
@@ -428,7 +441,10 @@ fn corpus_row() -> (String, String, bool) {
     let mut n = 0usize;
     let mut bytes = 0usize;
     let mut bad = Vec::new();
-    for line in man.lines().skip(1) {
+    for line in man
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.starts_with("name\topt"))
+    {
         let mut it = line.split('\t');
         let (Some(name), Some(opt), Some(path)) = (it.next(), it.next(), it.next()) else {
             continue;

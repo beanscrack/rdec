@@ -649,6 +649,18 @@ clean; 20 tests green (15 gate + 5 oracle, including the T1 hardware run);
 `selftest` 5/5; `corpus` 120/120 AMD64 objects. `flags.rs` is untouched by this
 commit, so the measured T1 result (9.7 × 10⁹ probes, 0 mismatches) still stands.
 
+### Measured on the first CI run (2026-11-02, GitHub-hosted windows-latest)
+
+| item | result |
+|---|---|
+| fmt, clippy `-D warnings`, `cargo test`, `selftest`, `flags` grid | **passed on the runner**, so T1 is a valid hardware oracle there too (it is x86-64) |
+| corpus step | **failed, and the gate was the bug.** `git diff --exit-code corpus/manifest.tsv` asserts byte-identical codegen against the committed manifest, so it compares clang *versions*: runner 20.1.8 vs manifest built with 22.1.8. Replaced with a check of the claim actually wanted — build twice on the same toolchain, byte-compare the manifests. The manifest now records its compiler and target. |
+| corpus reproducibility (found by that new check, locally, on its first run) | COFF objects embed a build `TimeDateStamp`: two runs of the *same* clang over the *same* sources moved 120/120 object hashes at **identical sizes** — the signature of a fixed-width volatile field, not a codegen change. `/Brepro` is clang-cl only and `-Xclang -brepro` is unknown to clang 22 (both measured), so the stamp is normalized at object offset 4; `-g0` drops the CodeView sections that embed the source path. Pinned by `coff_stamp_normalization_targets_the_real_field`, because the guard must read `Machine` at offset **0** — an object header has no image signature field, and checking offset 2 (NumberOfSections) silently disables the normalization. That is how this first shipped. |
+
+After the fix: two builds into the same directory produce byte-identical
+manifests, every object stamp is 0, and the corpus is a fingerprint of codegen
+rather than of the clock.
+
 ### Found by reading
 
 Each needs a fixture before it is fixed.
