@@ -713,6 +713,14 @@ bugs were caught on the first run.
 | **Gate: boundaries vs llvm-objdump** | `rdec objdump-check --corpus`, all 120 objects: **124 symbols, 124 exact boundary matches, 0 mismatches**, each symbol also decode→encode→decode stable. Its own CI step; a sampled row in `rdec status`. |
 | Fuzz | 40,000 pseudo-random windows (prefix-biased): 0 panics, every accepted instruction 1..=15 bytes, addresses monotonic, refusals terminal. |
 
+CI on this commit: run 41401159339 concluded `failure` with **zero jobs and no
+logs** — `name: objdump-check (M1: instruction boundaries ...)` has an unquoted
+colon-space, so the workflow file never parsed, and GitHub's failure mode for
+that is silent. Pinned by `crates/cli/tests/ci_hygiene.rs`, which also asserts
+that it *found* workflow files: the first version ran from `crates/cli`, found
+none, and passed while checking nothing. Green again at e230c68 (run
+41401304705), 12 steps including the corpus-wide objdump gate on the runner.
+
 Not yet M1: recursive-descent discovery from entry points and relocations,
 indirect-jump classification (jump-table recovery), the coverage measurement
 itself, and the disassembly-literal test vectors. M1's gate stays open until
