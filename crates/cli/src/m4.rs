@@ -189,6 +189,12 @@ pub fn cmd_c(args: &[String]) -> Result<i32, String> {
             clean(&mut f);
             if let Err(errs) = verify_ssa(&f) {
                 pass_broken += 1;
+                // The post-pass IR of a broken function is the only way to see
+                // WHICH op a pass emitted at the wrong width.
+                if pass_broken <= 3 {
+                    let dump = format!("{out_dir}/passbroken_{pass_broken}.ir");
+                    let _ = std::fs::write(&dump, rdec_core::fmt_ir::format_function(&f));
+                }
                 if first_pass_break.is_none() {
                     first_pass_break = Some(format!("{file} :: {raw}: {}", errs.join("; ")));
                 }

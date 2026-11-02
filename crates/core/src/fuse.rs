@@ -54,6 +54,13 @@ pub enum SO {
 
 pub struct SB {
     pub ops: Vec<(SO, Ty)>,
+    /// The width the lowering is working at: the type of the flags operation
+    /// being modelled. Constants a lowering invents (`sign`, `0xff`, `1`, a
+    /// shift amount) are properties of THAT operation, so they carry its width.
+    /// They used to be hard-wired to `u64`, and a W32 `sub` fused into
+    /// `and(result, 0x80000000u64)` mixed widths, which the verifier rejects -
+    /// 68 corpus functions.
+    pub ty: Ty,
 }
 
 impl Default for SB {
@@ -64,14 +71,24 @@ impl Default for SB {
 
 impl SB {
     pub fn new() -> SB {
-        SB { ops: Vec::new() }
+        SB {
+            ops: Vec::new(),
+            ty: Ty::u64(),
+        }
     }
     fn push(&mut self, so: SO, ty: Ty) -> Tm {
         self.ops.push((so, ty));
         Tm::T(self.ops.len() - 1)
     }
     fn c(&mut self, v: u64) -> Tm {
-        self.push(SO::Const(v), Ty::u64())
+        let t = self.ty.clone();
+        self.push(SO::Const(v), t)
+    }
+    /// Pin the working width before emitting a lowering for a flags operation.
+    pub fn set_ty(&mut self, t: Ty) {
+        if !t.is_bool() {
+            self.ty = t;
+        }
     }
     fn bin(&mut self, o: BinOp, x: Tm, y: Tm, ty: Ty) -> Tm {
         self.push(SO::Bin(o, x, y), ty)
@@ -393,6 +410,7 @@ fn expr_of(f: &Function, v: VId) -> Option<FlagExpr> {
 }
 
 fn lower_tree(sb: &mut SB, e: &FlagExpr, ctx: &Ctx) -> Tm {
+    sb.set_ty(ctx.ty.clone());
     match e {
         FlagExpr::Leaf(fl) => exact_flag(sb, ctx, *fl),
         FlagExpr::Not(x) => {
@@ -463,6 +481,7 @@ fn res(sb: &mut SB, ctx: &Ctx) -> Tm {
 }
 
 fn exact_flag(sb: &mut SB, ctx: &Ctx, fl: Flag) -> Tm {
+    sb.set_ty(ctx.ty.clone());
     let t = ctx.ty.clone();
     let w = ctx.w.bits() as u64;
     let sign: u64 = 1 << (w - 1);
@@ -485,9 +504,9 @@ fn exact_flag(sb: &mut SB, ctx: &Ctx, fl: Flag) -> Tm {
         Flag::PF => {
             let m = sb.c(0xff);
             let lo = sb.bin(BinOp::And, r, m, t.clone());
-            let pc = sb.push(SO::Un(UnOp::Popcount, lo), Ty::u64());
+            let pc = sb.push(SO::Un(UnOp::Popcount, lo), t.clone());
             let one = sb.c(1);
-            let b0 = sb.bin(BinOp::And, pc, one, Ty::u64());
+            let b0 = sb.bin(BinOp::And, pc, one, t.clone());
             let z = sb.c(0);
             sb.cmp(IntCmp::Eq, b0, z)
         }
@@ -539,7 +558,7 @@ fn exact_flag(sb: &mut SB, ctx: &Ctx, fl: Flag) -> Tm {
             FlagsOp::Shl { .. } => {
                 // CF = last bit shifted out = bit (width - n) of a
                 let bits = sb.c(w);
-                let sh = sb.bin(BinOp::Sub, bits, b, Ty::u64());
+                let sh = sb.bin(BinOp::Sub, bits, b, t.clone());
                 let s = sb.bin(BinOp::Shr, a, sh, t.clone());
                 let one = sb.c(1);
                 let bt = sb.bin(BinOp::And, s, one, t.clone());
@@ -548,7 +567,7 @@ fn exact_flag(sb: &mut SB, ctx: &Ctx, fl: Flag) -> Tm {
             FlagsOp::Shr { .. } | FlagsOp::Sar { .. } => {
                 // CF = bit (n-1) of a
                 let one = sb.c(1);
-                let n1 = sb.bin(BinOp::Sub, b, one, Ty::u64());
+                let n1 = sb.bin(BinOp::Sub, b, one, t.clone());
                 let s = sb.bin(BinOp::Shr, a, n1, t.clone());
                 let o = sb.c(1);
                 let bt = sb.bin(BinOp::And, s, o, t.clone());
