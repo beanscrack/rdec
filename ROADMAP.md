@@ -495,7 +495,70 @@ not promise those are arguments - and is what a type/ABI inference pass must res
 
 ---
 
-### M5 — Control-flow structuring · 4–5 wk
+#### M4 step 1 - measured (2026-11-02): the C emitter, end to end
+
+`crates/core/src/emit_c.rs` + `rdec c --corpus`: lift -> passes (flag elimination,
+phi prune, const fold, copy prop, branch simplify, dead-store elim, DCE) -> verify
+again -> emit C -> write one translation unit -> compile it with
+`clang -std=c17 -Wall -Wextra -Werror`.
+
+```
+emit-c: 141 lifted functions, 15 emitted C, 97 refused, 29 invalid after passes
+refusal classes: 33 opaque: live-in Rax | 17 flags value sub{a | 9 opaque: live-in Rsi
+                 | 6 opaque: live-in Rsp | 6 opaque: unmodelled instruction: cdq
+                 | 6 sext from unsigned int
+clang -Werror: OK (corpus/c/all.c -> corpus/c/all.obj)
+FAIL: a pass broke SSA in 29 functions: array_walk.Oz :: f: %69 mixes widths W32 and W64
+```
+
+What is now proven, and what is not:
+
+- **Proven:** the pipeline runs on real machine code, and for 15 functions the
+  emitted C is accepted by clang under `-Werror` - real widths, real signedness,
+  phi-free (edge-copies), flat-memory loads/stores. The emitter cannot emit a
+  silent gap: an unmodellable instruction is a `Refusal` with an address and a
+  reason, and the gate counts them by class.
+- **Not proven:** that the C computes what the machine code computes. That is the
+  T2 differential (M4 step 2), and it is the milestone's real exit test.
+
+The named work queue, largest class first. Each is a specific defect, not a
+mystery:
+
+1. **33+9+6 live-in placeholders** (`Rax`, `Rsi`, `Rsp`) - a register read at a
+   block start whose value the SSA solve never resolved to a definition. The
+   interpreter's "0 uses of an undefined value" does not catch it: the placeholder
+   is an `opaque`, defined, semantically empty. Fix: find why in_val keeps the
+   placeholder (entry-bound Rsp should propagate).
+2. **29 functions where a pass breaks SSA** (width mixes, W1-with-W64). The
+   post-pass `verify_ssa` is what catches this; it is a real pass bug, and the
+   named instance is `array_walk.Oz %69/%72/%77`.
+3. **17 flags values surviving elimination** (`sub`'s flags consumed in a shape
+   `fuse::flag_elimination` does not fold).
+4. **6 `cdq`** - unmodelled instruction in the lifter.
+5. **6 SExt from an unsigned source** - the emitter refuses; the C needs a cast
+   through the signed type of the source width.
+6. **Indirect calls** - refused, no signature model yet.
+
+Emitter decisions worth keeping in mind:
+
+- **Flat memory, one declaration per translation unit**: `static uint8_t
+  rdec_mem[1<<20]` inside every emitted function is a redefinition error the moment
+  two functions share a file, which is the normal case for a decompiler. The
+  address mask turns an out-of-range machine access into a deterministic in-range
+  one, because C UB cannot be diffed against anything.
+- **The entry stack pointer is a constant address** (`STACK_BASE = 1<<19`), not an
+  `Opaque`. As an opaque it refused every -O0 function, because every -O0 function
+  has a stack frame; as a flat-model address it gives the interpreter and the C the
+  *same* bytes to compare.
+- **`-Werror` hygiene is the emitter's job**: `(void)&&lN;` marks intentional labels
+  a branch-folding pass orphaned, `__attribute__((unused))` on locals the passes
+  left set-but-unread, and on the prelude helpers. Deleting the block, or dropping
+  the flag, would hide real facts to make a build green.
+- Guards where x86 and C disagree: division by zero (`? 0`), `INT_MIN / -1`, shift
+  counts masked the x86 way, `lzcnt/tzcnt` of zero.
+
+
+## M5 — Control-flow structuring · 4–5 wk
 
 - v1's scope: if/else, while, do/while, `for` recovery, and switch recovery from
   M3's resolved tables. Irreducible regions keep `goto`, with a warning, counted.

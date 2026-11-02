@@ -250,6 +250,11 @@ pub struct BlockInsns {
 }
 
 /// Split a proven instruction stream into blocks at the proven block starts.
+/// The entry stack pointer, in the flat address space both oracles model:
+/// `rdec_core::emit_c::MEM_SIZE` is 1 MiB, so this sits mid-range with 512 KiB of
+/// room below for frames and pushes, and the address mask keeps it in range.
+pub const STACK_BASE: u64 = 1 << 19;
+
 pub fn split_blocks(plan: &Plan, start: u64, end: u64) -> Vec<BlockInsns> {
     // Block starts are the union of what discovery recorded and every branch
     // destination in range. The second set is what makes loops liftable: a
@@ -350,15 +355,18 @@ impl<'a> Lifter<'a> {
                 .push(Instr::new(v, Op::Param, Ty::i64(), addr));
             regs.insert(g, v);
         }
-        // The entry stack pointer: a value we know points at this frame.
-        // `stack2reg` (M6) is what turns rsp-relative accesses into locals; until
-        // then the address arithmetic is modelled honestly as arithmetic.
-        let rsp = f.emit(
-            f.entry,
-            Op::Opaque("stack pointer at entry".into()),
-            Ty::u64(),
-            addr,
-        );
+        // The machine stack is memory. In a flat-memory model the entry stack
+        // pointer is a fixed address, which makes every rsp-relative access a real
+        // load/store at the SAME place in both oracles - the IR interpreter's
+        // sparse memory and the emitted C's byte array - so the differential can
+        // compare them at all. Modelling it as `Opaque` was defensible for the
+        // interpreter and fatal for emission: it refused every -O0 function,
+        // because every -O0 function has a stack frame.
+        //
+        // The value is not a guess about the program: no corpus function's
+        // behaviour depends on the absolute address, only on offsets from it, and
+        // `stack2reg` (M6) is the pass that turns these offsets into locals.
+        let rsp = f.emit(f.entry, Op::Const(STACK_BASE), Ty::u64(), addr);
         regs.insert(Grp::Rsp, rsp);
         Lifter {
             f,

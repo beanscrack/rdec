@@ -14,6 +14,7 @@
 //! ```
 
 pub mod cfg;
+pub mod emit_c;
 pub mod fmt_ir;
 pub mod fuse;
 pub mod interp;

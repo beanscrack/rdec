@@ -10,6 +10,7 @@ use rdec_core::verify;
 use rdec_verify::{hw, model_shim, Sabotage};
 
 mod m1;
+mod m4;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -19,6 +20,13 @@ fn main() {
         "selftest" => cmd_selftest(),
         "corpus" => cmd_corpus(&args[1..]),
         "disasm" => m1::cmd_disasm(&args),
+        "c" => match m4::cmd_c(&args) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("c: {e}");
+                2
+            }
+        },
         "lift" => match m1::cmd_lift(&args) {
             Ok(code) => code,
             Err(e) => {
