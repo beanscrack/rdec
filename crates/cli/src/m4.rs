@@ -202,6 +202,13 @@ pub fn cmd_c(args: &[String]) -> Result<i32, String> {
                 }
                 Err(rs) => {
                     refused += 1;
+                    // When a function is refused, the post-pass IR IS the
+                    // diagnosis: the refusal names a value, and the only useful
+                    // question is what the passes left around it.
+                    if refused <= 3 {
+                        let dump = format!("{out_dir}/refused_{refused}.ir");
+                        let _ = std::fs::write(&dump, rdec_core::fmt_ir::format_function(&f));
+                    }
                     for r in &rs {
                         *keys.entry(key(r)).or_default() += 1;
                     }

@@ -206,6 +206,16 @@ pub fn flag_elimination(f: &mut Function) -> bool {
             Tm::T(k) => ids[k],
         };
         f.blocks[bi].instrs[ii + sb.ops.len()].op = Op::Copy(final_v);
+        // The root's cone is folded. The *same* flags value is usually read by
+        // bits this branch never uses - the lifter reads all five flags for a
+        // jcc, defensively - and those leaves keep the `Flags` value alive: the
+        // value is partially consumed, so it survives to the emitter, which
+        // refuses it, and DCE cannot clean it up (deleting a flag read is not
+        // semantics-preserving: reading a flag the model calls undefined faults).
+        // Fold them here, where the arithmetic context is known.
+        if let Some(fv) = root_flag_value(f, ins.dest) {
+            fold_flag_reads(f, fv);
+        }
         return true;
     }
     false
@@ -285,7 +295,20 @@ pub fn flag_roots(f: &Function) -> Vec<(usize, usize)> {
         for blk in &f.blocks {
             for ins in &blk.instrs {
                 let d = match &ins.op {
-                    Op::GetFlag(_, fv) => f.ty_of(*fv) == Some(Ty::Flags),
+                    // "Is this operand a flags value?" is answered by the op that
+                    // defines it as much as by the type annotation, and a guard that
+                    // can silently un-mark every leaf in every function is not a
+                    // guard worth having. Relaxing this did NOT move the corpus
+                    // counts - the root-predicate polarity below was the cause -
+                    // so the change here is defensive, and the measurement that
+                    // matters is the one attached to that polarity.
+                    Op::GetFlag(_, fv) => {
+                        f.ty_of(*fv) == Some(Ty::Flags)
+                            || matches!(
+                                f.def(*fv).map(|(b, i)| &f.blocks[b as usize].instrs[i].op),
+                                Some(Op::Flags(_))
+                            )
+                    }
                     Op::Bin(o, x, y) => {
                         matches!(o, BinOp::And | BinOp::Or | BinOp::Xor)
                             && (gat(&derived, *x) || gat(&derived, *y))
@@ -307,10 +330,16 @@ pub fn flag_roots(f: &Function) -> Vec<(usize, usize)> {
                 continue;
             }
             let consumed = f.uses_of(ins.dest).into_iter().any(|u| {
-                // A terminator use (instr == usize::MAX) is a real consumer that is
-                // not part of the tree, which is what makes this node the root.
+                // `consumed` here means "interior to the tree": consumed by
+                // another derived node. A terminator use (instr == usize::MAX) is
+                // NOT part of the flag expression - it is the branch that the
+                // expression feeds - so it makes this node the ROOT, not an
+                // interior node. Returning true here was inverted: it classified
+                // every live jcc tree as interior, so the pass folded only the
+                // flag reads nobody used, and every real `flags.sub` feeding a
+                // branch survived to the C emitter (37 refused functions).
                 if u.instr == usize::MAX {
-                    return true;
+                    return false;
                 }
                 f.blocks[u.bb as usize]
                     .instrs
@@ -677,4 +706,94 @@ fn mask_cmp(m: u8, signed: bool) -> Option<IntCmp> {
         }
         _ => return None,
     })
+}
+
+/// The single `Flags` value behind every leaf of the boolean expression rooted at
+/// `root`, or `None` if the leaves read more than one, or none.
+fn root_flag_value(f: &Function, root: VId) -> Option<VId> {
+    let mut one: Option<VId> = None;
+    let mut stack = vec![root];
+    let mut seen: Vec<VId> = Vec::new();
+    while let Some(v) = stack.pop() {
+        if seen.contains(&v) {
+            continue;
+        }
+        seen.push(v);
+        let (bb, ii) = f.def(v)?;
+        match &f.blocks[bb as usize].instrs[ii].op {
+            Op::GetFlag(_, fv) => match one {
+                None => one = Some(*fv),
+                Some(p) if p == *fv => {}
+                Some(_) => return None,
+            },
+            Op::Bin(_, x, y) => {
+                stack.push(*x);
+                stack.push(*y);
+            }
+            Op::Un(UnOp::Not, x) => stack.push(*x),
+            _ => {}
+        }
+    }
+    one
+}
+
+/// Fold every remaining read of one `Flags` value, leaf by leaf.
+///
+/// A leaf is rewritten only when the lowering table answers it EXACTLY. A bit the
+/// model calls undefined after this operation lowers to a `Gap`, and replacing a
+/// read that faults in the interpreter with a value that does not would change
+/// meaning - the TV harness would be right to call that a broken pass. So an
+/// undefined bit keeps its `getflag`, the flags value keeps surviving, and the
+/// emitter keeps refusing: the honest outcome for a bit x86 leaves undefined.
+fn fold_flag_reads(f: &mut Function, fv: VId) -> bool {
+    let (fb, fi) = match f.def(fv) {
+        Some(x) => x,
+        None => return false,
+    };
+    let fop = match &f.blocks[fb as usize].instrs[fi].op {
+        Op::Flags(o) => *o,
+        _ => return false,
+    };
+    let ctx = ctx_of(f, fop);
+    let mut changed = false;
+    loop {
+        let mut target: Option<(usize, usize, Flag)> = None;
+        'scan: for (bi, b) in f.blocks.iter().enumerate() {
+            for (ii, ins) in b.instrs.iter().enumerate() {
+                if let Op::GetFlag(bit, x) = ins.op {
+                    if x == fv {
+                        target = Some((bi, ii, bit));
+                        break 'scan;
+                    }
+                }
+            }
+        }
+        let Some((bi, ii, bit)) = target else {
+            break;
+        };
+        let addr = f.blocks[bi].instrs[ii].addr;
+        let mut sb = SB::new();
+        let res = exact_flag(&mut sb, &ctx, bit);
+        if sb.ops.iter().any(|(so, _)| matches!(so, SO::Gap(_))) {
+            // Undefined bit: leave the faulting read alone, and stop - every
+            // remaining read of this value is the same question.
+            break;
+        }
+        let mut ids: Vec<VId> = Vec::with_capacity(sb.ops.len());
+        for (k, (so, ty)) in sb.ops.iter().enumerate() {
+            let op = materialise(so, &ids);
+            let v = f.new_value(ty.clone());
+            f.blocks[bi]
+                .instrs
+                .insert(ii + k, Instr::new(v, op, ty.clone(), addr));
+            ids.push(v);
+        }
+        let final_v = match res {
+            Tm::V(v) => v,
+            Tm::T(k) => ids[k],
+        };
+        f.blocks[bi].instrs[ii + sb.ops.len()].op = Op::Copy(final_v);
+        changed = true;
+    }
+    changed
 }

@@ -609,6 +609,50 @@ read of a flags value in one step - while preserving the definedness story (T1 i
 the oracle for which bits an operation leaves defined). The measure is the refusal
 count: 37 of 87 today.
 
+### M4 step 3 - measured (2026-11-02): the fusion pass was never firing on live code
+
+The per-flags-value sweep went in, the refusal count did not move, and a hermetic
+fixture (`crates/core/tests/m4_flags_live.rs`: a `jge` with all five flag bits read,
+`not(SF ^ OF)` feeding the branch) reproduced it exactly. The cause was not the
+shape of the flags value at all - it was the root finder:
+
+`flag_roots` marks "is this node interior to the tree", and the arm for a
+terminator use returned `true`. A flag expression feeding a `br` is consumed by a
+*terminator*, so every live jcc tree was classified interior, so the pass folded
+only the flag reads nobody used, and every real `flags.sub` feeding a branch
+survived. The comment above that arm already described the correct behaviour; the
+code did the opposite of it. One polarity, in the arm, not in the table.
+
+Before -> after, same 141 functions:
+
+| measure | before | after |
+|---|---|---|
+| refused functions | 87 | **48** |
+| refusals naming a flags value | 37 | **0** |
+| `flags value sub{..}` class | 28 | **gone** |
+| `flags value and{..}` class | 9 | **gone** |
+| emitted C accepted by clang -Werror | 25 | 25 |
+| `cargo test` | 43 | **45** |
+
+`lift --corpus` is unchanged at 141/141 valid IR, so the lifter is not what moved.
+
+What the fix exposed, named: **68 functions (was 29) where a pass breaks SSA**,
+first instance `array_walk.O0 :: f: bb1: %94 mixes widths W32 and W64`. The fusion
+lowerings are now running on real code for the first time, and they emit comparisons
+at the wrong width - `ZF` of a 32-bit `sub` compared against a 64-bit zero. The fix
+is in `exact_flag`/the scratch builder: constants take the operation's type
+(`ctx.ty`), not `u64`. That is M4 step 4, and it is also the gate for the emission
+count, since a function whose passes broke SSA is not emitted at all.
+
+Process notes worth keeping:
+- The test suite stayed green through a fusion pass that never fired on live code.
+  The M0 flag tests do not cover "flags value consumed by a branch". They do now
+  (`m4_flags_live.rs`), with a TV test next to it: folding a `jge` preserves meaning.
+- The refusal dump (`corpus/c/refused_N.ir`, written by `rdec c` for the first three
+  refusals) is what turned this from a theory into a fact: the post-pass IR showed
+  nothing had been folded, which ruled out every "the table is missing a shape"
+  hypothesis in one look.
+
 
 ## M5 — Control-flow structuring · 4–5 wk
 
