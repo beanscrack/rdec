@@ -2,22 +2,31 @@ name: gates
 # Roadmap M0: the gates are commands, so CI runs the commands. A green badge that
 # checks nothing is worse than no badge, because it launders a missing check into
 # a passed one.
+#
+# GitHub-hosted windows-latest for now. It is x86-64, so T1 (which executes real
+# instructions against real EFLAGS) is a valid oracle here; a self-hosted runner
+# stays in the plan for `flags --full` volume and for pinning the clang version.
 on:
   push:
   pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 4 * * *" # nightly: the full T1 sweep
 
 jobs:
   gates:
-    # Self-hosted Windows, per roadmap §4 M0: T1 executes real x86 instructions,
-    # so the runner is the machine. If no self-hosted runner is registered,
-    # github's windows-latest runs the same steps (T1 still runs; it is the
-    # corpus's clang target that must stay MSVC).
-    runs-on: [self-hosted, windows]
+    runs-on: windows-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
+      - uses: Swatinem/rust-cache@v2
+
       - name: toolchain
-        run: rustc -V && cargo -V && clang --version
+        run: |
+          rustc -V
+          cargo -V
+          clang --version
 
       - name: fmt
         run: cargo fmt --check
@@ -31,7 +40,7 @@ jobs:
       - name: selftest (the verifier must be able to fail)
         run: cargo run -q -p rdec-cli -- selftest
 
-      - name: flags (T1 grid; use --full on a nightly job)
+      - name: flags (T1 grid against real EFLAGS)
         run: cargo run -q -p rdec-cli -- flags
 
       - name: corpus (rebuild, and the manifest must not move)
@@ -41,3 +50,16 @@ jobs:
 
       - name: status (prints section 9's table from the commands above)
         run: cargo run -q -p rdec-cli -- status
+
+  t1-full:
+    # 9.7e9 probes against hardware EFLAGS, ~6 min release build. Nightly/dispatch
+    # only: the grid is the PR gate, the sweep is the regression net.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    needs: gates
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: flags --full
+        run: cargo run --release -q -p rdec-cli -- flags --full 20000
