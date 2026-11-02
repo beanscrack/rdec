@@ -308,6 +308,12 @@ pub struct Report {
     pub unnamed_calls: usize,
     /// Blocks the entry cannot reach; their lifted contents dropped, counted.
     pub unreachable_blocks: usize,
+    /// Live-in placeholders SSA construction resolved and deleted.
+    pub scaffolding_removed: usize,
+    /// Live-ins whose incoming value is `undef`: the register is read at a point
+    /// where no modelled path defines it. At a function entry that is the ABI
+    /// question (is this register an argument?), not a dataflow question.
+    pub undef_live_ins: usize,
 }
 
 pub struct Lifter<'a> {
@@ -1498,10 +1504,41 @@ impl<'a> Lifter<'a> {
                 let Some(new) = in_val.get(&b).copied() else {
                     continue;
                 };
+                if Some(new) == self.undef {
+                    self.rep.undef_live_ins += 1;
+                }
                 if old != new {
                     rewrite_in_block(self.f.block_mut(b), old, new);
                 }
             }
+        }
+        // Delete the placeholders SSA construction invented, now that every
+        // group has been solved and rewritten - not per group. Doing it
+        // interleaved deleted a placeholder a *later* group's phi had already
+        // taken as an incoming value, and the verifier caught the dangling
+        // reference: "value %28 is used but never defined".
+        //
+        // Why delete at all: the placeholder is our plumbing, not a fact about
+        // the machine code. `Op::Opaque` blocks DCE on purpose (an unmodelled
+        // instruction must never vanish quietly), and that rule must not extend
+        // to scaffolding, or every live-in in every loop header survives into the
+        // emitted C as a refusal.
+        let mut seen: HashSet<u32> = HashSet::new();
+        for (b, _g, old) in self.live_in.clone() {
+            if !seen.insert(old) {
+                continue;
+            }
+            if self.f.use_count(old) != 0 {
+                continue;
+            }
+            let is_scaffolding = self.f.block(b).instrs.iter().any(|i| {
+                i.dest == old && matches!(&i.op, Op::Opaque(t) if t.starts_with("live-in "))
+            });
+            if !is_scaffolding {
+                continue;
+            }
+            self.f.block_mut(b).instrs.retain(|i| i.dest != old);
+            self.rep.scaffolding_removed += 1;
         }
         self.place_undef();
     }

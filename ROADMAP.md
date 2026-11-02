@@ -558,6 +558,51 @@ Emitter decisions worth keeping in mind:
   counts masked the x86 way, `lzcnt/tzcnt` of zero.
 
 
+### M4 step 2 - measured (2026-11-02): live-in scaffolding resolved, class 1 closed
+
+SSA construction invented an `Op::Opaque("live-in Rg")` for every register read
+before a write in a block, rewrote its uses to the resolved incoming value, and
+**left the definition behind** - `Op::Opaque` blocks DCE on purpose, so the
+scaffolding became a permanent refusal in the emitted C. Deleting the definition
+once nothing refers to it:
+
+| measure | before | after |
+|---|---|---|
+| emitted C accepted by clang -Werror | 15 | **25** |
+| refused functions | 97 | 87 |
+| interpreter: reached an unmodelled op | 141 | **47** |
+| valid IR (lift gate) | 141 | 141 |
+| live-in placeholders resolved | - | 439 (205 of them `undef`) |
+
+The refusal classes `opaque: live-in Rax` (33), `Rsi` (9), `Rsp` (6) are gone.
+
+Two things this step made explicit, both from the gate rather than from reading:
+
+- **Deleting per group is wrong.** Deleting a placeholder as soon as group `g`'s
+  rewrite made it unused broke two functions: a later group's phi had already
+  taken that placeholder as an incoming value, and the verifier reported
+  "value %28 is used but never defined". The sweep runs once, after every group
+  has been solved and rewritten. `cargo test` stayed green through the broken
+  version - only the corpus gate caught it, which is why the gate exists.
+- **`undef` is the honest answer, and it is a count.** 205 live-ins resolve to
+  `undef`: a register read at a point no modelled path defines, which at a
+  function entry is the ABI question ("is r8 an argument here?"), not a dataflow
+  one. The number is in the gate's evidence line so it cannot be forgotten.
+
+Largest refusal class now: **37 flags values surviving elimination** - flags that
+are live across a join. The flags value gets a phi over `Ty::Flags`, and
+`fuse::flag_elimination` cannot fold a `GetFlag` of a phi, so the shape is:
+
+    GetFlag(ZF, phi[(flags_a, p1), (flags_b, p2)])
+
+The fix is a named, local pass - push `GetFlag` through the phi:
+
+    phi[(GetFlag(ZF, flags_a), p1), (GetFlag(ZF, flags_b), p2)]
+
+so each `GetFlag` sits on a direct producer that folds into a comparison, and the
+phi ends up over bools, which C can spell. That is M4 step 3.
+
+
 ## M5 — Control-flow structuring · 4–5 wk
 
 - v1's scope: if/else, while, do/while, `for` recovery, and switch recovery from

@@ -689,10 +689,13 @@ pub fn cmd_lift(args: &[String]) -> Result<i32, String> {
     let mut unnamed_total = 0usize;
     let mut clobber_total = 0usize;
     let mut unreach_total = 0usize;
+    let mut undef_live = 0usize;
+    let mut scaffolding = 0usize;
     let (mut ret_n, mut no_ret, mut step_budget, mut holes, mut unmodeled_load, mut fault) =
         (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
     let mut opaque = 0usize;
     let mut first_bad: Option<String> = None;
+    let mut bad_msgs: Vec<String> = Vec::new();
     let mut first_gappy: Option<String> = None;
     let mut budget = limit;
 
@@ -790,6 +793,8 @@ pub fn cmd_lift(args: &[String]) -> Result<i32, String> {
             unnamed_total += rep.unnamed_calls;
             clobber_total += rep.clobbers;
             unreach_total += rep.unreachable_blocks;
+            undef_live += rep.undef_live_ins;
+            scaffolding += rep.scaffolding_removed;
             // M3's semantic check, on top of the structural one: run the IR
             // interpreter over the lifted function. It is strict - every operand
             // it consumes must already be defined - so a renaming that leaves a
@@ -824,8 +829,14 @@ pub fn cmd_lift(args: &[String]) -> Result<i32, String> {
             match verify_ssa(&f) {
                 Ok(()) => verified += 1,
                 Err(errs) => {
+                    let msg = format!("{file} :: {name}: {}", errs.join("; "));
                     if first_bad.is_none() {
-                        first_bad = Some(format!("{file} :: {name}: {}", errs.join("; ")));
+                        first_bad = Some(msg.clone());
+                    }
+                    // Three, not one: with 141 functions, a single example is how
+                    // you miss that two failures are two different classes.
+                    if bad_msgs.len() < 3 {
+                        bad_msgs.push(msg);
                     }
                 }
             }
@@ -848,13 +859,13 @@ pub fn cmd_lift(args: &[String]) -> Result<i32, String> {
         "lift: {objects} objects, {lifted} functions lifted, {verified} pass verify_ssa, {clean} with no gaps and no exits"
     );
     println!(
-        "evidence: {gap_total} loud gaps, {exit_total} Exit terminators, {unnamed_total} unnamed call targets, {clobber_total} modelled register clobbers, {unreach_total} unreachable blocks dropped"
+        "evidence: {gap_total} loud gaps, {exit_total} Exit terminators, {unnamed_total} unnamed call targets, {clobber_total} modelled register clobbers, {unreach_total} unreachable blocks dropped, {scaffolding} live-in placeholders resolved, {undef_live} of them `undef` (the ABI question)"
     );
     println!(
         "interp: {ret_n} returned, {no_ret} ended at Exit, {step_budget} hit the step budget, {opaque} reached an unmodelled op, {unmodeled_load} unmodelled loads, {fault} arithmetic faults, {holes} used a value that is never defined"
     );
-    if let Some(b) = first_bad {
-        println!("first verifier rejection: {b}");
+    for (i, b) in bad_msgs.iter().enumerate() {
+        println!("verifier rejection {}: {b}", i + 1);
     }
     if holes > 0 {
         println!("FAIL: {holes} lifted functions reference a value they never define");
