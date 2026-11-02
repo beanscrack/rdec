@@ -1064,3 +1064,39 @@ complaint was untraceable. IR nodes now carry the instruction address.
 | Gates must cover all existing code; `rdec status` generates §9 | v1's M0 gate passed over miscompiling passes; the state section was wrong twice |
 | Non-goals listed | A production tool says what it doesn't do, loudly |
 | M0–M6: 19–25 → 25–33 weeks, re-baseline after M2 | Scope moved in |
+
+## T2 - differential execution: measured (2026-11-02), RED by design
+
+`rdec t2 --corpus` (crates/cli/src/t2.rs, from the delegated build) runs BOTH sides of
+every function the emitter accepts: the original machine-code bytes reached through the
+COFF symbol via a linked driver, and the generated C, on the same 4-argument vectors,
+comparing the full 64-bit RAX. A crash is its own bucket; a function that cannot run on
+both sides is named with a reason, never silently dropped.
+
+```
+t2: 141 lifted, 57 refused by the emitter (not run), 0 invalid after passes
+runnable: 31 functions on both sides, 53 not runnable
+compare: the full 64-bit RAX, every vector, on both sides
+compared: 732 | match: 617 | mismatch: 115 | not compared: 0 | differing only above bit 31: 39
+FAIL: the decompiled C disagrees with the machine code on 115 of 732 runs
+```
+
+It found a real miscompile, minimized: **`sar` was emitted as a LOGICAL shift**. The
+emitter's unsigned arm rendered `((uint64_t)x >> cnt)` because registers are modelled as
+one unsigned W64 value - a modelling artifact, not a fact about the operand, and the
+same root cause as `movsx`. Fixed in `emit_c.rs`: read the source as signed at the
+operation's width. Measured: **115 -> 39 mismatches of 732** (f(0x80000000,0x80000000,1,0):
+machine 0xa0000000, C 0x60000000, now agrees).
+
+The remaining 39 are one class, already bucketed by the harness: the C side sign-extends
+a 32-bit result into an `int64_t` return (0xffffffffffffff9d) where the machine writes
+EAX and leaves bits 32-63 of RAX as the ABI allows (0xffffff9d). Two honest options, not
+yet chosen: return the value at the width the IR records for the return (which needs the
+lifter to record the width observed at the return site), or compare at that width and
+treat the upper bits as ABI-undefined. Masking the compare by inferring width from
+observed answers was tried and rejected - it collapsed 19 functions to a 1-bit gate that
+can never fail.
+
+Also named: 29 functions are skipped because RAX is unwritten on some path, and the IR
+dump shows why - at entry, `xor eax,eax` becomes `xor(trunc(%undef), trunc(%undef))` and
+no pass folds `x ^ x -> 0`. An idempotent-op fold admits ~29 more functions to the gate.

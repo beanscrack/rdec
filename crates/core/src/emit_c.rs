@@ -282,7 +282,23 @@ impl<'a> Emitter<'a> {
             BinOp::Shl => format!("({x} << {cnt})"),
             BinOp::Shr => format!("({x} >> {cnt})"),
             BinOp::Sar if signed => format!("({x} >> {cnt})"),
-            BinOp::Sar => format!("((uint64_t){x} >> {cnt})"),
+            BinOp::Sar => {
+                // `sar` is an ARITHMETIC shift by definition. The operand is
+                // unsigned here only because registers are modelled as one
+                // unsigned W64 value - a modelling artifact, not a fact about the
+                // operand (the same root cause as `movsx`). Reading the source as
+                // signed at the operation's width is what the instruction does;
+                // the old '((uint64_t)x >> cnt)' silently produced a LOGICAL shift
+                // and T2 caught it: f(0x80000000,0x80000000,1,0) gave machine
+                // 0xa0000000 vs C 0x60000000, 76 of 732 runs.
+                let st = match w {
+                    8 => "int8_t",
+                    16 => "int16_t",
+                    32 => "int32_t",
+                    _ => "int64_t",
+                };
+                format!("(({st}){x} >> {cnt})")
+            }
             BinOp::RotL => format!("(({x} << {cnt}) | ({x} >> (({w}ULL - {cnt}) & {w}_ULL)))"),
             BinOp::RotR => format!("(({x} >> {cnt}) | ({x} << (({w}ULL - {cnt}) & {w}_ULL)))"),
         };

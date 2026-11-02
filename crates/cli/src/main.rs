@@ -11,6 +11,7 @@ use rdec_verify::{hw, model_shim, Sabotage};
 
 mod m1;
 mod m4;
+mod t2;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -24,6 +25,13 @@ fn main() {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("c: {e}");
+                2
+            }
+        },
+        "t2" => match t2::cmd_t2(&args) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("t2: {e}");
                 2
             }
         },
@@ -72,6 +80,8 @@ fn print_help() {
          \x20 probe <op> <w> <a> <b>          print model+hardware flags for one case\n\
          \x20 selftest                        prove the IR verifier rejects broken IR\n\
          \x20 corpus [--out DIR] [--opt O0,O2]  build the clang corpus + hashed manifest\n\
+         \x20 t2 [--corpus] [--limit N]        T2 differential gate: decompiled C vs\n\
+         \x20                                   the machine code, same inputs, RAX\n\
          \x20 status                          roadmap section 9's table, from commands\n\
          \n\
          coming next (M1): disasm <obj> [symbol]"
@@ -449,6 +459,32 @@ fn cmd_status() -> i32 {
         "objdump-check (M1: boundaries vs llvm-objdump)".into(),
         ob.1.lines().last().unwrap_or("").trim().into(),
         ob.0,
+    ));
+    // T2 is the only row that RUNS both sides: `rdec c` proves the emitted C
+    // compiles, this proves it computes the same values as the machine code.
+    // It is a real verdict, so it is allowed to fail the scoreboard.
+    let t2_cmd: Vec<String> = if self_cmd[0] == "run" {
+        vec![
+            "run".into(),
+            "-q".into(),
+            "-p".into(),
+            "rdec-cli".into(),
+            "--".into(),
+            "t2".into(),
+            "--corpus".into(),
+        ]
+    } else {
+        vec!["t2".into(), "--corpus".into()]
+    };
+    let t2 = sh(&exe, &t2_cmd);
+    rows.push((
+        "t2 differential (C vs machine code, same inputs, RAX)".into(),
+        t2.1.lines()
+            .find(|l| l.starts_with("compared:"))
+            .unwrap_or("no comparison ran")
+            .trim()
+            .into(),
+        t2.0,
     ));
     let local = rdec_verify::corpus::clang_stamp(&rdec_verify::corpus::clang_path()).0;
     let recorded = rdec_verify::corpus::manifest_clang(std::path::Path::new("corpus/manifest.tsv"));

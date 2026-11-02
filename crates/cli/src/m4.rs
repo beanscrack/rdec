@@ -14,7 +14,7 @@ use rdec_arch_x86::lift::lift_one;
 use rdec_core::emit_c::{emit_c, Refusal, PRELUDE};
 use rdec_core::ir::Function;
 use rdec_core::verify::verify_ssa;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// The pre-emission pipeline. Flag elimination first: `Ty::Flags` has no C
@@ -52,7 +52,10 @@ fn key(r: &Refusal) -> String {
     low[..cut.min(46)].trim().to_string()
 }
 
-fn c_ident(s: &str) -> String {
+/// The one naming scheme for C identifiers built from symbol names. `rdec t2`
+/// calls the emitted C by these names: a second scheme in the harness would
+/// mean the gate runs a function that the `c` gate never emitted.
+pub fn c_ident(s: &str) -> String {
     s.chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '_' {
@@ -64,52 +67,39 @@ fn c_ident(s: &str) -> String {
         .collect()
 }
 
-pub fn cmd_c(args: &[String]) -> Result<i32, String> {
-    let mut files: Vec<String> = Vec::new();
-    for a in args.iter().skip(1) {
-        if a == "--corpus" {
-            let man = std::fs::read_to_string("corpus/manifest.tsv")
-                .map_err(|e| format!("corpus/manifest.tsv: {e}"))?;
-            for line in man.lines() {
-                if line.starts_with('#') || line.starts_with("name\t") {
-                    continue;
-                }
-                if let Some(o) = line.split('\t').nth(2) {
-                    files.push(o.to_string());
-                }
-            }
-            continue;
-        }
-        if !a.starts_with("--") {
-            files.push(a.clone());
-        }
-    }
-    if files.is_empty() {
-        return Err("usage: rdec c <object.obj> [...] [--corpus] [--emit DIR]".to_string());
-    }
-    let out_dir = args
-        .iter()
-        .position(|a| a == "--emit")
-        .and_then(|i| args.get(i + 1))
-        .cloned()
-        .unwrap_or_else(|| "corpus/c".to_string());
-    std::fs::create_dir_all(&out_dir).map_err(|e| format!("{out_dir}: {e}"))?;
+/// One lifted function plus the identity every gate needs to talk about it.
+///
+/// `sym` is the name the *object* uses (so `rdec t2` can link a driver against
+/// it) and `cname` is the name the *generated translation unit* uses. They are
+/// derived from each other here, once, so the gate that emits C and the gate
+/// that runs it cannot drift apart.
+pub struct Subject {
+    pub obj: String,
+    /// The COFF symbol name (`f`, `h`), or the synthetic `fn_<addr>` that
+    /// discovery gives code no symbol names. A synthetic name is not a link
+    /// name: nothing in the object resolves it.
+    pub sym: String,
+    /// `o<object index>_<sym>` — unique across the 120 objects that all
+    /// define `f`, which is why one C file can hold every function.
+    pub cname: String,
+    /// Entry address in the per-object virtual space the discovery plan uses.
+    pub start: u64,
+    /// The COFF symbol is `IMAGE_SYM_CLASS_EXTERNAL`, so another object can
+    /// link against it. A file-static symbol (`h` in `call_helper`) is visible
+    /// to the decompiler and invisible to a linker: `rdec t2`'s driver for it
+    /// fails with `undefined symbol`, so the gate has to know which is which.
+    pub external: bool,
+    /// The lifted IR, after `clean`.
+    pub f: Function,
+}
 
-    let mut seen = 0usize;
-    let mut emitted = 0usize;
-    let mut refused = 0usize;
-    let mut pass_broken = 0usize;
-    let mut keys: HashMap<String, usize> = HashMap::new();
-    let mut first_refusal: Option<String> = None;
-    let mut first_pass_break: Option<String> = None;
-    let mut all = String::new();
-    // The per-function text carries its own includes (so a single emitted
-    // function is a compilable translation unit on its own); the concatenated
-    // file needs them before the shared prelude, which uses uint64_t.
-    all.push_str("#include <stdint.h>\n#include <string.h>\n\n");
-    all.push_str(PRELUDE);
-    all.push('\n');
-
+/// Load, discover, lift and clean every function in `files`.
+///
+/// This is `rdec c`'s front half, split out so `rdec t2` runs the *same*
+/// pipeline on the *same* names — a differential gate that re-derived the
+/// function list its own way would be measuring its own copy, not the corpus.
+pub fn lift_all(files: &[String]) -> Result<Vec<Subject>, String> {
+    let mut out: Vec<Subject> = Vec::new();
     for (oi, file) in files.iter().enumerate() {
         let obj = rdec_arch_x86::loader::load(Path::new(file))?;
         let mut ranges: Vec<Code> = Vec::new();
@@ -156,11 +146,16 @@ pub fn cmd_c(args: &[String]) -> Result<i32, String> {
         }
         let plan = discover_all(&ranges, &seeds);
         let mut names: HashMap<u64, String> = HashMap::new();
+        let mut external: HashSet<u64> = HashSet::new();
         for i in obj.code_symbols() {
             let s = &obj.symbols[i];
             let sec = s.section.unwrap();
             if obj.is_code(sec) && !s.name.starts_with('.') && s.size > 0 {
-                names.insert(base_of[idx_of[&sec]] + s.offset, s.name.clone());
+                let at = base_of[idx_of[&sec]] + s.offset;
+                names.insert(at, s.name.clone());
+                if s.storage_class == rdec_arch_x86::loader::STORAGE_EXTERNAL {
+                    external.insert(at);
+                }
             }
         }
 
@@ -185,50 +180,112 @@ pub fn cmd_c(args: &[String]) -> Result<i32, String> {
                 .unwrap_or_else(|| format!("fn_{start:x}"));
             let name = format!("o{oi}_{}", c_ident(&raw));
             let (mut f, _rep) = lift_one(&name, rg.bytes, rg.base, start, end, &plan, &names);
-            seen += 1;
             clean(&mut f);
-            if let Err(errs) = verify_ssa(&f) {
-                pass_broken += 1;
-                // The post-pass IR of a broken function is the only way to see
-                // WHICH op a pass emitted at the wrong width.
-                if pass_broken <= 3 {
-                    let dump = format!("{out_dir}/passbroken_{pass_broken}.ir");
-                    let _ = std::fs::write(&dump, rdec_core::fmt_ir::format_function(&f));
+            out.push(Subject {
+                obj: file.clone(),
+                sym: raw,
+                cname: name,
+                start,
+                external: external.contains(&start),
+                f,
+            });
+        }
+    }
+    Ok(out)
+}
+
+pub fn cmd_c(args: &[String]) -> Result<i32, String> {
+    let mut files: Vec<String> = Vec::new();
+    for a in args.iter().skip(1) {
+        if a == "--corpus" {
+            let man = std::fs::read_to_string("corpus/manifest.tsv")
+                .map_err(|e| format!("corpus/manifest.tsv: {e}"))?;
+            for line in man.lines() {
+                if line.starts_with('#') || line.starts_with("name\t") {
+                    continue;
                 }
-                if first_pass_break.is_none() {
-                    first_pass_break = Some(format!("{file} :: {raw}: {}", errs.join("; ")));
+                if let Some(o) = line.split('\t').nth(2) {
+                    files.push(o.to_string());
                 }
-                continue;
             }
-            match emit_c(&f) {
-                Ok(out) => {
-                    emitted += 1;
-                    all.push_str(&out.text);
-                    all.push('\n');
+            continue;
+        }
+        if !a.starts_with("--") {
+            files.push(a.clone());
+        }
+    }
+    if files.is_empty() {
+        return Err("usage: rdec c <object.obj> [...] [--corpus] [--emit DIR]".to_string());
+    }
+    let out_dir = args
+        .iter()
+        .position(|a| a == "--emit")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| "corpus/c".to_string());
+    std::fs::create_dir_all(&out_dir).map_err(|e| format!("{out_dir}: {e}"))?;
+
+    let subjects = lift_all(&files)?;
+
+    let mut seen = 0usize;
+    let mut emitted = 0usize;
+    let mut refused = 0usize;
+    let mut pass_broken = 0usize;
+    let mut keys: HashMap<String, usize> = HashMap::new();
+    let mut first_refusal: Option<String> = None;
+    let mut first_pass_break: Option<String> = None;
+    let mut all = String::new();
+    // The per-function text carries its own includes (so a single emitted
+    // function is a compilable translation unit on its own); the concatenated
+    // file needs them before the shared prelude, which uses uint64_t.
+    all.push_str("#include <stdint.h>\n#include <string.h>\n\n");
+    all.push_str(PRELUDE);
+    all.push('\n');
+
+    for s in &subjects {
+        seen += 1;
+        if let Err(errs) = verify_ssa(&s.f) {
+            pass_broken += 1;
+            // The post-pass IR of a broken function is the only way to see
+            // WHICH op a pass emitted at the wrong width.
+            if pass_broken <= 3 {
+                let dump = format!("{out_dir}/passbroken_{pass_broken}.ir");
+                let _ = std::fs::write(&dump, rdec_core::fmt_ir::format_function(&s.f));
+            }
+            if first_pass_break.is_none() {
+                first_pass_break = Some(format!("{} :: {}: {}", s.obj, s.sym, errs.join("; ")));
+            }
+            continue;
+        }
+        match emit_c(&s.f) {
+            Ok(out) => {
+                emitted += 1;
+                all.push_str(&out.text);
+                all.push('\n');
+            }
+            Err(rs) => {
+                refused += 1;
+                // When a function is refused, the post-pass IR IS the
+                // diagnosis: the refusal names a value, and the only useful
+                // question is what the passes left around it.
+                if refused <= 3 {
+                    let dump = format!("{out_dir}/refused_{refused}.ir");
+                    let _ = std::fs::write(&dump, rdec_core::fmt_ir::format_function(&s.f));
                 }
-                Err(rs) => {
-                    refused += 1;
-                    // When a function is refused, the post-pass IR IS the
-                    // diagnosis: the refusal names a value, and the only useful
-                    // question is what the passes left around it.
-                    if refused <= 3 {
-                        let dump = format!("{out_dir}/refused_{refused}.ir");
-                        let _ = std::fs::write(&dump, rdec_core::fmt_ir::format_function(&f));
-                    }
-                    for r in &rs {
-                        *keys.entry(key(r)).or_default() += 1;
-                    }
-                    if let Some(r) = rs.first() {
-                        if first_refusal.is_none() {
-                            first_refusal =
-                                Some(format!("{file} :: {raw} @ {:#x}: {}", r.at, r.reason));
-                        }
+                for r in &rs {
+                    *keys.entry(key(r)).or_default() += 1;
+                }
+                if let Some(r) = rs.first() {
+                    if first_refusal.is_none() {
+                        first_refusal = Some(format!(
+                            "{} :: {} @ {:#x}: {}",
+                            s.obj, s.sym, r.at, r.reason
+                        ));
                     }
                 }
             }
         }
     }
-
     let path = format!("{out_dir}/all.c");
     std::fs::write(&path, &all).map_err(|e| format!("{path}: {e}"))?;
 
