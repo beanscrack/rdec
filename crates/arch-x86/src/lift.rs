@@ -39,19 +39,24 @@
 //! * A call clobbers the caller-saved registers. That is modelled, as an
 //!   `Opaque` per clobbered register, because leaving a value live across a call
 //!   is a silent miscompile, and the silent kind is the one that ships.
-//! * The Windows x64 ABI splits arguments by REGISTER CLASS: integer parameters
-//!   consume RCX/RDX/R8/R9 in order and float parameters consume XMM0-3 in
-//!   order, each argument consuming only its own class. Which kind each
-//!   parameter has is NOT visible in the machine code - it is a property of the
-//!   declared signature - so the lifter does not infer it: the caller hands in
-//!   an `FnAbi` per function (`lift_one_sig`), and the C++ pipeline builds it
-//!   from the DEMANGLED SIGNATURE, saying out loud that the evidence is the
-//!   decorated name, not observed answers. An empty `FnAbi` is the integer
-//!   model exactly as it was: the four integer registers seeded as parameters,
-//!   an integer return. A signature the front end cannot fully type keeps the
-//!   integer model and is counted and named - never guessed. `ret` follows the
-//!   same declared kind: a float/double function answers in XMM0 (the cell's
-//!   low 32/64 bits), and the emitted C declares the float return type.
+//! * The Windows x64 ABI homes every parameter by REGISTER PAIR: declared
+//!   parameter `k` arrives in the pair that owns RCX/RDX/R8/R9[k] AND
+//!   XMM0-3[k], so a float parameter consumes no integer register and an
+//!   integer parameter no XMM, and the index into each class's four registers
+//!   is the DECLARED POSITION. A `__thiscall` callee spends pair 0 - RCX and
+//!   XMM0 - on `this`, so its first `double` arrives in XMM1; a free
+//!   `int f(int a, double b)` gets the same XMM1 for the same reason, because
+//!   `b` is at position 1. Which kind each parameter has is NOT visible in the
+//!   machine code - it is a property of the declared signature - so the lifter
+//!   does not infer it: the caller hands in an `FnAbi` per function
+//!   (`lift_one_sig`), and the C++ pipeline builds it from the DEMANGLED
+//!   SIGNATURE, saying out loud that the evidence is the decorated name, not
+//!   observed answers. An empty `FnAbi` is the integer model exactly as it was:
+//!   the four integer registers seeded as parameters, an integer return. A
+//!   signature the front end cannot fully type keeps the integer model and is
+//!   counted and named - never guessed. `ret` follows the same declared kind: a
+//!   float/double function answers in XMM0 (the cell's low 32/64 bits), and the
+//!   emitted C declares the float return type.
 //! * Everything outside the subset becomes `Op::Opaque(text)` - in the IR,
 //!   counted, printed. Never a plausible guess.
 //!
@@ -237,15 +242,22 @@ fn ty_u(w: Width) -> Ty {
     Ty::uint(w)
 }
 
-/// The Windows x86-64 integer calling convention, as far as we model it: four
-/// integer arguments, integer return. More arguments is a loud gap, not a drop.
+/// The Windows x86-64 integer argument registers, indexed by DECLARED
+/// PARAMETER POSITION (pair index), not by "the n-th integer": pair `k` owns
+/// `ARG_REGS[k]` and `ARG_XMM[k]` together. Four pairs, integer return; a
+/// parameter past them is a loud gap, not a drop.
 const ARG_REGS: [Grp; 4] = [Grp::Rcx, Grp::Rdx, Grp::R8, Grp::R9];
 
-/// The float argument registers, in order. The Windows x64 ABI gives every
-/// parameter a register in its OWN class: a float argument consumes an XMM slot
-/// and leaves the integer slots to the integer arguments (and vice versa), so
-/// `int f(int a, double b)` arrives with `a` in RCX and `b` in XMM0 - RDX is
-/// NOT "used" by `b`, it holds nothing this function may read.
+/// The float argument registers, indexed by the same DECLARED PARAMETER
+/// POSITION (pair index) as `ARG_REGS`. The Windows x64 ABI homes parameter `k`
+/// in the pair that owns `ARG_REGS[k]` AND `ARG_XMM[k]`: a float parameter
+/// consumes no integer register and an integer parameter no XMM, so the index
+/// into each class is the position, never a per-class counter. `int f(int a,
+/// double b)` arrives with `a` in RCX (pair 0) and `b` in XMM1 (pair 1) - RDX is
+/// NOT "used" by `b`, and XMM0 (pair 0's float half, spent on the `int`) holds
+/// nothing this function may read. Pinned on hand-assembled bytes in
+/// `tests/float_abi.rs`; the corpus' member `grow` says the same thing from the
+/// other side (`movsd %xmm1, 0x8(%rsp)`).
 const ARG_XMM: [Grp; 4] = [Grp::Xmm(0), Grp::Xmm(1), Grp::Xmm(2), Grp::Xmm(3)];
 
 /// Which register class one declared parameter arrives in. The kind is a
@@ -255,13 +267,16 @@ const ARG_XMM: [Grp; 4] = [Grp::Xmm(0), Grp::Xmm(1), Grp::Xmm(2), Grp::Xmm(3)];
 /// is the gate that reads the answer off the answer.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum ArgKind {
-    /// An integer-class parameter: consumes the next of RCX/RDX/R8/R9.
+    /// An integer-class parameter: delivered in `ARG_REGS[pos]`, the integer
+    /// half of the pair its DECLARED POSITION owns.
     Int,
-    /// `float`: consumes the next of XMM0-3. The cell's value is the 32-bit
-    /// bit pattern zero-extended to 64 - the `movss` a scalar caller must use
-    /// zeroes bits 127:32, so bits 63:32 are architecturally zero.
+    /// `float`: delivered in `ARG_XMM[pos]`, the float half of that same pair.
+    /// The cell's value is the 32-bit bit pattern zero-extended to 64 - the
+    /// `movss` a scalar caller must use zeroes bits 127:32, so bits 63:32 are
+    /// architecturally zero.
     F32,
-    /// `double`: consumes the next of XMM0-3, the cell's value is the bits.
+    /// `double`: delivered in `ARG_XMM[pos]` like `F32`, and the cell's value is
+    /// the bits. `int f(int a, double b)` puts `b` in XMM1, pair 1.
     F64,
 }
 
@@ -293,9 +308,10 @@ pub struct FnAbi {
     /// member's first `double` arrives in XMM1, not XMM0. The corpus says
     /// so as machine fact: `?grow@Circle@@QEAANN@Z` opens
     /// `movsd %xmm1, 0x8(%rsp)` — the declared parameter is saved from XMM1.
-    /// For free functions the slots are per class (the Microsoft x64 rule
-    /// for `__cdecl`): `int f(int a, double b)` = ECX + XMM0, and a float
-    /// consumes no integer slot.
+    /// The pairing is the rule for free functions TOO (`int f(int a, double b)`
+    /// = RCX + XMM1, and a float consumes no integer slot), so this flag does
+    /// not pick a seeding rule — it says `this` is declared parameter 0 and
+    /// therefore spends pair 0 in both classes.
     pub member: bool,
 }
 
@@ -637,9 +653,15 @@ impl<'a> Lifter<'a> {
     }
 
     /// Lift under a DECLARED shape. `abi.args` is the parameter list in
-    /// declaration order; each kind consumes its own register class
-    /// (`ARG_REGS` for integers, `ARG_XMM` for floats), which is the Windows
-    /// x64 rule that a float argument does not consume an integer slot.
+    /// declaration order, and parameter `pos` is seeded from the register PAIR
+    /// its position owns: `ARG_REGS[pos]` for an integer kind, `ARG_XMM[pos]`
+    /// for a float kind. That is the Windows x64 rule as measured — a float
+    /// parameter consumes no integer register and an integer parameter no XMM,
+    /// so the index is the declared POSITION, not a per-class count. A member
+    /// needs no special case: `this` is `args[0]` and spends pair 0 in BOTH
+    /// classes, which is why its first `double` is XMM1 and a free
+    /// `int f(int a, double b)`'s is XMM1 too. A parameter past pair 3 has no
+    /// register: a loud, counted gap, never an invented value.
     /// An empty `abi.args` is the integer model: the four integer registers.
     pub fn new_abi(
         name: &str,
@@ -678,34 +700,25 @@ impl<'a> Lifter<'a> {
                 seeded.push(g);
             }
         } else {
-            // One parameter per declared kind, consuming its OWN class. A
-            // float parameter's IR value is the XMM cell - one unsigned W64
-            // word, the register file's rule - and its DECLARED type
-            // (`param_tys`) is what the C signature spells; the emitter
-            // moves bits through the memcpy helpers at the assignment.
-            let mut int_slot = 0usize;
-            let mut xmm_slot = 0usize;
+            // One parameter per declared kind, seeded at its DECLARED POSITION:
+            // pair `pos` owns `ARG_REGS[pos]` AND `ARG_XMM[pos]`, so
+            // `int f(int a, double b)` = RCX + XMM1 and
+            // `int g(double a, int b, double c)` = XMM0 + RDX + XMM2. A float
+            // parameter's IR value is the XMM cell - one unsigned W64 word, the
+            // register file's rule - and its DECLARED type (`param_tys`) is what
+            // the C signature spells; the emitter moves bits through the memcpy
+            // helpers at the assignment.
             for (pos, &k) in abi.args.iter().enumerate() {
-                // Free function: each class counts its own slots (`int
-                // f(int, double)` = RCX + XMM0). Member: the PAIRED slot
-                // rule — parameter `pos` (this = 0) lands in slot `pos` of
-                // its class, so the first declared `double` is XMM1. The
-                // corpus bytes, not a model preference, picked this.
+                // The PAIR rule, identical for a free function and a member:
+                // parameter `pos` (a member's `this` is 0) lands in pair `pos`
+                // of its class, so a member's first declared `double` is XMM1
+                // and a free `f(int, double)`'s is XMM1 - the callee opens
+                // `movsd %xmm1, 0x8(%rsp)` in both cases. The corpus bytes and a
+                // harness driver's objdump, not a model preference, picked this,
+                // and `tests/float_abi.rs` pins it on assembled code.
                 let grp = match k {
-                    ArgKind::Int => {
-                        if abi.member {
-                            ARG_REGS.get(pos).copied()
-                        } else {
-                            ARG_REGS.get(int_slot).copied()
-                        }
-                    }
-                    ArgKind::F32 | ArgKind::F64 => {
-                        if abi.member {
-                            ARG_XMM.get(pos).copied()
-                        } else {
-                            ARG_XMM.get(xmm_slot).copied()
-                        }
-                    }
+                    ArgKind::Int => ARG_REGS.get(pos).copied(),
+                    ArgKind::F32 | ArgKind::F64 => ARG_XMM.get(pos).copied(),
                 };
                 let declared = match k {
                     ArgKind::Int => Ty::u64(),
@@ -713,17 +726,14 @@ impl<'a> Lifter<'a> {
                     ArgKind::F64 => Ty::f64(),
                 };
                 let Some(g) = grp else {
-                    // More parameters of one class than the ABI has registers
-                    // for: loud, counted, and the parameter is NOT invented.
-                    // The front end is asked to hand in a fully-typed,
-                    // in-budget signature; this is the net under the guess.
+                    // No pair left for this position (Windows x64 has four):
+                    // loud, counted, and the parameter is NOT invented. The
+                    // front end is asked to hand in a fully-typed, in-budget
+                    // signature; this is the net under the guess.
                     over_budget += 1;
                     continue;
                 };
-                if k == ArgKind::Int {
-                    int_slot += 1;
-                } else {
-                    xmm_slot += 1;
+                if k != ArgKind::Int {
                     float_params += 1;
                 }
                 let v = f.new_value(Ty::u64());

@@ -1557,33 +1557,59 @@ fn xmm_machine_proto(args: &[XArg]) -> Result<Vec<XArg>, String> {
 const X_ARG_INT_REGS: [&str; 4] = ["rcx", "rdx", "r8", "r9"];
 const X_ARG_FLOAT_REGS: [&str; 4] = ["xmm0", "xmm1", "xmm2", "xmm3"];
 
-/// Where the TARGET ABI delivers declared parameter `pos` (the register pair,
-/// above) versus where the LIFTER seeded it, for a FREE function: the lifter
-/// counts each register class separately (`int f(int, double)` = RCX + XMM0),
-/// the paired-slot rule spells that RCX + XMM1. A member needs no check — the
-/// lifter seeds members by pair, which is the ABI rule.
+/// Where the LIFTER seeds declared parameter `pos` of class `a`. This is a
+/// MIRROR of `lift.rs::new_abi`: parameter `pos` is seeded from the register
+/// pair its position owns — `ARG_REGS[pos]` for an integer, `ARG_XMM[pos]` for
+/// a float — the same rule for free functions and members (a member's `this`
+/// is `pos 0` and spends pair 0 in both classes). `crates/arch-x86/tests/
+/// float_abi.rs` pins that seeding on hand-assembled bytes; the mirror is kept
+/// honest by those tests, and a lifter change that diverges from it has to
+/// update this function, which is the point of naming it.
+fn lifter_seed_home(pos: usize, a: XArg) -> Option<&'static str> {
+    match a {
+        XArg::Int => X_ARG_INT_REGS.get(pos).copied(),
+        _ => X_ARG_FLOAT_REGS.get(pos).copied(),
+    }
+}
+
+/// Where the TARGET ABI delivers declared parameter `pos`: the register pair,
+/// measured (ROADMAP M8, commit 0b4b2dd) with `llvm-objdump -d` of a harness
+/// driver and a runtime probe — a non-static member's `this` takes pair 0 in
+/// both classes, so its first `float`/`double` arrives in XMM1, and a free
+/// `double f(int, double)` opens the same `movsd %xmm1,0x8(%rsp)` because
+/// position 1 owns XMM1. `xmm_machine_proto`/`native_wrapper_x` are the C side
+/// of the same fact: the machine prototype passes its arguments at declared
+/// positions, which is what makes clang fill the pairs.
+fn target_deliver_home(pos: usize, a: XArg) -> Option<&'static str> {
+    match a {
+        XArg::Int => X_ARG_INT_REGS.get(pos).copied(),
+        _ => X_ARG_FLOAT_REGS.get(pos).copied(),
+    }
+}
+
+/// Compare a seeding rule against the target ABI's delivery, position by
+/// position. Wherever they name different registers, the C side and the machine
+/// side would read different bytes and the comparison would measure the model
+/// gap: name the parameter, both registers and why, and keep the function out
+/// of the match column.
 ///
-/// Wherever the two disagree, the C side and the machine side would read
-/// different registers, and the comparison would measure the model gap. Name
-/// it and keep the function out of the match column.
-fn xmm_home_mismatch(args: &[XArg]) -> Option<String> {
-    let (mut ic, mut fc) = (0usize, 0usize);
-    for (pos, a) in args.iter().enumerate() {
-        let (seeded, delivered) = match a {
-            XArg::Int => (
-                X_ARG_INT_REGS.get(ic).copied(),
-                X_ARG_INT_REGS.get(pos).copied(),
-            ),
-            _ => (
-                X_ARG_FLOAT_REGS.get(fc).copied(),
-                X_ARG_FLOAT_REGS.get(pos).copied(),
-            ),
-        };
+/// The seeding rule is a parameter because that is the half that can rot: the
+/// lifter used to count each register CLASS separately (`int f(int a, double b)`
+/// = RCX + XMM0), which disagrees with the pair rule at position 1 — the guard
+/// was written to file that disagreement, the lifter has since been fixed to the
+/// pair rule, and the test below feeds the guard the per-class rule to prove it
+/// still bites. A guard that cannot fail is not a guard.
+fn home_mismatch(
+    args: &[XArg],
+    seeded_by: &dyn Fn(usize, XArg) -> Option<&'static str>,
+) -> Option<String> {
+    for (pos, &a) in args.iter().enumerate() {
+        let (seeded, delivered) = (seeded_by(pos, a), target_deliver_home(pos, a));
         match (seeded, delivered) {
             (Some(s), Some(d)) if s == d => {}
             (Some(s), Some(d)) => {
                 return Some(format!(
-                    "the lifter seeds parameter {pos} ({}) in {s}, the target ABI delivers it in {d} (paired slots vs per-class seeding): the two sides would read different registers",
+                    "the lifter seeds parameter {pos} ({}) in {s}, the target ABI delivers it in {d} (seeding rule vs register pairs): the two sides would read different registers",
                     match a {
                         XArg::Int => "integer",
                         XArg::F32 => "float",
@@ -1594,12 +1620,19 @@ fn xmm_home_mismatch(args: &[XArg]) -> Option<String> {
             // Past the four pairs: the signature classifier already refuses it.
             _ => return None,
         }
-        match a {
-            XArg::Int => ic += 1,
-            _ => fc += 1,
-        }
     }
     None
+}
+
+/// The guard the pipeline runs: lifter seeding (the pair rule, mirrored above)
+/// against target delivery (the pair rule, measured). Every shape the pipeline
+/// admits agrees today, so this returns `None` for all of them and NO float
+/// function is excluded on this ground — which is the honest outcome of a fixed
+/// lifter, not a dead check: `home_mismatch` compares two named rules and bites
+/// on any seeding that disagrees (see the test), and the corpus still has no
+/// mixed free signature to exercise it end to end.
+fn xmm_home_mismatch(args: &[XArg]) -> Option<String> {
+    home_mismatch(args, &lifter_seed_home)
 }
 
 /// The machine side's float extern: declared types from the signature
@@ -2256,13 +2289,15 @@ pub(crate) fn t2_cpp_run(
         }
         let xargs = xmm_params(&s.f);
         let xret = xmm_ret(&s.f);
-        // A FREE function's parameter homes: the lifter seeds each register
-        // class separately, the target ABI delivers by register PAIR. Where the
-        // two disagree, the C side and the machine side read different
-        // registers, and the comparison measures the model gap instead of the
-        // decompilation — so it is not run, and the reason is printed. (No
-        // corpus function hits it today: every compared float parameter sits at
-        // a position where the two rules name the same register.)
+        // A FREE function's parameter homes: the lifter seeds declared
+        // parameter `pos` from the register PAIR its position owns and the
+        // target ABI delivers it in that same pair, so the two sides read the
+        // same register and the comparison measures the decompilation. The
+        // check is not decoration — a seeding rule that disagrees (the per-class
+        // count the lifter used to run) names the parameter and both registers
+        // and keeps the function out of the match column, and the guard's test
+        // feeds it exactly that. (No corpus function exercises it: the corpus has
+        // no mixed free signature, the named gap ROADMAP records.)
         if class == "xmm" {
             if let Some(g) = xmm_home_mismatch(&xargs) {
                 skip(&mut rep, &g, &tag);
@@ -3142,35 +3177,92 @@ mod tests {
         );
     }
 
-    /// The free-function home check: the lifter seeds each register CLASS
-    /// separately, the target ABI delivers by register PAIR. Where the two name
-    /// different registers the two sides would read different bytes, so the
-    /// function is not run and the reason is printed.
+    /// The home guard with the lifter's seeding: the pair rule on both sides,
+    /// so it names NOTHING for any in-budget shape. That is what a fixed lifter
+    /// looks like from the guard's seat — no float function is excluded on this
+    /// ground, and the corpus' five XMM0-class functions and the window members
+    /// are all compared (the numbers below prove it end to end).
     #[test]
     fn a_free_function_is_compared_only_where_the_two_home_rules_agree() {
-        assert_eq!(xmm_home_mismatch(&[XArg::F64]), None);
-        assert_eq!(xmm_home_mismatch(&[XArg::F64, XArg::F64]), None);
-        assert_eq!(xmm_home_mismatch(&[XArg::Int, XArg::Int]), None);
+        for args in [
+            &[XArg::F64][..],
+            &[XArg::Int][..],
+            &[XArg::Int, XArg::Int][..],
+            &[XArg::F64, XArg::F64][..],
+            // The mixed shapes the fixed lifter now seeds by pair: the free
+            // `f(int, double)` and its mirror, the three-parameter shape, and a
+            // full four-pair mix. All agree; all are compared.
+            &[XArg::Int, XArg::F64][..],
+            &[XArg::F64, XArg::Int][..],
+            &[XArg::F64, XArg::Int, XArg::F64][..],
+            &[XArg::Int, XArg::F32, XArg::F64, XArg::Int][..],
+            &[XArg::F64, XArg::F64, XArg::F64, XArg::F64][..],
+        ] {
+            assert_eq!(xmm_home_mismatch(args), None, "{args:?}");
+        }
+        // A fifth parameter has no pair: the signature classifier refuses it
+        // before the guard sees it, and the guard says nothing (None = "no
+        // disagreement to name"), never a second opinion.
         assert_eq!(
-            xmm_home_mismatch(&[XArg::F64, XArg::F64, XArg::F64, XArg::F64]),
+            xmm_home_mismatch(&[XArg::F64, XArg::F64, XArg::F64, XArg::F64, XArg::F64]),
             None
         );
-        // `double f(int, double)`: seeded XMM0 (the lifter's per-class count),
-        // delivered XMM1 (pair 1). The corpus has no such function; if one
-        // appears, this is the named reason that keeps it out of the match
-        // column instead of a mismatch that blames the decompiler.
-        let g = xmm_home_mismatch(&[XArg::Int, XArg::F64]).unwrap();
+    }
+
+    /// The guard is LIVE, not a `None` in a trench coat: hand it a seeding rule
+    /// that disagrees with delivery and it bites, parameter by parameter. The
+    /// rule fed here is the one the lifter used to run — each register CLASS
+    /// counting its own slots, so `int f(int a, double b)` seeded XMM0 for a
+    /// parameter the machine delivers in XMM1. The shapes where the old rule and
+    /// the pair rule happen to agree (all-integer, all-float) must NOT fire: the
+    /// guard measures the disagreement, not the presence of a float.
+    #[test]
+    fn the_home_guard_bites_when_the_seeding_rule_disagrees() {
+        let per_class = |args: &'static [XArg]| {
+            move |pos: usize, a: XArg| -> Option<&'static str> {
+                let floats_before = args[..pos].iter().filter(|k| **k != XArg::Int).count();
+                match a {
+                    XArg::Int => X_ARG_INT_REGS.get(pos - floats_before).copied(),
+                    _ => X_ARG_FLOAT_REGS.get(floats_before).copied(),
+                }
+            }
+        };
+        // `double f(int, double)`: seeded XMM0, delivered XMM1.
+        let a: &'static [XArg] = &[XArg::Int, XArg::F64];
+        let g = home_mismatch(a, &per_class(a)).unwrap();
         assert!(g.contains("parameter 1"), "{g}");
+        assert!(g.contains("double"), "{g}");
         assert!(g.contains("xmm0") && g.contains("xmm1"), "{g}");
-        // The mirror case: a float at pair 0, an int at pair 1 — the lifter
-        // seeds the int RCX, the ABI delivers it in RDX.
+        // The mirror: a float at pair 0, an int at pair 1 — the old rule seeded
+        // the int RCX, the ABI delivers it in RDX.
+        let b: &'static [XArg] = &[XArg::F64, XArg::Int];
         assert!(
-            xmm_home_mismatch(&[XArg::F64, XArg::Int])
+            home_mismatch(b, &per_class(b))
                 .unwrap()
-                .contains("rcx"),
+                .contains("parameter 1 (integer) in rcx, the target ABI delivers it in rdx"),
             "{}",
-            xmm_home_mismatch(&[XArg::F64, XArg::Int]).unwrap()
+            home_mismatch(b, &per_class(b)).unwrap()
         );
+        // The three-parameter shape fires at its FIRST disagreement (position 1,
+        // rcx vs rdx) — the position rule and the class rule part there.
+        let c: &'static [XArg] = &[XArg::F64, XArg::Int, XArg::F64];
+        assert!(
+            home_mismatch(c, &per_class(c))
+                .unwrap()
+                .contains("parameter 1"),
+            "{}",
+            home_mismatch(c, &per_class(c)).unwrap()
+        );
+        // Where the two rules name the same registers, nothing is named: an
+        // all-integer and an all-float signature are compared by the gate.
+        let d: &'static [XArg] = &[XArg::Int, XArg::Int, XArg::Int];
+        assert_eq!(home_mismatch(d, &per_class(d)), None);
+        let e: &'static [XArg] = &[XArg::F64, XArg::F64];
+        assert_eq!(home_mismatch(e, &per_class(e)), None);
+        // And the rule the pipeline actually runs bites on none of them.
+        for args in [d, e, a, b, c] {
+            assert_eq!(home_mismatch(args, &lifter_seed_home), None, "{args:?}");
+        }
     }
 
     /// The signature classifier, on the corpus' own demangled texts. Floats
@@ -3641,6 +3733,140 @@ mod tests {
             );
         }
         // One flipped bit on the C side of a window+float job: caught.
+        let bad = t2_cpp_run(
+            std::slice::from_ref(&obj),
+            out_dir.to_str().unwrap(),
+            8,
+            usize::MAX,
+            true,
+        )
+        .expect("the sabotage pass runs");
+        assert_eq!(bad.compared, 8, "the same jobs run");
+        assert_eq!(bad.mismatched, 8, "{:?}", bad.mismatches);
+    }
+
+    /// The FREE mixed-signature shape — `int f(int a, double b)` — through the
+    /// real gate, value-verified: hand-assembled machine code, the emitted C,
+    /// clang's own call lowering, the answer pinned bitwise.
+    ///
+    /// `f` is `?f@@YAHHN@Z` (llvm-nm: `int __cdecl f(int, double)`), so `a`
+    /// spends pair 0 (RCX) and `b` spends pair 1 (XMM1):
+    ///
+    /// ```text
+    /// cvttsd2si eax, xmm1     F2 0F 2C C1   eax = (int)b              <- pair 1
+    /// shr     rcx, 32         48 C1 E9 20   rcx = the int's HIGH half (the
+    ///                                       table's int slot is the raw bits of
+    ///                                       a row value, so its low half is 0
+    ///                                       and only the high half carries it)
+    /// add     eax, ecx        01 C8         eax = (int)b + (int)(a >> 32)
+    /// ret                     C3
+    /// ```
+    ///
+    /// The machine side declares the real prototype (`extern uint64_t
+    /// xn0(uint64_t, double)`), so clang delivers `b` in XMM1 and pins the
+    /// undeclared float pair (XMM0 — pair 0's float half, spent on the `int`) to
+    /// 0.0 bits. The decompiled side can only answer `(int)b + (a >> 32)` if the
+    /// lifter seeds the DECLARED double from XMM1. Seeded from XMM0 — the
+    /// float-CLASS index — the `cvttsd2si` reads an undeclared register: the
+    /// answer is undef-tainted, the gate refuses to run the function at all
+    /// (`returns RAX unwritten on some path`, `xmm_functions = 0`, the home guard
+    /// behind it), and the answer the C side would print is `(a >> 32)` alone —
+    /// the b term silently gone. Red here, on values, is the point: the pair rule
+    /// is measured, not asserted in a comment.
+    ///
+    /// The answers are pinned from the bytes and the shared table, not from the
+    /// decompiler: slot 0 of row v is the int (the raw bits of
+    /// `FLOAT_ROWS[v][0]`, whose high half is a small magnitude) and slot 1 is
+    /// the double. The sabotage pass — one flipped bit of the C side's answer —
+    /// must be caught on every vector.
+    #[test]
+    fn a_free_mixed_signature_is_value_verified_on_the_pair_homes() {
+        let cc = std::env::var("CC").unwrap_or_else(|_| "clang".to_string());
+        if Command::new(&cc).arg("--version").output().is_err() {
+            eprintln!("SKIP: {cc} is not on PATH");
+            return;
+        }
+        let dir = std::env::temp_dir().join("rdec_t2pair_hermetic");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let asm = concat!(
+            ".file \"pair_demo.s\"\n",
+            ".text\n",
+            ".globl \"?f@@YAHHN@Z\"\n",
+            "\"?f@@YAHHN@Z\":\n",
+            // cvttsd2si eax, xmm1
+            ".byte 0xF2, 0x0F, 0x2C, 0xC1\n",
+            // shr rcx, 32
+            ".byte 0x48, 0xC1, 0xE9, 0x20\n",
+            // add eax, ecx
+            ".byte 0x01, 0xC8\n",
+            ".byte 0xC3\n",
+        );
+        let sp = dir.join("pair_demo.s");
+        let op = dir.join("pair_demo.obj");
+        std::fs::write(&sp, asm).expect("write .s");
+        let out = Command::new(&cc)
+            .arg("-target")
+            .arg("x86_64-pc-windows-msvc")
+            .arg("-c")
+            .arg(&sp)
+            .arg("-o")
+            .arg(&op)
+            .output()
+            .expect("run clang");
+        assert!(
+            out.status.success(),
+            "clang must assemble the hand-written object: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let obj = op.to_str().unwrap().to_string();
+        let out_dir = dir.join("gen");
+        let rep = t2_cpp_run(
+            std::slice::from_ref(&obj),
+            out_dir.to_str().unwrap(),
+            8,
+            usize::MAX,
+            false,
+        )
+        .expect("the gate runs on the hand-written free mixed-signature function");
+        assert_eq!(rep.xmm_functions, 1, "the XMM class, free form: {rep:?}");
+        assert_eq!(rep.rax_functions, 0);
+        assert_eq!(rep.win_functions, 0);
+        assert_eq!(refuse_not_broken(&rep), 0, "nothing refused/broken");
+        assert_eq!(rep.compared, 8, "eight float vectors, all compared");
+        assert_eq!(rep.mismatched, 0, "mismatches: {:?}", rep.mismatches);
+        assert_eq!(
+            rep.fn_buckets
+                .values()
+                .filter(|b| **b == "compared+match")
+                .count(),
+            1,
+            "the function is compared and matches: {:?}",
+            rep.fn_buckets
+        );
+        // The machine's own answer, from the bytes: (int)b + (int)(bits(a) >> 32),
+        // the 32-bit write leaving bits 63:32 zero.
+        let want = |row: &[f64; 4]| -> u64 {
+            let a = (row[0].to_bits() >> 32) as u32;
+            let b = row[1] as i32;
+            a.wrapping_add(b as u32) as u64
+        };
+        let wants: Vec<u64> = FLOAT_ROWS.iter().map(want).collect();
+        for (v, &w) in wants.iter().enumerate() {
+            assert_eq!(
+                rep.native_values.get(&v),
+                Some(&w),
+                "vec {v}: the callee read the double from XMM1, pair 1 (b={}, a>>32={:#x})",
+                FLOAT_ROWS[v][1],
+                FLOAT_ROWS[v][0].to_bits() >> 32
+            );
+        }
+        // The answers are not all the same number, and both parameters move
+        // them: the int by billions, the double by its own magnitude.
+        let mut seen = wants;
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), 8, "eight distinct answers, eight vectors");
+        // One flipped bit on the C side: caught on every vector.
         let bad = t2_cpp_run(
             std::slice::from_ref(&obj),
             out_dir.to_str().unwrap(),
