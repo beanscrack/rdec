@@ -1392,3 +1392,34 @@ red before the fix and green after.
 different `this` images) was DISPROVED, not fixed — the machine answers equal `W[j][0]`
 bit-for-bit on all five rows and the C answers are `W[j][0] + p`, which rounds to exactly
 `p` where `W[j][0]` is tiny. One bug, not two. The disproof is in the commit message.
+
+### The pair rule closed, and three things it exposed (2026-11-02)
+
+`Lifter::new_abi` now seeds BOTH classes by declared position: a free
+`int f(int a, double b)` seeds RCX + **XMM1**, `int g(double,int,double)` seeds
+XMM0 + RDX + XMM2, and a member's `this` spends pair 0 in both classes so its first
+`double` is XMM1 with no special case. Red-first, quoted in the commit; the corpus gates
+moved by exactly nothing, which is the honest expectation with no corpus witness.
+
+Three findings, all named, none papered over:
+
+1. **The emitter's signed int -> float cast emitted C that does not compile.** `s` was
+   the string `"(int64_t)"` inside `({s})({x})`, so every `cvtsi2sd`-from-signed produced
+   `((int64_t))(x)` — clang: `expected expression`. Zero corpus witnesses, so no gate saw
+   it. Pinned by two hermetic tests, including that the interpreter shows the f32 rounding
+   (`cvtsi2ss` of 16777217 → 16777216.0) and so does the emitted C.
+2. **The T2 home guard's lifter-side homes are a MIRROR of `new_abi`, not lifted data** —
+   the seeded register per parameter is not visible on `Function`. `home_mismatch` takes
+   the rule as `&dyn Fn` so a test can hand it the old class-index rule and prove it
+   bites, which keeps it falsifiable. The remaining work is to carry the seeding out of
+   the lifter as evidence and consume it in `m8.rs`.
+3. **The corpus has no witness for the free pair rule.** Adding `int f(int,double)` to the
+   generator shifts every corpus count (120 objects / 141 functions / 124 symbols / 68
+   names / 1364 runs), so it needs a planned re-baseline; the witnesses are hermetic until
+   then. This is the first entry in the ledger where a MISSING FIXTURE, not a missing
+   feature, is what let a miscompile-class bug sit unnoticed.
+
+Recorded as a testing fact: `F2` is the scalar-DOUBLE prefix, `F3` the scalar-SINGLE one.
+The first draft of the `cvtsi2sd` witness used `F3`; the lifter correctly produced a
+`float` and the emitted text looked like a lifter bug. Decode your own test bytes with
+`llvm-objdump` before believing a red test.
