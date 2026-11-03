@@ -390,7 +390,13 @@ impl<'a> Emitter<'a> {
                     );
                     return None;
                 }
-                let s = "(int64_t)".to_string();
+                // The cast spelled into `({s})({x})` below: `s` must be a TYPE, not a
+                // cast already. `"(int64_t)"` produced `((int64_t))(x)` - a cast of
+                // nothing - and clang answers `expected expression`, so every signed
+                // int -> float conversion (cvtsi2sd from a signed source) emitted C that
+                // did not compile. No corpus function hits it, which is exactly why the
+                // hermetic test in crates/arch-x86/tests/float_abi.rs exists.
+                let s = "int64_t".to_string();
                 match to {
                     Ty::Float { w: FWidth::F32 } => format!("(float)(({s})({x}))"),
                     _ => format!("(double)(({s})({x}))"),
