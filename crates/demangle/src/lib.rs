@@ -569,7 +569,13 @@ fn parse(sym: &str) -> Result<Demangled, String> {
     } else if id.starts_with("??$") {
         return Err(format!("template argument list (name '{id}')"));
     } else if let Some(rest) = id.strip_prefix("??_") {
-        let (tag, glued) = rest.split_at(1);
+        let Some((tag, glued)) = rest.split_at_checked(1) else {
+            return Err(if rest.is_empty() {
+                "truncated operator tag in '??_' name".to_string()
+            } else {
+                format!("malformed operator tag in '??_{rest}' name")
+            });
+        };
         match tag {
             "7" | "8" => table = Some(TableKind::Vftable),
             "9" | "B" => table = Some(TableKind::Vbtable),
@@ -1243,6 +1249,23 @@ mod tests {
         assert_eq!(
             reason("?f@C@@QAEXZ"),
             "non-x64 member function code (modifier letter 'A' is not 'E')"
+        );
+    }
+
+    #[test]
+    fn truncated_and_non_ascii_operator_tags_are_unsupported_not_panics() {
+        // `??_` with no tag byte: `rest` is empty, so `split_at(1)` would panic.
+        assert!(reason("??_@@YAHXZ").starts_with("truncated operator tag"));
+        // A multibyte char as the tag: byte index 1 is not a char boundary.
+        assert!(reason("??_éCircle@@6B@").starts_with("malformed operator tag"));
+        // Valid vtable / deleting-destructor tags still work.
+        assert_eq!(name("??_7Circle@@6B@").0, "const Circle::`vftable'");
+        // Deleting-destructor tag `E` is accepted (not rejected as an
+        // unknown operator); the exact code field may still be refused
+        // downstream, but never as a malformed/truncated tag.
+        assert!(
+            !reason("??_ECircle@@QAEXXZ").starts_with("malformed operator tag")
+                && !reason("??_ECircle@@QAEXXZ").starts_with("truncated operator tag")
         );
     }
 
