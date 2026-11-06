@@ -229,6 +229,13 @@ pub enum Fault {
     IntMinDivMinusOne,
     /// A read of a flag bit the model says is undefined.
     UndefFlag(Flag),
+    /// A flag the MODEL needs in order to compute a flag was not in the flag
+    /// dict at that node. `UndefFlag` is the x86 "this flag is undefined after
+    /// that instruction" fault; this one is structural - the IR asks the
+    /// interpreter for a value the node never carried. The payload is the
+    /// operation, so a T2 row says which. The field is `&'static str` because
+    /// `Fault` is `Copy` (jump-table tests compare faults by value).
+    MissingFlag(&'static str),
     /// A load from an address the state has no bytes for and no rule for.
     UnmodeledLoad,
     /// An operand with no definition. In SSA this cannot happen in valid IR, so
@@ -288,6 +295,18 @@ pub enum Outcome {
 #[derive(Clone, Debug)]
 pub struct Exec {
     pub outcome: Outcome,
+    /// Steps the run charged against its budget: one per block entry plus one
+    /// per instruction. The budget is a COUNT, so the bound is checkable
+    /// (`crates/core/tests/interp_block_transfer.rs`) instead of inferred from
+    /// "it finished"; a run that reports `Budget` at 20 001 steps proves the
+    /// bound fires, which a wall-clock measurement cannot.
+    ///
+    /// `Exec::diff` deliberately ignores it: TV compares *meaning* (outcome,
+    /// effects, memory) across two IR states, and a pass that legitimately
+    /// deletes an instruction changes the step count without changing the
+    /// answer. Comparing steps there would report every good optimisation as a
+    /// difference.
+    pub steps: usize,
     pub effects: Vec<Effect>,
     /// Every byte ever written, final value. A pass that writes extra bytes,
     /// skips bytes, or changes a value is caught here.
@@ -491,6 +510,7 @@ pub fn run_program_budget(
     let outcome = it.exec_entry(inputs);
     Exec {
         outcome,
+        steps: it.steps,
         effects: it.effects,
         mem: it.mem.snapshot(),
     }
@@ -619,6 +639,32 @@ impl<'a> Interp<'a> {
             if cur == NO_BB || cur as usize >= self.f.blocks.len() {
                 self.effects.push(Effect::Exited);
                 return Outcome::NoReturn;
+            }
+            // A CONTROL TRANSFER IS WORK, and the budget must charge it.
+            //
+            // The budget used to be charged only per instruction, so a block
+            // with no instructions at all cost nothing, and a cycle made of
+            // such blocks ran forever: `bb1: br bb1` — the lifted shape of a
+            // `jmp .` — enters `bb1`, executes zero instructions, jumps to
+            // `bb1`, charges zero steps, and `self.steps > self.budget` can
+            // never become true. Measured on a 270-byte hostile object (the
+            // fuzzer's seed 1, iteration 1992, `.text` = 152 random bytes;
+            // `crates/arch-x86/tests/fuzz_findings.rs::the_seed1_hang_input_
+            // terminates_under_a_step_budget`), `run_budget(.., 20_000)` did
+            // not take 20 000 steps: it took over 300 SECONDS and never
+            // finished. That is a DoS on every user of the interpreter —
+            // `rdec fuzz`, `rdec t2`, and TV — from one 4 KB object, and no
+            // wall-clock deadline in a driver can interrupt it from outside.
+            //
+            // The fix is the bound the model already promises, applied to the
+            // unit that actually advances: charge one step per block entry.
+            // Every lap of every cycle now spends budget, so every run is
+            // bounded by `budget` in units of work the machine can count, and
+            // a function that cannot finish says `Outcome::Budget` — loud,
+            // counted, and the same outcome the instruction path reports.
+            self.steps += 1;
+            if self.steps > self.budget {
+                return Outcome::Budget;
             }
             self.prev_bb = from;
             let block = &self.f.blocks[cur as usize];
@@ -1187,7 +1233,20 @@ impl<'a> Interp<'a> {
                 d.sf = Some(bit(res, w.bits() - 1));
                 d.of = if n == 1 {
                     match fo {
-                        FlagsOp::Shl { .. } => Some(bit(res, w.bits() - 1) != d.cf.unwrap()),
+                        FlagsOp::Shl { .. } => {
+                            // OF for a 1-bit shift is "the sign changed", which
+                            // needs the CF the shift just set. The FlagsOp node
+                            // does not carry CF, so a node whose flag dict has
+                            // none is a lifted IR that this interpreter cannot
+                            // execute: fault LOUD (the message names the
+                            // operation) - an `unwrap()` here is a panic in the
+                            // middle of a T2 comparison, and a silent `None`
+                            // would be a missing flag nobody notices.
+                            let Some(cf) = d.cf else {
+                                return Err(Fault::MissingFlag("shl"));
+                            };
+                            Some(bit(res, w.bits() - 1) != cf)
+                        }
                         FlagsOp::Shr { .. } => Some(bit(x, w.bits() - 1)),
                         _ => Some(bit(x, w.bits() - 1)),
                     }

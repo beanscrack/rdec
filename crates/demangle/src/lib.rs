@@ -158,7 +158,26 @@ struct Parser<'a> {
     pos: usize,
     /// Types fully parsed so far, for the `0`..`5` repeat-reference digits.
     types: Vec<String>,
+    /// Nesting depth of the type parser, bounded by `MAX_TYPE_DEPTH`.
+    depth: usize,
 }
+
+/// How deep a nested type encoding the parser will follow.
+///
+/// The bound is not stylistic. `parse_type` recurses per pointer/reference
+/// level, so the DEPTH IS A FUNCTION OF THE INPUT LENGTH, and a decorated name
+/// is attacker-supplied bytes from an object's symbol table. Measured on the
+/// code before this constant existed: `?f@@YAH` + 150 `P` + `AH@Z` demangles,
+/// while `?f@@YAH` + 1000 `P` kills the process with `STATUS_STACK_OVERFLOW`
+/// (0xc00000fd), which is an abort: `catch_unwind` cannot catch it and a fuzz
+/// gate cannot report it. A 4 KB name in a hostile `.obj`'s string table is all
+/// it takes.
+///
+/// 64 is above anything a C++ compiler emits (a `****` type is exotic; MSVC's
+/// own demangler caps its nesting too) and below the depth at which a debug
+/// build's 8 MiB stack runs out by a factor of ten. Past it the name is
+/// refused by name and counted, which is what `Unsupported` is for.
+const MAX_TYPE_DEPTH: usize = 64;
 
 type PErr = String;
 
@@ -168,6 +187,7 @@ impl<'a> Parser<'a> {
             s: s.as_bytes(),
             pos: 0,
             types: Vec::new(),
+            depth: 0,
         }
     }
     fn peek(&self) -> Option<u8> {
@@ -312,7 +332,23 @@ impl<'a> Parser<'a> {
         Ok(t)
     }
 
+    /// The depth-guarded entry to the type parser. Every recursive edge in the
+    /// grammar (`P`/`Q`/`R` pointers, `AE..` references, the `?A` wrapper) runs
+    /// through here, so one counter bounds the whole tree.
     fn parse_type_inner(&mut self) -> Result<String, PErr> {
+        if self.depth >= MAX_TYPE_DEPTH {
+            return Err(format!(
+                "type nesting deeper than {MAX_TYPE_DEPTH} levels ({} remaining bytes of decoration)",
+                self.s.len() - self.pos
+            ));
+        }
+        self.depth += 1;
+        let r = self.parse_type_body();
+        self.depth -= 1;
+        r
+    }
+
+    fn parse_type_body(&mut self) -> Result<String, PErr> {
         let Some(c) = self.peek() else {
             return Err("truncated decoration (type expected)".to_string());
         };
@@ -367,7 +403,15 @@ impl<'a> Parser<'a> {
         if c == b'A' {
             if self.peek_at(1) == Some(b'E') && matches!(self.peek_at(2), Some(b'A'..=b'D')) {
                 self.pos += 2; // 'A' 'E'
-                let q = self.peek().unwrap();
+                               // The byte at `pos` is now the qualifier. The `AE` arm above
+                               // tested bytes at +1 and +2, which is the SAME index this reads
+                               // (pos advanced by 2), so the guard does line up here - but the
+                               // `unwrap` is a claim about bytes the caller supplied, and
+                               // c660ff3 is the precedent for what that claim is worth on a
+                               // truncated name. Ask, refuse by name, count.
+                let q = self
+                    .peek()
+                    .ok_or("truncated decoration (reference qualifier after `AE`)")?;
                 self.pos += 1; // qualifier
                 let inner = self.parse_type()?;
                 let qual = match q {
@@ -414,8 +458,7 @@ impl<'a> Parser<'a> {
                 self.pos += 1; // __ptr64 / near / __ptr32 marker
             }
             let qual = match self.peek() {
-                Some(b'A') | Some(b'B') | Some(b'C') | Some(b'D') => {
-                    let q = self.peek().unwrap();
+                Some(q @ (b'A' | b'B' | b'C' | b'D')) => {
                     self.pos += 1;
                     q
                 }

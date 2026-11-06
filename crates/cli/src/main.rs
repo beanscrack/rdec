@@ -9,6 +9,7 @@ use rdec_core::ty::{Sx, Ty, Width};
 use rdec_core::verify;
 use rdec_verify::{hw, model_shim, Sabotage};
 
+mod fuzz;
 mod m1;
 mod m4;
 mod m8;
@@ -84,6 +85,13 @@ fn main() {
                 1
             }
         },
+        "fuzz" => match fuzz::cmd_fuzz(&args) {
+            Ok(rc) => rc,
+            Err(e) => {
+                eprintln!("fuzz: {e}");
+                2
+            }
+        },
         "status" => cmd_status(),
         "probe" => cmd_probe(&args),
         "help" | "--help" | "-h" => {
@@ -119,6 +127,11 @@ fn print_help() {
          \x20                                   (free/static integer functions),\n\
          \x20                                   window class (member functions,\n\
          \x20                                   `this` over a preloaded window)\n\
+         \x20 fuzz [--iterations N] [--seed S]  hostile-input gate: generated objects and
+         \x20      [--out DIR] [--max-seconds N]  byte streams through the real pipeline
+         \x20                                   (load, demangle, discover, lift, passes,
+         \x20                                   verify, emit C, interpreter). Per-stage
+         \x20                                   census; exit 1 on any panic or hang
          \x20 status                          roadmap section 9's table, from commands\n\
          \n\
          coming next (M1): disasm <obj> [symbol]"

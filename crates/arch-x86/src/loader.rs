@@ -98,6 +98,13 @@ pub struct Object {
     pub sections: Vec<Section>,
     pub symbols: Vec<Symbol>,
     pub time_date_stamp: u32,
+    /// The string table's own `Size` field claims more bytes than the file
+    /// holds, so the table was sliced at EOF. A long name near the end of such
+    /// a table reads as `?` rather than as the neighbouring bytes: the loader
+    /// cannot recover the name, and a gate that cannot see this cannot tell a
+    /// missing name from a corrupt table. Counted by `rdec fuzz`, printed by
+    /// the gates that report gaps.
+    pub string_table_truncated: bool,
     /// RAW symbol-table index -> index into `symbols`. Auxiliary records map
     /// to the main symbol they extend, so a relocation index — which counts
     /// every raw entry — resolves through this and nothing else.
@@ -269,6 +276,16 @@ impl Object {
     }
 
     /// Symbols that name a location in executable code, in address order.
+    ///
+    /// The sort key is TOTAL. `Symbol::section` is `None` for a record with
+    /// `SectionNumber == 0` - an ABSOLUTE symbol, which every real-world object
+    /// carries (.debug$S contributes a wall of them; every linked image has
+    /// them). Such a symbol is filtered out here, so a `section.unwrap()` in the
+    /// key cannot fire *today* - and that is exactly the shape that rots: one
+    /// change to the filter, and discovery dies on an absolute symbol. `None`
+    /// sorts first (an absolute symbol has no section, so no address in one)
+    /// with the code comment saying so, so a future filter change gets defined
+    /// order instead of a panic.
     pub fn code_symbols(&self) -> Vec<usize> {
         let mut v: Vec<usize> = self
             .symbols
@@ -280,7 +297,15 @@ impl Object {
             })
             .map(|s| s.index)
             .collect();
-        v.sort_by_key(|&i| (self.symbols[i].section.unwrap(), self.symbols[i].offset, i));
+        // `None` (absolute) first: see the doc. Every key here is a total order
+        // over fields read from the file.
+        v.sort_by_key(|&i| {
+            (
+                self.symbols[i].section.unwrap_or(usize::MAX),
+                self.symbols[i].offset,
+                i,
+            )
+        });
         v
     }
 
@@ -408,12 +433,34 @@ pub fn load_bytes(bytes: &[u8], path: &str) -> Result<Object, String> {
         ));
     }
     need(20 + 40 * nsec, "the section headers")?;
+    // The symbol table cannot overlap the headers it is described by: a
+    // `PointerToSymbolTable` of 0 (the field's default, and the value a
+    // truncated write leaves behind) would make the loader read the FILE HEADER
+    // as symbol entries - the same family of misread as the `.bss` case below,
+    // and just as silent. Loud, naming the field.
+    if nsyms > 0 && symoff < 20 + 40 * nsec {
+        return Err(format!(
+            "{}: NumberOfSymbols {nsyms} at PointerToSymbolTable {symoff}, inside the headers (which end at {})",
+            path,
+            20 + 40 * nsec
+        ));
+    }
 
     // The string table sits after the symbol table.
     let strings_off = symoff + nsyms * 18;
+    let mut string_table_truncated = false;
     let strings: &[u8] = if strings_off + 4 <= bytes.len() {
         let len = u32le(bytes, strings_off) as usize;
-        let end = (strings_off + len).min(bytes.len());
+        // `max(4)`: the size field counts itself, so a table that declares
+        // fewer than 4 bytes is lying, and slicing `+4..end` with an `end`
+        // computed from the lie (start > end) panics. Clamped to the empty
+        // table, and counted: `strings_off + 4` is in bounds by the guard above.
+        let end = (strings_off + len.max(4)).min(bytes.len());
+        if end < strings_off + len {
+            // The table claims bytes the file does not have. Long names near
+            // its end then resolve to `?` - a loss the caller has to see.
+            string_table_truncated = true;
+        }
         &bytes[strings_off + 4..end]
     } else {
         &[]
@@ -431,11 +478,52 @@ pub fn load_bytes(bytes: &[u8], path: &str) -> Result<Object, String> {
         // `PointerToRawData == 0` is COFF for "this section has no data in
         // the file" (`.bss`: SizeOfRawData keeps the virtual size, content is
         // zero). Indexing the file at 0 would read the file header as content.
-        let data = if raw_size == 0 || raw_off == 0 || raw_off >= bytes.len() {
+        //
+        // Every OTHER case where the bytes are not there is an error, not an
+        // empty section: "no bytes" and "bytes we were promised and did not
+        // get" are different facts, and the second one read as the first is a
+        // decompiler that decompiles nothing and says nothing. The names of the
+        // field, the offset and the file length are in the message because the
+        // reader has to find the field in the file.
+        let data = if raw_size == 0 || raw_off == 0 {
             Vec::new()
+        } else if raw_off >= bytes.len() {
+            return Err(format!(
+                "{}: section {i} ({name}) has SizeOfRawData {raw_size} at PointerToRawData {raw_off}, past the end of a {}-byte file",
+                path,
+                bytes.len()
+            ));
+        } else if raw_off + raw_size > bytes.len() {
+            return Err(format!(
+                "{}: section {i} ({name}) SizeOfRawData {raw_size} at PointerToRawData {raw_off} runs {} bytes past the end of a {}-byte file",
+                path,
+                raw_off + raw_size - bytes.len(),
+                bytes.len()
+            ));
         } else {
-            bytes[raw_off..(raw_off + raw_size).min(bytes.len())].to_vec()
+            bytes[raw_off..raw_off + raw_size].to_vec()
         };
+        // The relocation table is bounded by the FILE before anything is
+        // allocated for it. `NumberOfRelocations` is a u16 read from the file;
+        // `Vec::with_capacity(nrel)` with a hostile count asks for
+        // `nrel * size_of::<Reloc>()` bytes up front, which is how a 20-byte
+        // object asks a CI runner for gigabytes. The per-entry check below
+        // stays (it is the one the test fires), this one is the allocation
+        // guard in front of it.
+        if nrel > 0
+            && rel_off
+                .checked_add(10 * nrel)
+                .map(|end| end > bytes.len())
+                .unwrap_or(true)
+        {
+            return Err(format!(
+                "{}: section {i} ({name}) relocation table runs off the end: \
+                 {nrel} relocations at PointerToRelocations {rel_off}, past the \
+                 end of a {}-byte file",
+                path,
+                bytes.len()
+            ));
+        }
         let mut relocations = Vec::with_capacity(nrel);
         for r in 0..nrel {
             let rpos = rel_off + 10 * r;
@@ -463,7 +551,10 @@ pub fn load_bytes(bytes: &[u8], path: &str) -> Result<Object, String> {
     // Symbols, skipping auxiliary entries.
     let mut symbols = Vec::new();
     // Raw entry index -> parsed symbol index, for relocation resolution.
-    let mut raw_symbol: Vec<usize> = Vec::new();
+    // Bounded: `NumberOfSymbols` is a file field, and every entry costs 18
+    // bytes of a file whose length is already checked, so the table can only
+    // be as long as the file.
+    let mut raw_symbol: Vec<usize> = Vec::with_capacity(nsyms.min(bytes.len() / 18 + 1));
     let mut pos = symoff;
     // `NumberOfSymbols` counts EVERY entry, auxiliary records included, so the
     // loop bound is entries consumed - not main symbols emitted.
@@ -478,6 +569,18 @@ pub fn load_bytes(bytes: &[u8], path: &str) -> Result<Object, String> {
         let typ = u16le(bytes, pos + 14);
         let storage = bytes[pos + 16];
         let naux = bytes[pos + 17] as usize;
+        // Auxiliary records count towards `NumberOfSymbols`, so a main symbol
+        // whose aux count runs past the declared table means the table and its
+        // own count disagree. Skipping to the next entry then reads the aux
+        // records as symbols (inventing symbols with the aux fields' values),
+        // and the `raw_symbol.len() == nsyms` invariant below would fire in a
+        // debug build and mis-map every relocation index in a release build.
+        if entries + 1 + naux > nsyms {
+            return Err(format!(
+                "{}: symbol {name} at {pos} declares {naux} auxiliary records, running past the {nsyms}-entry table",
+                path
+            ));
+        }
         let section = if (1..=nsec as i16).contains(&secnum) {
             Some((secnum - 1) as usize)
         } else {
@@ -540,6 +643,7 @@ pub fn load_bytes(bytes: &[u8], path: &str) -> Result<Object, String> {
         sections,
         symbols,
         time_date_stamp: stamp,
+        string_table_truncated,
         raw_symbol,
     })
 }
