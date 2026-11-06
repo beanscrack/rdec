@@ -10,6 +10,36 @@ use crate::ir::*;
 use crate::ty::{Sx, Ty, Width};
 
 // ---------------------------------------------------------------------------
+// the pass pipeline
+// ---------------------------------------------------------------------------
+
+/// THE pre-emission pass pipeline, run to a fixpoint (bounded, not to
+/// convergence: a pass that oscillates must stop and be reported, not spin).
+///
+/// This is one function on purpose. Flag elimination has to run here because
+/// `Ty::Flags` has no C spelling, so the order of these passes IS the semantics
+/// of every emitted function, and a second copy of the list - in a gate, in a
+/// fuzzer - would measure its own ordering instead of the product's.
+/// `rdec c`, `rdec cpp`, `rdec t2` and `rdec fuzz` all reach the IR through
+/// here (`m4::clean` is a thin alias), so "the passes broke SSA" means the same
+/// thing in every one of them.
+pub fn clean(f: &mut Function) {
+    for _ in 0..16 {
+        let mut ch = false;
+        ch |= crate::fuse::flag_elimination(f);
+        ch |= prune_phis(f);
+        ch |= const_fold(f);
+        ch |= copy_prop(f);
+        ch |= simplify_branches(f);
+        ch |= dead_store_elimination(f);
+        ch |= dead_code_elimination(f);
+        if !ch {
+            break;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // phi pruning: SSAn -> SSA
 // ---------------------------------------------------------------------------
 

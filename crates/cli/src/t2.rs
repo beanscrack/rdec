@@ -55,6 +55,10 @@ use std::time::{Duration, Instant};
 const PER_LINE: Duration = Duration::from_secs(20);
 /// Per-process patience, so a fast-printing loop cannot hold the gate open.
 const RUN_BUDGET: Duration = Duration::from_secs(120);
+/// How many lost comparisons get a name on the console. A fault is a comparison
+/// that is NOT claimed, so the names are the evidence, and a bounded print is
+/// still a print: the count on the census line tells you if it was truncated.
+const FAULT_LINES: usize = 40;
 
 // ---------------------------------------------------------------------------
 // The IR questions that decide whether a function has a comparable answer.
@@ -1168,8 +1172,24 @@ pub fn cmd_t2(args: &[String]) -> Result<i32, String> {
             .entry(snippet_of(&subs[*k].s.obj))
             .or_insert([0, 0]);
         let (Some(&x), Some(&y)) = (native.get(&g), crun.vals.get(&g)) else {
-            // One side faulted here: no verdict, and not a match either.
+            // One side faulted here: no verdict, and not a match either. Say
+            // WHICH side and with WHAT, next to WHICH function: a comparison
+            // lost is an equivalence claim that got smaller, and a census line
+            // that only counts it lets that shrink go unnoticed.
             not_compared += 1;
+            if not_compared <= FAULT_LINES {
+                let c_side = crun.faults.iter().find(|(i, _)| *i == g);
+                let n_side = native_faults.iter().find(|(i, _)| *i == g);
+                let (side, why) = match (n_side, c_side) {
+                    (Some((_, w)), _) => ("machine code", w.clone()),
+                    (None, Some((_, w))) => ("decompiled C", w.clone()),
+                    (None, None) => ("both/neither", "no fault record".to_string()),
+                };
+                println!(
+                    "NOT COMPARED: {} :: {}  vector {v}  side that faulted: {side}  fault: {why}",
+                    subs[*k].s.obj, subs[*k].s.sym
+                );
+            }
             continue;
         };
         row[1] += 1;

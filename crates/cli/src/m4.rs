@@ -11,8 +11,9 @@
 //!     same verifier, not with trust.
 use rdec_arch_x86::discover::Code;
 use rdec_arch_x86::lift::{lift_one_sigs, CalleeSig, CalleeTable, FnShape, RelocMap, RelocTarget};
-use rdec_core::emit_c::{callee_decl, emit_c_sig, Protos, Refusal, PRELUDE};
+use rdec_core::emit_c::{callee_decl, emit_c_sig, text_census, Protos, Refusal, PRELUDE};
 use rdec_core::ir::Function;
+use rdec_core::structure::{sum_reports, Report};
 use rdec_core::verify::verify_ssa;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -122,6 +123,102 @@ pub fn reloc_map_of(
         }
     }
     map
+}
+
+/// The structuring census, on the same footing as `calls_line` and `tail_line`:
+/// counted by the emitter from the statements the structuring walk built, per
+/// function, and summed here.
+///
+/// The numbers add up by construction: `N regions` is exactly
+/// `if + if/else + while`, `M functions structured` counts the functions that own
+/// at least one of them, and every number is cross-checked against the printed
+/// text by [`census_drift`] - a figure in this line is a fact about the C, never a
+/// claim about the code.
+pub fn control_flow_line(reports: &[Report], emitted: usize) -> String {
+    let rep = sum_reports(reports);
+    let structured = reports.iter().filter(|r| r.structured()).count();
+    let mut line = format!(
+        "control flow: {structured}/{emitted} functions structured | {} regions: {} if | \
+         {} if/else | {} while | {} short-circuit | {} blocks left as goto",
+        rep.ifs + rep.if_else + rep.whiles,
+        rep.ifs,
+        rep.if_else,
+        rep.whiles,
+        rep.shorts,
+        rep.flat
+    );
+    if !rep.reasons.is_empty() {
+        let rs: Vec<String> = rep
+            .reasons
+            .iter()
+            .map(|(k, n)| format!("{n} {k}"))
+            .collect();
+        line.push_str(&format!(" (reasons: {})", rs.join(", ")));
+    }
+    line
+}
+
+/// The readability census, printed and never thresholded: the `goto` statements
+/// and `lN:` labels in the emitted C, counted from that C. A structuring change is
+/// measured by this line moving down; the gate on the change is `t2`, which runs
+/// the same C, and this line is what tells a reader whether it got easier to read.
+pub fn readability_line(text: &str, emitted: usize) -> String {
+    let t = text_census(text);
+    format!(
+        "readability: {emitted} emitted functions | {} goto statements | {} labels | {} structured if \
+         | {} while",
+        t.gotos, t.labels, t.ifs, t.whiles
+    )
+}
+
+/// Where the emitter's structuring census and a scan of the emitted text disagree.
+/// `None` is the healthy case: the census is then exactly what the C contains,
+/// counted by two independent paths.
+///
+/// A structured `if` prints exactly one `if (...) {` line, an `else` arm exactly
+/// one `} else {`, a `while` exactly one `while (...) {`, and a function with no
+/// structured region prints none of those - so the two paths must land on the same
+/// numbers. When they do not, the census describes a file that does not exist.
+pub fn census_drift(reports: &[Report], text: &str) -> Option<String> {
+    let rep = sum_reports(reports);
+    let tc = text_census(text);
+    let mut d: Vec<String> = Vec::new();
+    if tc.ifs != rep.ifs + rep.if_else {
+        d.push(format!(
+            "the text has {} `if` statements, the walk built {}",
+            tc.ifs,
+            rep.ifs + rep.if_else
+        ));
+    }
+    if tc.els != rep.if_else {
+        d.push(format!(
+            "the text has {} `else` arms, the walk built {} if/else regions",
+            tc.els, rep.if_else
+        ));
+    }
+    if tc.whiles != rep.whiles {
+        d.push(format!(
+            "the text has {} `while` statements, the walk built {}",
+            tc.whiles, rep.whiles
+        ));
+    }
+    if tc.gotos != rep.gotos {
+        d.push(format!(
+            "the text has {} `goto` statements, the walk counted {}",
+            tc.gotos, rep.gotos
+        ));
+    }
+    if tc.labels != rep.labels {
+        d.push(format!(
+            "the text has {} labels, the walk marked {}",
+            tc.labels, rep.labels
+        ));
+    }
+    if d.is_empty() {
+        None
+    } else {
+        Some(d.join("; "))
+    }
 }
 
 /// The pre-emission pipeline. Flag elimination first: `Ty::Flags` has no C
@@ -564,6 +661,9 @@ pub fn cmd_c(args: &[String]) -> Result<i32, String> {
     let mut refused = 0usize;
     let mut pass_broken = 0usize;
     let mut keys: HashMap<String, usize> = HashMap::new();
+    // The structuring census, one report per EMITTED function (a refused
+    // function has no C, so it has no control flow to count).
+    let mut reports: Vec<Report> = Vec::new();
     let mut first_refusal: Option<String> = None;
     let mut first_pass_break: Option<String> = None;
     let mut all = String::new();
@@ -592,6 +692,31 @@ pub fn cmd_c(args: &[String]) -> Result<i32, String> {
         match emit_c_sig(&s.f, &protos) {
             Ok(out) => {
                 emitted += 1;
+                reports.push(out.structuring.clone());
+                // `RDEC_C_GOTOFLOW=1` prints the per-function readability
+                // exchange: what the flat label + `goto` spelling of THIS
+                // function costs, against what the printed C costs. The flat
+                // form is the before-picture computed from the same IR, in the
+                // same units, so a reader can see which functions structuring
+                // bought and which it did not, by name.
+                if std::env::var_os("RDEC_C_GOTOFLOW").is_some() {
+                    let flat = rdec_core::structure::flat_walk(&s.f).report;
+                    let st = &out.structuring;
+                    println!(
+                        "goto/label {} :: {}  goto {} -> {}  label {} -> {}  {}",
+                        s.obj,
+                        s.sym,
+                        flat.gotos,
+                        st.gotos,
+                        flat.labels,
+                        st.labels,
+                        if (flat.gotos, flat.labels) == (st.gotos, st.labels) {
+                            "unchanged"
+                        } else {
+                            "CHANGED"
+                        }
+                    );
+                }
                 all.push_str(&out.text);
                 all.push('\n');
             }
@@ -622,6 +747,15 @@ pub fn cmd_c(args: &[String]) -> Result<i32, String> {
     std::fs::write(&path, &all).map_err(|e| format!("{path}: {e}"))?;
 
     println!("emit-c: {seen} lifted functions, {emitted} emitted C, {refused} refused, {pass_broken} invalid after passes");
+    println!("{}", control_flow_line(&reports, emitted));
+    println!("{}", readability_line(&all, emitted));
+    if let Some(d) = census_drift(&reports, &all) {
+        // The census is a claim about the emitted C. When the emitter's own count
+        // and a scan of the text are not the same number, the census is broken,
+        // and a broken census cannot certify anything else in this report.
+        println!("FAIL: the structuring census disagrees with the emitted C: {d}");
+        return Ok(1);
+    }
     let mut ks: Vec<(String, usize)> = keys.into_iter().collect();
     ks.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     if !ks.is_empty() {
