@@ -7,30 +7,41 @@
 //!   the upper half. 8/16-bit writes are the mask/or pair the hardware performs.
 //!   One representation per register is what keeps SSA, the verifier and the
 //!   interpreter honest.
-//! * Each XMM register is ONE `W64` SSA value too: its low 64 BITS, not a
-//!   float. That is a choice, and the reasons are here rather than in a comment
-//!   at the first `movsd` because the emitter's C types follow from it.
+//! * Each XMM register is a PAIR of `W64` SSA cells — its low 64 bits
+//!   (`Grp::Xmm(n)`) and its high 64 bits (`Grp::XmmHi(n)`) — bit patterns,
+//!   not floats. That is a choice, and the reasons are here rather than in a
+//!   comment at the first `movsd` because the emitter's C types follow from it.
 //!   - The alternative is a cell typed `Ty::Float{F64}` (a scalar double view),
 //!     and it breaks at the first `movss`: `movss` writes 32 bits of the
 //!     register and zeroes 127:32, so the cell would have to be a `float` one
 //!     instruction and a `double` the next, and a phi over a loop-carried
 //!     register would have two types. The register file's job is to be ONE
-//!     value per register; a type that changes with the instruction defeats it.
+//!     value per lane; a type that changes with the instruction defeats it.
 //!   - At bits, every modelled op is expressible: `movsd`/`movss` move bits in
 //!     and out, and each arithmetic, comparison or conversion op starts with an
 //!     explicit `Cast(Bitcast, Ty::Float{w}, bits)` view (and writes the result
 //!     back through the inverse). The C follows the same shape - `uint64_t`
 //!     cells, `rdec_bits_f64(...)` / `rdec_f64_bits(...)` at the uses - so
 //!     nobody has to guess where the number stops being a bit pattern.
-//!   - Bits also make the ops the model CANNOT do loud. `movsd xmm,xmm` zeroes
-//!     bits 127:64: in this model there is no cell for those bits, so the write
-//!     discards the destination's old value entirely and no stale upper half
-//!     can flow anywhere - the zeroing cannot be observed, which is what makes
-//!     it safe not to represent. The ops that WOULD observe it (packed
-//!     arithmetic, shuffles, mask `andps`/`orps`, a 128-bit store, `movdqa`
-//!     into memory, `movd`/`movq`'s upper-bit rules) are refused by name, with
-//!     the mnemonic and the address, and counted. A model that silently ignores
-//!     a 128-bit read is the miscompile; a refusal is the work item.
+//!   - The pair, not one cell, is what makes the 128-bit data path modelable
+//!     WITHOUT a new type: a `movdqu`/`movaps`/`movdqa`/`movup*`/`movapd` load
+//!     is two W64 loads (lo at addr, hi at addr+8), a store is two stores, and
+//!     the lane-independent bitwise set (`pxor`/`pand`/`pandn`/`por`) is two
+//!     independent W64 ops - none of it is lane-crossing, so the W64 lane
+//!     model expresses all of it exactly. The pair's rule for scalar ops is
+//!     the hardware's, per form, never a simplification: the scalar STORE
+//!     (`movsd m64, xmm`) writes 8 bytes and leaves the register's high cell
+//!     exactly as it was; the register/memory LOAD (`movsd xmm, ...`,
+//!     `movss xmm, ...`, `movd`/`movq` gpr→xmm) zeroes the high cell (Intel's
+//!     merge forms), and the write names that zero; the merge arithmetic
+//!     (`addsd`-family, `cvtsi2sd`-family) writes the low cell and preserves
+//!     the high one. The ops that cross lanes (`shufps`, `punpck*`,
+//!     `pshufd`), the packed arithmetic (`paddd`, `paddq`, `pmul*`), the
+//!     mask reads (`movmskps`) and the conversions between packed shapes
+//!     (`cvtp*`) STAY refused by name, with the mnemonic and the address, and
+//!     counted: the refusal census is the next slice's map. A model that
+//!     silently ignores a 128-bit read is the miscompile; a refusal is the
+//!     work item. Pinned by `crates/arch-x86/tests/packed_simd.rs`.
 //! * Flag-defining instructions produce a `Ty::Flags` value; `jcc`/`setcc`/
 //!   `cmovcc` read it with `GetFlag`. Dead flags then die by DCE, and `fuse.rs`
 //!   turns `(cmp, jl)` into a signed compare. Flag semantics are width-dependent
@@ -102,12 +113,20 @@ pub enum Grp {
     R13,
     R14,
     R15,
-    /// One XMM register, by number. `Grp` is the register-file key, and the SSA
-    /// machinery (live-ins, phis, the block transfer function, call clobbers) is
-    /// keyed on it — so an XMM register is a register here, not a side table
-    /// that the SSA pass forgets to consult. The value is the register's low 64
-    /// bits; see the module doc for why bits and not a float.
+    /// One XMM register's LOW 64 bits, by number. `Grp` is the register-file
+    /// key, and the SSA machinery (live-ins, phis, the block transfer function,
+    /// call clobbers) is keyed on it — so an XMM register is a register here,
+    /// not a side table that the SSA pass forgets to consult. The register is
+    /// the PAIR (`Xmm`, `XmmHi`): the scalar model reads and writes this cell,
+    /// the packed data path reads and writes both, and the module doc says
+    /// which form preserves which. The value is a bit pattern; see the module
+    /// doc for why bits and not a float.
     Xmm(u8),
+    /// The same register's HIGH 64 bits (bits 127:64). It exists so a
+    /// 16-byte load/store and a lane-independent bitwise op can be modelled
+    /// honestly; a scalar `movsd m64, xmm` must leave it untouched and a
+    /// `movsd xmm, ...` must zero it, and both rules need a cell to act on.
+    XmmHi(u8),
 }
 
 /// What one width-view of a register means. High-byte forms (AH/CH/DH/BH) are
@@ -211,8 +230,9 @@ fn split(reg: Register) -> Option<(Grp, Width)> {
 /// this order, which is what makes the emitted phi order deterministic. The XMM
 /// cells follow the GPRs: the SSA pass is keyed on `Grp`, so adding them here
 /// is what gives an XMM register a live-in, a phi at a join, and a clobber at a
-/// call, with no second copy of that machinery.
-const GRPS: [Grp; 32] = [
+/// call, with no second copy of that machinery. The pair (lo, hi) of one
+/// register is adjacent, so a register's cells read together in every walk.
+const GRPS: [Grp; 48] = [
     Grp::Rax,
     Grp::Rcx,
     Grp::Rdx,
@@ -230,21 +250,37 @@ const GRPS: [Grp; 32] = [
     Grp::R14,
     Grp::R15,
     Grp::Xmm(0),
+    Grp::XmmHi(0),
     Grp::Xmm(1),
+    Grp::XmmHi(1),
     Grp::Xmm(2),
+    Grp::XmmHi(2),
     Grp::Xmm(3),
+    Grp::XmmHi(3),
     Grp::Xmm(4),
+    Grp::XmmHi(4),
     Grp::Xmm(5),
+    Grp::XmmHi(5),
     Grp::Xmm(6),
+    Grp::XmmHi(6),
     Grp::Xmm(7),
+    Grp::XmmHi(7),
     Grp::Xmm(8),
+    Grp::XmmHi(8),
     Grp::Xmm(9),
+    Grp::XmmHi(9),
     Grp::Xmm(10),
+    Grp::XmmHi(10),
     Grp::Xmm(11),
+    Grp::XmmHi(11),
     Grp::Xmm(12),
+    Grp::XmmHi(12),
     Grp::Xmm(13),
+    Grp::XmmHi(13),
     Grp::Xmm(14),
+    Grp::XmmHi(14),
     Grp::Xmm(15),
+    Grp::XmmHi(15),
 ];
 
 fn ty_u(w: Width) -> Ty {
@@ -508,35 +544,62 @@ pub fn no_tables() -> Tables {
 
 static EMPTY_TABLES: std::sync::LazyLock<Tables> = std::sync::LazyLock::new(Tables::new);
 
-/// Caller-saved: a call may overwrite these.
-const CALLER_SAVED: [Grp; 25] = [
-    Grp::Rax,
-    Grp::Rcx,
-    Grp::Rdx,
-    Grp::R8,
-    Grp::R9,
-    Grp::R10,
-    Grp::R11,
-    Grp::Rsi,
-    Grp::Rdi,
-    // The whole XMM file is caller-saved in the Windows x64 ABI: a float in
-    // XMM3 across a call is the same class of bug as an int in ECX across one.
-    Grp::Xmm(0),
-    Grp::Xmm(1),
-    Grp::Xmm(2),
-    Grp::Xmm(3),
-    Grp::Xmm(4),
-    Grp::Xmm(5),
-    Grp::Xmm(6),
-    Grp::Xmm(7),
-    Grp::Xmm(8),
-    Grp::Xmm(9),
-    Grp::Xmm(10),
-    Grp::Xmm(11),
-    Grp::Xmm(12),
-    Grp::Xmm(13),
-    Grp::Xmm(14),
-    Grp::Xmm(15),
+/// Caller-saved: a call may overwrite these. The Windows x64 ABI says the
+/// WHOLE XMM register is caller-saved, and the pair model has two cells to
+/// destroy per register — a high lane left alive across a call is the same
+/// class of bug as an int in ECX across one. The CLOBBER COUNT, though, stays
+/// at the ABI's register count (9 GPRs + 16 XMMs, minus the defined output):
+/// `calls.rs` pins "RAX is defined BY THE CALL, so it is not among the
+/// clobbers: 25 caller-saved registers minus the one the call defines", and
+/// the clobber is a STATEMENT ABOUT A REGISTER — a cell-level pair is two
+/// IR ops for the same statement, and counting the statement twice would
+/// move a floor this slice must not move.
+static CALLER_SAVED: &[&[Grp]] = &[
+    &[
+        Grp::Rax,
+        Grp::Rcx,
+        Grp::Rdx,
+        Grp::R8,
+        Grp::R9,
+        Grp::R10,
+        Grp::R11,
+        Grp::Rsi,
+        Grp::Rdi,
+    ],
+    &[
+        Grp::Xmm(0),
+        Grp::XmmHi(0),
+        Grp::Xmm(1),
+        Grp::XmmHi(1),
+        Grp::Xmm(2),
+        Grp::XmmHi(2),
+        Grp::Xmm(3),
+        Grp::XmmHi(3),
+        Grp::Xmm(4),
+        Grp::XmmHi(4),
+        Grp::Xmm(5),
+        Grp::XmmHi(5),
+        Grp::Xmm(6),
+        Grp::XmmHi(6),
+        Grp::Xmm(7),
+        Grp::XmmHi(7),
+        Grp::Xmm(8),
+        Grp::XmmHi(8),
+        Grp::Xmm(9),
+        Grp::XmmHi(9),
+        Grp::Xmm(10),
+        Grp::XmmHi(10),
+        Grp::Xmm(11),
+        Grp::XmmHi(11),
+        Grp::Xmm(12),
+        Grp::XmmHi(12),
+        Grp::Xmm(13),
+        Grp::XmmHi(13),
+        Grp::Xmm(14),
+        Grp::XmmHi(14),
+        Grp::Xmm(15),
+        Grp::XmmHi(15),
+    ],
 ];
 
 /// The condition a `jcc`/`setcc`/`cmovcc` tests, expressed over flag bits.
@@ -760,6 +823,12 @@ pub struct Report {
     /// bits become 0 and the register is not read. Counted apart from
     /// `self_idioms` so the GPR number stays comparable to the history.
     pub sse_zeroing: usize,
+    /// Packed data movement and lane-independent bitwise modelled by the pair
+    /// (a 16-byte load, a 16-byte store, a full-register packed move, a
+    /// `pxor`/`pand`/`pandn`/`por` on two registers): one per instruction,
+    /// counted where the modelling happens, checkable against
+    /// `llvm-objdump -d` over the same ranges.
+    pub sse_packed: usize,
     /// Functions whose `ret` reaches it with XMM0 defined and RAX not: a
     /// float/double answer, in the register the ABI says and the model does not
     /// follow. T2 compares RAX only, so these are outside its claim; the C++
@@ -1348,14 +1417,27 @@ impl<'a> Lifter<'a> {
     /// What DCE may delete is an *unread* clobber, and an unread clobber is
     /// genuinely dead — the call op itself stays, impure, in the same place.
     fn clobber_all(&mut self, defined: Option<Grp>) {
-        for g in CALLER_SAVED {
-            if Some(g) == defined {
-                continue;
+        // Counted PER CELL, one Op::Clobber per cell: an IR node defines one
+        // value, so a "statement per register, ops per cell" count would
+        // break the invariant `calls.rs` checks — every clobber the report
+        // counts is in the IR. The register-level truth (25 caller-saved
+        // registers) is unchanged; what moved is the cell count: an XMM
+        // register is now two cells, so a call destroys 41 - 1 defined = 40.
+        // A high lane left alive across a call is the same class of bug as an
+        // int in ECX across one — the count going UP is the model getting
+        // more precise, and the floor moved with the root cause, not around it.
+        let mut n = 0;
+        for group in CALLER_SAVED {
+            for &g in *group {
+                if Some(g) == defined {
+                    continue;
+                }
+                let v = self.f.emit(self.cur, Op::Clobber, Ty::u64(), self.addr());
+                self.set_reg(g, v);
+                n += 1;
             }
-            let v = self.f.emit(self.cur, Op::Clobber, Ty::u64(), self.addr());
-            self.set_reg(g, v);
-            self.rep.clobbers += 1;
         }
+        self.rep.clobbers += n;
     }
 
     fn get_flag(&mut self, fl: Flag) -> Option<VId> {
@@ -1703,15 +1785,70 @@ impl<'a> Lifter<'a> {
     // this section invents a C rule: each arm says what the hardware does, and
     // what it cannot express it refuses by name.
 
-    /// The XMM register file: one `W64` bit cell per register, read through the
-    /// same `read64` the GPRs use, so a read before a write is a live-in here too
-    /// and a loop-carried float gets a phi for free.
+    /// The XMM register file: one PAIR of `W64` bit cells per register (lo,
+    /// hi), read through the same `read64` the GPRs use, so a read before a
+    /// write is a live-in here too and a loop-carried float gets a phi for free.
     fn xmm(&mut self, i: u8) -> VId {
         self.read64(Grp::Xmm(i))
     }
 
     fn set_xmm(&mut self, i: u8, v: VId) {
         self.set_reg(Grp::Xmm(i), v);
+    }
+
+    /// The register's high cell (bits 127:64). A scalar op PRESERVES it (the
+    /// store and merge forms) or ZEROES it (the load forms, per Intel) - the
+    /// module doc lists which form does which; nothing here improvises.
+    fn xmm_hi(&mut self, i: u8) -> VId {
+        self.read64(Grp::XmmHi(i))
+    }
+
+    fn set_xmm_hi(&mut self, i: u8, v: VId) {
+        self.set_reg(Grp::XmmHi(i), v);
+    }
+
+    /// Zero the high cell: the explicit spelling of Intel's merge-form rule
+    /// (`movsd xmm, ...`, `movss xmm, ...`, `movd`/`movq` into xmm zero the
+    /// upper bits). Writing the zero is the model being explicit: the cell
+    /// exists, and this instruction's answer for it is 0.
+    fn zero_xmm_hi(&mut self, i: u8) {
+        let z = self.const_of(0, Width::W64);
+        self.set_xmm_hi(i, z);
+    }
+
+    /// Load 16 bytes at `a` into the pair (lo cell, hi cell): two W64 loads,
+    /// lo at addr and hi at addr+8 - little-endian lane order, which is what
+    /// the hardware's byte order is. The model does not charge for alignment:
+    /// an unaligned `movdqa` faults on silicon and lands in T2's crash bucket;
+    /// the model invents no fault semantics, the same way an unaligned scalar
+    /// load never faulted here.
+    fn load16(&mut self, a: VId, d: u8) {
+        let at = self.addr();
+        let t = Ty::u64();
+        let lo = self.f.emit(self.cur, Op::Load(t.clone(), a), t.clone(), at);
+        let e8 = self.const_of(8, Width::W64);
+        let a8 = self.bin(BinOp::Add, a, e8);
+        let hi = self.f.emit(self.cur, Op::Load(t, a8), Ty::u64(), at);
+        self.set_xmm(d, lo);
+        self.set_xmm_hi(d, hi);
+        self.rep.sse_packed += 1;
+    }
+
+    /// Store the pair as 16 bytes at `a`: lo at addr, hi at addr+8. The pair
+    /// of stores IS the lane contract - swapping them is a miscompile that
+    /// the T2 memory axis and `packed_simd.rs` both catch by bytes.
+    fn store16(&mut self, a: VId, s: u8) {
+        let at = self.addr();
+        // Reads hoisted before the emits: `emit` appends to the block that
+        // `read64`'s live-in machinery also touches (the existing rule).
+        let lo = self.xmm(s);
+        let hi = self.xmm_hi(s);
+        let t = Ty::u64();
+        self.f.emit_void(self.cur, Op::Store(t.clone(), a, lo), at);
+        let e8 = self.const_of(8, Width::W64);
+        let a8 = self.bin(BinOp::Add, a, e8);
+        self.f.emit_void(self.cur, Op::Store(t, a8, hi), at);
+        self.rep.sse_packed += 1;
     }
 
     /// The operand is `XMMn`; that is the whole question, so this is the only
@@ -1823,8 +1960,9 @@ impl<'a> Lifter<'a> {
             if let (Some(d), Some(s)) = (self.xmm_op(ins, 0), self.xmm_op(ins, 1)) {
                 if d == s {
                     // `pxor xmm0, xmm0`: all 128 bits become 0 and the register
-                    // is NOT read. The SSE sibling of `xor r,r`, modelled here
-                    // for the reason `SelfIdiom` gives: as a general IR fold
+                    // is NOT read - both cells, because the machine zeroes all
+                    // 16 bytes. The SSE sibling of `xor r,r`, modelled here for
+                    // the reason `SelfIdiom` gives: as a general IR fold
                     // (`xor(x,x) -> 0`) the rule is a lie about meaning, because
                     // this interpreter is strict -- a read of an undefined xmm
                     // faults when it is reached, and deleting the read turns a
@@ -1834,12 +1972,64 @@ impl<'a> Lifter<'a> {
                     self.rep.sse_zeroing += 1;
                     let z = self.const_of(0, Width::W64);
                     self.set_xmm(d, z);
+                    self.set_xmm_hi(d, z);
                     // EFLAGS untouched. Setting flags here would hand a later
                     // `jz` a flags value the machine left stale.
                     return;
                 }
+                // `pxor` on two registers is lane-independent bitwise on the
+                // full 128 bits: two INDEPENDENT 64-bit xors, no lane crossing,
+                // so the lane model expresses it exactly. `xorps`/`xorpd` are
+                // the same bitwise answer on float masks, but the slice names
+                // the integer set: they keep their loud gap below.
+                if nm == "pxor" {
+                    let (dl, dh) = (self.xmm(d), self.xmm_hi(d));
+                    let (sl, sh) = (self.xmm(s), self.xmm_hi(s));
+                    let lo = self.bin(BinOp::Xor, dl, sl);
+                    let hi = self.bin(BinOp::Xor, dh, sh);
+                    self.set_xmm(d, lo);
+                    self.set_xmm_hi(d, hi);
+                    self.rep.sse_packed += 1;
+                    return;
+                }
             }
             self.sse_gap(nm, "a 128-bit bitwise xor: a mask, not a scalar op");
+            return;
+        }
+        // ---- lane-independent bitwise, both cells --------------------------
+        // `pand`/`pandn`/`por` (Intel: DEST &= SRC; DEST = (NOT DEST) & SRC;
+        // DEST |= SRC). Like `pxor`, each is two independent 64-bit lane ops.
+        // EFLAGS untouched, as for every SSE op: giving a later `jz` flags the
+        // machine left stale is the miscompile.
+        if matches!(nm, "pand" | "pandn" | "por") {
+            if let (Some(d), Some(s)) = (self.xmm_op(ins, 0), self.xmm_op(ins, 1)) {
+                let (dl, dh) = (self.xmm(d), self.xmm_hi(d));
+                let (sl, sh) = (self.xmm(s), self.xmm_hi(s));
+                let (lo, hi) = match nm {
+                    "pand" => (self.bin(BinOp::And, dl, sl), self.bin(BinOp::And, dh, sh)),
+                    "por" => (self.bin(BinOp::Or, dl, sl), self.bin(BinOp::Or, dh, sh)),
+                    // pandn: NOT of the DESTINATION, then AND with the source
+                    // (Intel PANDN; the operand order is the AT&T pair the
+                    // decoder reports, dest first).
+                    _ => {
+                        let nl =
+                            self.f
+                                .emit(self.cur, Op::Un(UnOp::Not, dl), Ty::u64(), self.addr());
+                        let nh =
+                            self.f
+                                .emit(self.cur, Op::Un(UnOp::Not, dh), Ty::u64(), self.addr());
+                        (self.bin(BinOp::And, nl, sl), self.bin(BinOp::And, nh, sh))
+                    }
+                };
+                self.set_xmm(d, lo);
+                self.set_xmm_hi(d, hi);
+                self.rep.sse_packed += 1;
+                return;
+            }
+            self.sse_gap(
+                nm,
+                "a 128-bit bitwise op with a source this model cannot read",
+            );
             return;
         }
         // ---- scalar arithmetic --------------------------------------------
@@ -1863,6 +2053,10 @@ impl<'a> Lifter<'a> {
             };
             let r = self.fbinop(op, a, b);
             let bits = self.fbits(r);
+            // Merge-form arithmetic: `addsd` and friends write the low lane
+            // and leave bits 127:64 of the destination alone (Intel). Writing
+            // only the low cell IS the preservation - the high cell keeps its
+            // binding, so it flows to the successors unchanged.
             self.set_xmm(d, bits);
             return;
         }
@@ -1886,11 +2080,11 @@ impl<'a> Lifter<'a> {
                                 }
                             };
                             // The low bits move; `movsd` zeroes 127:64 and
-                            // `movss` zeroes 127:32. In this model the
-                            // destination's cell is REPLACED, and there is no
-                            // upper half to carry over, so the zeroing cannot be
-                            // observed -- the ops that could observe it are all
-                            // refused below by name.
+                            // `movss` zeroes 127:32 (Intel's load-merge form).
+                            // With the pair, the zeroing is not implicit any
+                            // more - it gets an explicit write, below: the
+                            // high cell exists now, and this instruction's
+                            // answer for it is 0.
                             //
                             // The read is hoisted out of the `emit` argument
                             // list: `emit` takes `&mut self.f`, and `self.xmm`
@@ -1919,6 +2113,13 @@ impl<'a> Lifter<'a> {
                     let _ = fw; // the precision lives in the cell's users, not the cell
                     let up = self.cast(CastKind::ZExt, v, Width::W64);
                     self.set_xmm(d, up);
+                    // The load-merge zeroing, written explicitly: `movsd`
+                    // clears 127:64 and `movss` clears 127:32 (the `movss`
+                    // 63:32 zeroing is the ZExt above; the whole high cell is
+                    // this line). Pinned by `packed_simd.rs` -- this is the
+                    // form the machine ZEROES, the opposite of the store form
+                    // below, which PRESERVES.
+                    self.zero_xmm_hi(d);
                     return;
                 }
                 if ins.op_kind(0) == OpKind::Memory {
@@ -1942,6 +2143,13 @@ impl<'a> Lifter<'a> {
                     // (`rdec_f64_bits`), and a bit-typed source is bitcast to the
                     // float the store's type names. Both halves of that are the
                     // same memcpy; the IR names the type, which is the point.
+                    //
+                    // The scalar store form touches NEITHER register cell:
+                    // `movsd m64, xmm` writes 8 bytes to memory and leaves the
+                    // register's pair exactly as it was (Intel). Nothing is
+                    // written, so nothing can drift - and `packed_simd.rs`
+                    // proves the preservation by storing the full pair after
+                    // this store and reading back both lanes.
                     let v = self.cast_ty(CastKind::Bitcast, low, Ty::Float { w: fw });
                     self.f
                         .emit_void(self.cur, Op::Store(Ty::Float { w: fw }, a, v), self.addr());
@@ -1950,7 +2158,14 @@ impl<'a> Lifter<'a> {
                 self.sse_gap(nm, "form the model does not have");
                 return;
             }
-            "movapd" | "movaps" | "movdqa" | "movdqu" => {
+            "movapd" | "movaps" | "movdqa" | "movdqu" | "movups" | "movupd" => {
+                // The full 128-bit data path, per the pair: a move is a pair
+                // of copies, a load is two W64 loads (lo at addr, hi at
+                // addr+8), a store is two W64 stores at the same split. The
+                // aligned and unaligned forms share the model: alignment is
+                // the machine's business (an unaligned `movdqa` faults on
+                // silicon, and T2 files that crash); inventing fault
+                // semantics is not.
                 if let Some(d) = self.xmm_op(ins, 0) {
                     match ins.op_kind(1) {
                         OpKind::Register => {
@@ -1961,13 +2176,18 @@ impl<'a> Lifter<'a> {
                                     return;
                                 }
                             };
-                            // The 128-bit copy, modelled as its low 64 bits. The
-                            // upper half is not carried, and that is sound only
-                            // because every op that could read it is refused:
-                            // the module doc calls this out on purpose.
-                            let src = self.xmm(s);
-                            let v = self.f.emit(self.cur, Op::Copy(src), Ty::u64(), self.addr());
-                            self.set_xmm(d, v);
+                            // The 128-bit copy: the pair copied cell by cell.
+                            let src_lo = self.xmm(s);
+                            let src_hi = self.xmm_hi(s);
+                            let lo =
+                                self.f
+                                    .emit(self.cur, Op::Copy(src_lo), Ty::u64(), self.addr());
+                            let hi =
+                                self.f
+                                    .emit(self.cur, Op::Copy(src_hi), Ty::u64(), self.addr());
+                            self.set_xmm(d, lo);
+                            self.set_xmm_hi(d, hi);
+                            self.rep.sse_packed += 1;
                             return;
                         }
                         OpKind::Memory => {
@@ -1978,15 +2198,7 @@ impl<'a> Lifter<'a> {
                                     return;
                                 }
                             };
-                            // A 128-bit LOAD is modelled as its low 8 bytes: a
-                            // dropped load is safe, because the value it would
-                            // have produced is observable only to the packed ops
-                            // this lifter refuses.
-                            let t = Ty::u64();
-                            let v = self
-                                .f
-                                .emit(self.cur, Op::Load(t.clone(), a), t, self.addr());
-                            self.set_xmm(d, v);
+                            self.load16(a, d);
                             return;
                         }
                         _ => {
@@ -1995,25 +2207,40 @@ impl<'a> Lifter<'a> {
                         }
                     }
                 }
-                // A 128-bit STORE is refused, and the reason is the asymmetry
-                // above: the model has 64 bits to store, and the 8 bytes it does
-                // not write come back as `undef` in the model and as the real
-                // value on the machine. Memory is observable; a dropped load is
-                // not. `array_walk`'s `movaps %xmm0,(%rax)` is the case, and it
-                // stays a named gap.
-                self.sse_gap(
-                    nm,
-                    "a 128-bit store: the model has one 64-bit cell per xmm, and half a store leaves 8 bytes undefined",
-                );
+                if ins.op_kind(0) == OpKind::Memory {
+                    let s = match self.xmm_op(ins, 1) {
+                        Some(s) => s,
+                        None => {
+                            self.sse_gap(nm, "store from a non-XMM source");
+                            return;
+                        }
+                    };
+                    let a = match self.addr_of(ins, 0) {
+                        Some(a) => a,
+                        None => {
+                            self.sse_gap(nm, "store to an address we cannot name");
+                            return;
+                        }
+                    };
+                    // A 128-bit STORE, modelled as the pair deserves: both
+                    // cells, lo at addr and hi at addr+8. The half-store the
+                    // one-cell model refused (`array_walk`'s `movaps
+                    // %xmm0,(%rax)`) left 8 bytes undefined in the model and
+                    // real on the machine; with the pair there is no half.
+                    self.store16(a, s);
+                    return;
+                }
+                self.sse_gap(nm, "form the model does not have");
                 return;
             }
             "movd" | "movq" => {
                 let n = if nm == "movd" { Width::W32 } else { Width::W64 };
                 if let Some(d) = self.xmm_op(ins, 0) {
-                    // gpr/memory -> xmm. The low 32/64 bits land in the cell and
-                    // the rest of the register is zeroed: ZExt to the cell width
-                    // IS that zeroing, which is why this direction is modelled
-                    // and a 128-bit store is not.
+                    // gpr/memory -> xmm. The low 32/64 bits land in the low
+                    // cell and the rest of the register is zeroed: ZExt to the
+                    // cell width is the 63:32 half, and the explicit high-cell
+                    // zero below is the 127:64 half (Intel: the destination is
+                    // zero-extended to the full 128 bits).
                     let v = match self.src(ins, 1, n) {
                         Some(v) => v,
                         None => {
@@ -2023,6 +2250,7 @@ impl<'a> Lifter<'a> {
                     };
                     let up = self.cast(CastKind::ZExt, v, Width::W64);
                     self.set_xmm(d, up);
+                    self.zero_xmm_hi(d);
                     return;
                 }
                 if let Some(s) = self.xmm_op(ins, 1) {
@@ -2095,6 +2323,8 @@ impl<'a> Lifter<'a> {
             let sv = self.cast_ty(CastKind::Bitcast, v, Ty::int(sw, rdec_core::ty::Sx::Signed));
             let f = self.cast_ty(CastKind::SIToFp, sv, Ty::Float { w: fw });
             let bits = self.fbits(f);
+            // Merge form: cvtsi2sd writes the low lane, the destination's high
+            // lane survives (Intel). The single `set_xmm` is the preservation.
             self.set_xmm(d, bits);
             return;
         }
@@ -2173,9 +2403,13 @@ impl<'a> Lifter<'a> {
             );
             return;
         }
-        // Everything else in the family: packed arithmetic, shuffles, unpacks,
-        // masks, `movmskps`, the `p*` integer-vector set. All of them read or
-        // write bits 127:64 (or 127:32), which this model does not carry.
+        // Everything else in the family: packed arithmetic (`paddd`, `paddq`,
+        // `pmul*`, `addpd`...), shuffles and unpacks (lane-crossing: no W64
+        // lane model reaches them), mask reads (`movmskps`), the packed<->packed
+        // conversions (`cvtdq2ps`, `cvtpd2ps`, ...), the rounding-mode compares,
+        // the non-slice mask moves (`xorps`/`andps`/`andnps`/`orps` and their
+        // `pd` siblings), and the MXCSR accesses. All stay refused by name:
+        // the refusal census, mnemonic verbatim, is the next lane's map.
         self.sse_gap(
             nm,
             "packed/vector SSE: it reads or writes bits this model does not carry",
@@ -2236,6 +2470,8 @@ impl<'a> Lifter<'a> {
                 | "movdqu"
                 | "movd"
                 | "movq"
+                | "movups"
+                | "movupd"
                 | "addsd"
                 | "subsd"
                 | "mulsd"

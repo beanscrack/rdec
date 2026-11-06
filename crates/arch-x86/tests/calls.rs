@@ -637,9 +637,13 @@ fn the_call_defines_its_answer_and_clobbers_the_rest() {
         clobbers, rep.clobbers,
         "every clobber the report counts is in the IR"
     );
-    // RAX is defined BY THE CALL, so it is not among the clobbers: 25
-    // caller-saved registers minus the one the call defines.
-    assert_eq!(clobbers, 24, "the defined output is not clobbered");
+    // RAX is defined BY THE CALL, so it is not among the clobbers. 2026-11-06
+    // root-cause move 24 -> 40: the pair model (M8 packed slice) made each XMM
+    // register TWO caller-saved cells (lo+hi) — an IR node defines one value,
+    // so the IR count is cells: 9 GPR + 32 XMM cells - the defined output.
+    // The register-level ABI fact (25 caller-saved) is unchanged; clobbering
+    // the high lane is the point of the model, not a side effect.
+    assert_eq!(clobbers, 40, "the defined output is not clobbered");
 }
 
 /// The entry-seeding window is unchanged by all of this: a call is a statement

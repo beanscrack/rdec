@@ -199,6 +199,29 @@ pub const SNIPPETS: &[Snippet] = &[
         exercises: "fixed-count store loop through a caller buffer: 16 words written, 16 returned",
         code: "long long f(long long *b) { int n = 16; for (int i = 0; i < n; i++) b[i] = b[i] + (long long)i; return n; }",
     },
+    // The packed-SIMD witness: a block copy is pure data movement, so clang
+    // vectorizes it into 16-byte load/store pairs - no packed arithmetic
+    // anywhere, exactly the M8 data-movement slice. copy_words is NOT this
+    // witness on current clang: `b[i] = b[i] + i` is a read-modify-write,
+    // which lowers to paddq (packed arithmetic), and the first slice keeps
+    // paddq a loud refusal by name. The copy is spelled UNROLLED on purpose:
+    // the rolled loop forms measured on clang 22 drag non-slice encodings at
+    // the small -O levels (Oz emits `movq $-0x8, %rax` - a 64-bit mov with a
+    // sign-extended imm32, a REFUSED form whose zero-extension modelling
+    // would be a silent miscompile, and whose loop forms also step on a
+    // pre-existing loop-folding pass bug at O1, in passes, not in the lifter,
+    // and not this slice). The unrolled body lowers to the packed moves at
+    // O1, O2 AND Oz: measured on clang 22 (llvm-objdump ground truth) all
+    // three are the identical 4x `movups disp(%rcx), %xmmK` + 4x
+    // `movups %xmmK, disp(%rcx)` + `movl $8, %eax` + ret, and O0 stays scalar
+    // 8-byte moves through a stack slot. The emitted C goes through the T2
+    // memory axis, whose buffer comparison is the oracle for a mis-ordered
+    // half of a 16-byte store.
+    Snippet {
+        name: "copy_block",
+        exercises: "packed 16-byte block moves through a caller buffer: movups data movement, no packed arithmetic",
+        code: "long long f(long long *b) { b[0]=b[8]; b[1]=b[9]; b[2]=b[10]; b[3]=b[11]; b[4]=b[12]; b[5]=b[13]; b[6]=b[14]; b[7]=b[15]; return 8; }",
+    },
     Snippet {
         name: "read_only_words",
         exercises: "read-mostly over a caller buffer: MUST NOT write; a spurious store is a miscompile",

@@ -382,6 +382,13 @@ fn packed_and_ordered_compare_are_refused_by_name() {
             ][..],
         ),
         (
+            // `movapd` MOVED OUT of this table on 2026-11-06: the M8 packed
+            // slice models the 16-byte load/store family (movap{s,d},
+            // movdqa/movdqu/movups/movupd) over the XMM pair cells, so a
+            // 128-bit store is IR now, not a refusal. Positive coverage
+            // (16-byte round-trip, hi lane included, ground-truthed against
+            // llvm-objdump) is `packed_simd.rs`; the mnemonics below stay
+            // refused by name and stay tested here.
             "comisd",
             &[
                 0x66, 0x0F, 0x2F, 0xC1, // comisd xmm0, xmm1
@@ -393,18 +400,6 @@ fn packed_and_ordered_compare_are_refused_by_name() {
             &[
                 0x66, 0x0F, 0xEF, 0xC0, // pxor      xmm0, xmm0
                 0xF2, 0x0F, 0x2D, 0xC0, // cvtsd2si eax, xmm0 (rounding form)
-                0xC3,
-            ][..],
-        ),
-        (
-            // The 128-bit STORE form. `llvm-objdump` prints these bytes as
-            // `movaps`; iced canonicalises them to `movapd` (the encoding does
-            // not say which), and the refusal names what the decoder that built
-            // the IR said -- which is exactly why the census is printed with the
-            // decoder's names and can be checked against them.
-            "movapd",
-            &[
-                0x66, 0x0F, 0x29, 0x00, // movaps/movapd [rax], xmm0 (a 128-bit store)
                 0xC3,
             ][..],
         ),

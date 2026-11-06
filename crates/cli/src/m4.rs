@@ -678,6 +678,9 @@ pub fn cmd_c(args: &[String]) -> Result<i32, String> {
     let mut refused = 0usize;
     let mut pass_broken = 0usize;
     let mut keys: HashMap<String, usize> = HashMap::new();
+    // Read once, at the top: the record dump inside the loop and the class
+    // list after it are the same auditable census, on one switch.
+    let all_classes = std::env::var_os("RDEC_C_CENSUS_ALL").is_some();
     // The structuring census, one report per EMITTED function (a refused
     // function has no C, so it has no control flow to count).
     let mut reports: Vec<Report> = Vec::new();
@@ -759,6 +762,16 @@ pub fn cmd_c(args: &[String]) -> Result<i32, String> {
                 }
                 for r in &rs {
                     *keys.entry(key(r)).or_default() += 1;
+                    // `RDEC_C_CENSUS_ALL=1` doubles as the record dump: the
+                    // census tells you a class grew, the record tells you
+                    // WHICH object grew it, and a class name without an owner
+                    // is a census you cannot audit.
+                    if all_classes {
+                        println!(
+                            "refusal record: {} :: {} @ {:#x}: {}",
+                            s.obj, s.sym, r.at, r.reason
+                        );
+                    }
                 }
                 if let Some(r) = rs.first() {
                     if first_refusal.is_none() {
@@ -802,7 +815,16 @@ pub fn cmd_c(args: &[String]) -> Result<i32, String> {
             "refusal records: {total} in {refused} refused functions, {} classes",
             ks.len()
         );
-        let top: Vec<String> = ks.iter().take(6).map(|(k, n)| format!("{n} {k}")).collect();
+        // `RDEC_C_CENSUS_ALL=1` prints every class, not the top six: the M8
+        // packed-SIMD slice needs the full census verbatim (each remaining
+        // mnemonic names the next lane's work item), and a truncation that
+        // hides `paddd` hides the map.
+        let all_classes = std::env::var_os("RDEC_C_CENSUS_ALL").is_some();
+        let top: Vec<String> = ks
+            .iter()
+            .take(if all_classes { ks.len() } else { 6 })
+            .map(|(k, n)| format!("{n} {k}"))
+            .collect();
         println!("refusal classes: {}", top.join(" | "));
     }
     if let Some(r) = &first_refusal {
@@ -859,13 +881,14 @@ pub fn cmd_c(args: &[String]) -> Result<i32, String> {
 /// objects prints. Auditable, not trusted.
 pub fn sse_line(sse: &std::collections::BTreeMap<String, u32>, zeroing: usize) -> String {
     if sse.is_empty() {
-        return "  sse mnemonics counted: 0 (scalar subset modelled, packed refused)".to_string();
+        return "  sse mnemonics counted: 0 (scalar + packed data-movement modelled, rest refused)"
+            .to_string();
     }
     let mut parts: Vec<String> = sse.iter().map(|(k, v)| format!("{k}={v}")).collect();
     parts.sort();
     let tot: u32 = sse.values().sum();
     format!(
-        "  sse mnemonics counted: {tot} [{}] (scalar subset modelled, packed refused by name; zeroing idiom: {zeroing})",
+        "  sse mnemonics counted: {tot} [{}] (scalar subset and packed data movement / lane-independent bitwise modelled, the rest refused by name; zeroing idiom: {zeroing})",
         parts.join(" ")
     )
 }

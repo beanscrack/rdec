@@ -30,6 +30,10 @@ cmp_unsigned	O0	corpus\obj\cmp_unsigned.O0.obj	936	e26d76689e5881c4
 cmp_unsigned	O1	corpus\obj\cmp_unsigned.O1.obj	660	db8f5c16e528ce50
 cmp_unsigned	O2	corpus\obj\cmp_unsigned.O2.obj	660	db8f5c16e528ce50
 cmp_unsigned	Oz	corpus\obj\cmp_unsigned.Oz.obj	660	97218f377e9b26f0
+copy_block	O0	corpus\obj\copy_block.O0.obj	983	5b60c02f3e7cf216
+copy_block	O1	corpus\obj\copy_block.O1.obj	679	3fc32cd44db5642c
+copy_block	O2	corpus\obj\copy_block.O2.obj	679	3fc32cd44db5642c
+copy_block	Oz	corpus\obj\copy_block.Oz.obj	679	b76ab862d2583d0c
 copy_words	O0	corpus\obj\copy_words.O0.obj	931	fbb4b571ad38ad9f
 copy_words	O1	corpus\obj\copy_words.O1.obj	677	ef3a145a98b0ab63
 copy_words	O2	corpus\obj\copy_words.O2.obj	1892	709f0193093b0653

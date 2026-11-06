@@ -2018,3 +2018,40 @@ relaxed to the machine fact (every arm transfers control; switch/8 cases/default
 trap stay pinned). Parent re-measured all floors on master+patch: t2
 1700/1700/0/4 + memory 288 + ir 288 byte-identical, structuring 18/18 untouched,
 workspace 326/0, ratchet/fmt/clippy/status exit 0.
+
+## M8 packed SIMD first slice: the XMM pair — movdqa/movdqu/movaps/movups family + lane bitwise
+
+XMM registers are a PAIR of W64 cells (lo+hi; GRPS 32->48, CALLER_SAVED covers
+both). Modelled: movap{s,d}, movdqa/movdqu/movups/movupd (loads = two W64 loads
+lo@addr hi@addr+8, stores symmetric, reg-reg pair copies, the stack-spill shape),
+pxor/pand/pandn/por as two independent lane ops, pxor/xorps/xorpd zeroing zeros
+BOTH cells; scalar load-merge (`movsd xmm,...`) zeroes the hi cell explicitly,
+scalar store (`movsd m64,xmm`) touches NEITHER cell; every other packed op stays a
+loud Opaque naming the mnemonic. The refusal census is the next lane's map: 43
+refusals, paddq 1 (copy_words.O2), pcmpeqd 1, cdq 10, clobbered-by-call 8, imul 6,
+lea-unnamed 6, lea-.rdata 4, div 4, live-in Rsp 2, live-out flags 1. The
+movdqa/movdqu-shape classes are GONE (modelled).
+ACCEPTANCE DEVIATION, root-caused: `copy_words` O2/Oz stay refused on THIS clang
+because they vectorize to movdqu + paddq (read-modify-write), and paddq is out of
+this slice's scope — the refusal names the mnemonic verbatim in the census. The
+pure-`movups` witness is the new corpus fixture `copy_block` (O1/O2/Oz): +3
+emitted (97 emitted / 43 refused, -Werror OK), t2 `1796/1796/0/4`, memory axis
+288 -> 384/384/0 and ir leg 384/384/0 - vector stores byte-compared in the caller
+window, which is the oracle this slice was built to feed.
+CLOBBER COUNT, the invariant the lane could not square: "one statement per ABI
+register" broke `calls.rs`'s report == IR check (an IR node defines ONE value; the
+pair needs two ops). Resolution is per-cell counting with the pinned 24 -> 40 move
+carrying its root cause (9 GPR + 32 XMM cells - the defined output): clobbering the
+high lane across a call is the POINT of the pair model, and the register-level ABI
+fact (25 caller-saved) is unchanged. The scalar-era `movapd` refusal pin in
+`sse_scalar.rs` retired with the reason (it is IR now; positive coverage in
+`packed_simd.rs`).
+SABOTAGE (all five, parent-run for the last three): store-lane-swap ->
+`the 16 bytes must arrive in order (lo lane first)` left/right byte-quoted;
+hi-load dropped -> 4 fixtures red; movsd load-merge zeroing removed ->
+`low 8 = the load, high 8 = ZERO` red with bytes; scalar store spilling hi at
+addr+8 -> FIRST RUN PASSED — the fixture compared `tail == HI` and the spill
+wrote exactly HI: a test written to pass, caught by sabotage. Strengthened: the
+destination high half is seeded with a 0xA5 sentinel the program cannot carry,
+the same sabotage now reddens it with `Some([136,...,255]) != Some([165 x 8])`,
+and the lesson is a comment in the fixture. Nine tests, all restored green.
