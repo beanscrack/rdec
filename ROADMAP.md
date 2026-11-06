@@ -1705,3 +1705,98 @@ Also named: `rdec_core::emit_c` refuses `Op::Cmp` whose operand is an `Op::Const
 `None`, and the emitter's comparison path needs a width from the operand). No corpus function
 shows it because the lifter's comparisons go through flags + `GetFlag`. Fixture cost: three
 iterations to route around it.
+
+---
+
+## M5 — Control-flow structuring: LANDED 2026-11-06 at `e0dafc6` (CI green)
+
+The algorithm is pattern-directed region recognition in `crates/core/src/structure.rs`, chosen
+against the corpus, not imported: a region is structured only when the forward-closure and
+single-join gates PROVE it, and the honest fallback is the label + `goto` form that was always
+correct. `No More Gotos`-style edge splitting is not used, because it duplicates the guard's
+WORK, and duplicated work is duplicated semantics in a decompiler whose contract is equivalence.
+
+Measured before → after on the corpus (86 emitted functions):
+
+    goto statements   318 → 123        labels   323 → 206
+    structured        0/86 → 35/86 functions
+    regions           72: 50 if | 12 if/else | 10 while
+    blocks left as goto: 38 fall-through, 121 return, 34 unstructured conditional
+                         branch, 8 region whose text left a named label undefined,
+                         5 join is not this region's exit, 2 switch
+    t2 --corpus  1412 | 1412 | mismatch 0 | not compared 4     (the floor, exactly)
+    t2 --cpp     856 | 856 | 0
+    clang -Werror: OK
+
+**The bug T2 caught, and the class of bug.** Structuring's first loop form printed the header's
+WORK (the compare that computes the tested value) ONCE, above the loop. The C never
+re-evaluated the guard, so every corpus loop spun, and the interpreter timed out on it:
+`t2 --corpus` dropped from 1412 compared to **1403 with 13 not-compared**, while `mismatch`
+stayed at 0 — because the IR interpreter reads the GRAPH and the C side faults before
+comparing, so the comparison count is the only thing that moves. A green gate measuring LESS
+is the cardinal sin, not a detail. The fix rotates the TEXT (the guard's work is spelled on
+the entry edge and again at the body bottom, the back edge; label on the in-loop copy, so a
+`goto` to the header means "test again"): text duplication, not work duplication, so a store
+in a header still runs exactly the machine's number of times. `t2.rs` now prints
+`NOT COMPARED: <function> <vector> <side> <fault>` for every lost comparison, so a shrinking
+claim cannot hide behind a clean mismatch count again. This is why the gate reports the
+4-tuple `(compared, match, mismatch, not-compared)` and the FLOOR includes the compared count.
+
+The same class, caught by the same mechanism earlier in the pass: `pre_loop` decided
+body-in-then vs body-in-else BACKWARDS (36 mismatches, `mismatch` non-zero — this class IS
+detectable when both sides run). Polarity is asserted per fixture by quoting the emitted
+`if (`/`while (` condition line, with the negation asserted ABSENT, so "the body moved to the
+arm the machine code skips" is a test failure, not a review finding.
+
+Red directions proven by sabotage on the final tree (each applied alone, test quoted, restored):
+guard polarity negated; if/else tests the negated value; `pre_loop`'s body arm inverted; `while`
+→ do-while; **header printed once** (the shipped bug); `region()`'s gates dropped (irreducible
+CFG must stay a `goto`, and `an_irreducible_region_stays_...` is the anti-invention test);
+emitter printing a tree with an undefined label. Two gates were measured and are reported as
+NOT load-bearing (`pre_loop`'s body-predecessors gate and arm-exclusivity gate: a later gate
+already refuses the fixture) — a gate nobody can break is not evidence.
+
+Honest narrowings, not weakened needles: `a_multi_entry_loop_is_not_structured` asserts the
+pass proposes **no loop**, not zero `if`s — measurement showed the walk proposes 2 provable
+`if`s there, and the reason that tree is unprintable is an undefined label, which is caught
+and counted. Fixtures that use `Op::Param` assign `f.params` (a fixture that binds no argument
+agrees with any bug). Test-time C compilation is the single `-Werror` acceptance call.
+
+M5 gate status: if/else/while are recovered and T2-equivalent; jump tables are modelled as
+`Terminator::Switch` with resolved targets (M1's relocation evidence) and the emitter keeps
+them as `switch` (2 tables / 12 slots in the corpus, 0 unresolved). The 90%-as-`switch` gate
+is NOT claimed: the corpus has 2 tables, and a percentage over 2 is a story, not a measurement.
+`for`-loop recovery (three-clause canonicalisation) is not built; `for` appears in the corpus
+as a `while` with an induction variable in the body, which is T2-equivalent and readable, so
+this is a readability gap (M6), not a semantic one.
+
+## Fuzz/robustness lane: LANDED 2026-11-06 at `289645b`
+
+See the commit for the full account. The load-bearing facts:
+
+1. **A 4 KB object was a 300-second DoS on the tool's own users**, and no wall-clock deadline
+   outside the interpreter could interrupt it: the step budget charged instructions, the input
+   lifted to an EMPTY self-loop block (`bb1: br bb1`), so every lap charged 0 and
+   `steps > budget` could never fire. Fixed by charging one step per block entry — a control
+   transfer is work. 300 s+ → 2 ms; fuzzer seed 1: never finished → 12.3 s for 3000 inputs.
+   `Exec::diff` deliberately ignores `steps`: TV compares MEANING, and a pass that legitimately
+   deletes an instruction must not show up as a difference.
+2. **The fuzzer finds injected bugs, proven, not asserted.** Re-injecting the demangler
+   truncation panic reddens the CI fuzz test naming seed, iteration, generator, and the repro.
+   Deleting the step charge reddens the hand-counted step accounts (3 vs 5) and turns the
+   self-loop test into the production hang (timeout kill).
+3. **A stack overflow is not a panic.** `?f@@YAH` + ~1000 nested `P` produced
+   `STATUS_STACK_OVERFLOW (0xc00000fd)`, which `catch_unwind` cannot catch: the demangler is
+   depth-bounded (`MAX_TYPE_DEPTH`) and reports counted `Unsupported`.
+4. Six census runs (seeds 1, 2, 20261106 × debug, release): 0 crashes, 0 hangs, 0 over-budget,
+   **no release-only crash class**. Debug ~12 s, release ~2.8 s per 3000 inputs.
+
+The ratchet moved DOWN where the lane deleted real panic sites, per the gate's own instruction:
+`core 2 → 1`, `demangle 3 → 1`; `arch-x86 7`, `verify 4`, `cli 14` unchanged.
+
+Named decreases, said out loud: the `m4` API adaptation dropped the census counters
+`discover.bytes`, `discover.tables`, `discover.table_slots`, `discover.table_unresolved` and
+the per-`Gap` `discover.<gap>` loop, because master's `Vec<Subject>` carries no plan census.
+Re-based equivalents from the lifter's own report: `lift.jump_tables`, `lift.jump_table_edges`,
+`lift.jump_table_partial`, `lift.jump_table_missing`, `lift.insns`. A census counter is removed
+by name, never by silence.
