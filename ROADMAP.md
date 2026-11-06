@@ -1423,3 +1423,41 @@ Recorded as a testing fact: `F2` is the scalar-DOUBLE prefix, `F3` the scalar-SI
 The first draft of the `cvtsi2sd` witness used `F3`; the lifter correctly produced a
 `float` and the emitted text looked like a lifter bug. Decode your own test bytes with
 `llvm-objdump` before believing a red test.
+
+### Direct calls modelled, and the evidence source that was missing (2026-11-05)
+
+`Op::Call` defines its result; caller-saved destruction is a separate `Op::Clobber` per
+register. That split is what moved the gates: `Op::Opaque` still blocks DCE, so an
+unmodelled instruction can never vanish, while an unread clobber is genuinely dead and a
+read clobber is still a loud refusal.
+
+| gate | before | after |
+|---|---|---|
+| `c --corpus` | 84 emitted / 57 refused | **99 emitted / 42 refused**, 0 invalid; the 15 `clobbered by call` class is gone (57-15 = 42 exactly) |
+| `cpp --corpus` | 62 emitted / 16 refused | **71 emitted / 7 refused** (9 call-clobber gone; 4 indirect call remain) |
+| `t2 --corpus` | 1364 / 1364 / 0, 4 faults | **identical**, and the exclusion list now names `15 calls a symbol` where it was silent before |
+| `t2 --cpp` | 688 / 688 / 0, buckets sum 78 | **identical** (the 9 newly-emitting functions moved refused -> excluded) |
+| lift / objdump / demangle / tests | 141/141 · 124/124 · 68/68 · 133 | 141/141 · 124/124 · 68/68 · **143** |
+
+**The finding that matters more than the numbers: `calls: 0 modelled` in both corpora.**
+The emission rise came from the clobber split, not from modelled calls, because a clang
+COFF object does not put the call target in the instruction. Verified with llvm-objdump on
+`corpus/obj/call_helper.O0.obj`:
+
+    10:  callq 0x15 <f+0x15>          ; the immediate is the unrelocated next-IP
+    OFFSET 0000000000000011  IMAGE_REL_AMD64_REL32  h     ; the target is HERE
+
+`Lifter::target()` reads the immediate, so it never equals the callee's address. The
+missing piece is not "support calls" — it is **the COFF relocation table as an evidence
+source**, threaded into lifting. One reader unlocks four recorded gaps at once: call
+targets (the 15 `calls a symbol` T2 exclusions), the **jump tables that keep M1 red at
+97.88%** with 2 unclassified indirect branches, the largest remaining C refusal class
+(`14 lea of an address we cannot name`), and **vtable identity for M8**, where this clang
+build names zero vftable symbols so `.rdata` + REL32 is the only route.
+
+New refusal census, C (42 records in 42 functions, 8 classes): `14 lea of an address we
+cannot name | 10 cdq | 6 imul | 4 unstructured conditional branch | 4 div | 2 live-in
+Rsp`. C++ (7): `4 indirect call | 1 arithmetic-unmodelled | 1 rip-relative mov | 1
+mov-unmodelled source`. Next by the ledger's own ranking: relocation-aware targets, then
+`cdq`/`imul`/`div` (arithmetic facts, each with a red-first fixture), then M5 structuring
+on top of real control flow.
