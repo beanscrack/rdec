@@ -718,9 +718,16 @@ impl DomIndex {
             pre[root] = clock;
             clock += 1;
             let mut stack: Vec<(usize, usize)> = vec![(root, 0)];
-            while let Some((node, idx)) = stack.last_mut().copied() {
+            // The DFS walks with the live `last_mut` borrow: the increment goes
+            // through `top` itself. The copied-index + re-borrowed-`last_mut`
+            // shape (the cfg.rs pattern) is provably guarded, but an
+            // explicit-panic call there is a PANIC SITE, and the ratchet counts
+            // it — a new guarded site in a rewrite is fixed by not needing the
+            // guard, not by raising the baseline.
+            while let Some(top) = stack.last_mut() {
+                let (node, idx) = *top;
                 if idx < cfg.dom_tree[node].len() {
-                    stack.last_mut().unwrap().1 += 1;
+                    top.1 += 1;
                     let c = cfg.dom_tree[node][idx] as usize;
                     if pre[c] == u32::MAX {
                         pre[c] = clock;
