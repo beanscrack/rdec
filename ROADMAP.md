@@ -1848,3 +1848,17 @@ New named gap, measured, not papered: **`verify_ssa` on 20k blocks costs 274.7 s
 ignored test carries the number in its reason. Fix shape: the same per-sweep-table
 pattern; the acceptance test is the 20k probe un-ignored on the SSA-verification
 leg.
+
+## M9 evidence: 20k-input fuzz census at `78f23c7` (clean worktree, own target dir)
+
+    debug   seed 7     20000 inputs  7.4 s   crashes 0  hangs 0  over-budget 0  slowest 10 ms
+    debug   seed 123   20000 inputs  7.6 s   crashes 0  hangs 0  over-budget 0  slowest 10 ms
+    debug   seed 31337 20000 inputs  7.6 s   crashes 0  hangs 0  over-budget 0  slowest  9 ms
+    release seed 7     20000 inputs  3.0 s   crashes 0  hangs 0  over-budget 0  slowest  2 ms
+    (load refusals ~4.4k and gaps ~2.7k per run, all counted loudly; ~4.5 KB inputs)
+
+The throughput is itself a datapoint: the fuzz census used to take 12.2 s for 3000
+inputs with a 146 ms slowest input (`289645b`); at `78f23c7` the same surface does
+20000 inputs in 7.4 s, slowest 10 ms - the pass-pipeline fixpoint work (fe425cf)
+sped up every front-half consumer, which is what "the middle end scales" means
+when measured at the product's own fuzzer.
