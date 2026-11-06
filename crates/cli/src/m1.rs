@@ -688,6 +688,15 @@ pub fn cmd_lift(args: &[String]) -> Result<i32, String> {
     let mut exit_total = 0usize;
     let mut unnamed_total = 0usize;
     let mut clobber_total = 0usize;
+    // The call census, printed with the rest of the evidence: the modelled
+    // number and each refused class, so the direct-call model is auditable and
+    // not a claim. This gate lifts with `lift_one` (no callee table), so its
+    // modelled count is 0 by construction - the line says so with numbers.
+    let mut call_modelled = 0usize;
+    let mut call_indirect = 0usize;
+    let mut call_nosym = 0usize;
+    let mut call_over = 0usize;
+    let mut call_untypable = 0usize;
     let mut unreach_total = 0usize;
     let mut undef_live = 0usize;
     let mut scaffolding = 0usize;
@@ -801,6 +810,11 @@ pub fn cmd_lift(args: &[String]) -> Result<i32, String> {
             exit_total += rep.exits;
             unnamed_total += rep.unnamed_calls;
             clobber_total += rep.clobbers;
+            call_modelled += rep.calls_modelled;
+            call_indirect += rep.calls_indirect;
+            call_nosym += rep.calls_no_symbol;
+            call_over += rep.calls_over_args;
+            call_untypable += rep.calls_untypable;
             unreach_total += rep.unreachable_blocks;
             undef_live += rep.undef_live_ins;
             scaffolding += rep.scaffolding_removed;
@@ -876,6 +890,9 @@ pub fn cmd_lift(args: &[String]) -> Result<i32, String> {
     );
     println!(
         "return width: {ret_w32} of {lifted} functions answer at 32-bit width (a 32-bit write zeroes RAX's upper half, so the emitted C returns uint32_t)"
+    );
+    println!(
+        "calls: {call_modelled} modelled | indirect {call_indirect} | no symbol {call_nosym} | >4 args {call_over} | untypable {call_untypable}"
     );
     println!(
         "evidence: {gap_total} loud gaps, {exit_total} Exit terminators, {unnamed_total} unnamed call targets, {clobber_total} modelled register clobbers, {unreach_total} unreachable blocks dropped, {scaffolding} live-in placeholders resolved, {undef_live} of them `undef` (the ABI question), {self_idioms} register self-idioms translated as machine-code facts (`xor/sub r,r` write 0 without reading the register; `and/or r,r` write it back)"

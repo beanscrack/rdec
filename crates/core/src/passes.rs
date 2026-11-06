@@ -556,6 +556,9 @@ fn op_shape(op: &Op) -> String {
         Op::Select(..) => "select".into(),
         Op::Phi(p) => format!("phi(len={})", p.len()),
         Op::Call { callee, ret_ty, .. } => format!("call({callee:?},{ret_ty})"),
+        // Its own shape: two blocks that clobber at the same point may be
+        // merged, and a clobber must never key-match an opaque gap.
+        Op::Clobber => "clobber".into(),
         Op::Opaque(s) => format!("opaque({s})"),
     }
 }
@@ -677,7 +680,7 @@ impl Op {
     /// Visit every operand slot so passes can rewrite uses in place.
     pub fn map_uses(&mut self, mut g: impl FnMut(&mut VId)) {
         match self {
-            Op::Const(_) | Op::ConstF(_) | Op::Undef | Op::Opaque(_) | Op::Param => {}
+            Op::Const(_) | Op::ConstF(_) | Op::Undef | Op::Opaque(_) | Op::Clobber | Op::Param => {}
             Op::Copy(a) => g(a),
             Op::Bin(_, a, b) => {
                 g(a);

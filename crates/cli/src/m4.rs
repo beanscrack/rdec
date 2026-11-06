@@ -10,8 +10,8 @@
 //!  3. the passes that run before emission must not break SSA - checked with the
 //!     same verifier, not with trust.
 use rdec_arch_x86::discover::{discover_all, Code};
-use rdec_arch_x86::lift::lift_one_sig;
-use rdec_core::emit_c::{emit_c, Refusal, PRELUDE};
+use rdec_arch_x86::lift::{lift_one_sigs, CalleeSig, CalleeTable, FnShape};
+use rdec_core::emit_c::{callee_decl, emit_c_sig, Protos, Refusal, PRELUDE};
 use rdec_core::ir::Function;
 use rdec_core::verify::verify_ssa;
 use std::collections::{HashMap, HashSet};
@@ -110,17 +110,24 @@ pub struct Subject {
 
 /// Load, discover, lift and clean every function in `files`, named by
 /// `name_of(object index, COFF symbol)` and shaped by
-/// `abi_of(object index, COFF symbol)`.
+/// `shape_of(object index, COFF symbol)`.
 ///
 /// The naming scheme and the shape are parameters, not copies of the
 /// pipeline: `rdec cpp` names the C++ functions from their DEMANGLED text and
 /// declares their parameter kinds from the same evidence, and it must run the
 /// same discovery, the same lifter and the same passes as `rdec c` - a C++
 /// gate that re-implemented the front half would be measuring its own copy.
-pub fn lift_all_named_sigs(
+///
+/// `shape_of` is asked for EVERY symbol of the object, not only for the
+/// function being lifted, because the result is also the object's CALLEE TABLE:
+/// a `call` to a sibling is only modelable when the front end can name the
+/// target (the COFF symbol at that address) and say what its signature declares.
+/// `FnShape::typed == false` is the loud case - a signature the demangler could
+/// not fully type - and a call to such a callee stays refused.
+pub fn lift_all_named_shapes(
     files: &[String],
     name_of: &dyn Fn(usize, &str) -> String,
-    abi_of: &dyn Fn(usize, &str) -> rdec_arch_x86::lift::FnAbi,
+    shape_of: &dyn Fn(usize, &str) -> FnShape,
 ) -> Result<Vec<Subject>, String> {
     let mut out: Vec<Subject> = Vec::new();
     for (oi, file) in files.iter().enumerate() {
@@ -182,6 +189,25 @@ pub fn lift_all_named_sigs(
             }
         }
 
+        // What every symbol of this object DECLARES, keyed by the COFF name: the
+        // table a call site consults. Keyed by COFF name because that is what an
+        // address resolves to; the value carries the name the generated C uses.
+        let mut sigs: CalleeTable = CalleeTable::new();
+        for raw in names.values() {
+            if sigs.contains_key(raw.as_str()) {
+                continue;
+            }
+            let sh = shape_of(oi, raw);
+            sigs.insert(
+                raw.clone(),
+                CalleeSig {
+                    cname: name_of(oi, raw),
+                    abi: sh.abi,
+                    typed: sh.typed,
+                },
+            );
+        }
+
         for (k, &start) in plan.functions.iter().enumerate() {
             let Some((_, rg)) = ranges
                 .iter()
@@ -202,9 +228,10 @@ pub fn lift_all_named_sigs(
                 .cloned()
                 .unwrap_or_else(|| format!("fn_{start:x}"));
             let name = name_of(oi, &raw);
-            let abi = abi_of(oi, &raw);
-            let (mut f, rep) =
-                lift_one_sig(&name, rg.bytes, rg.base, start, end, &plan, &names, &abi);
+            let abi = shape_of(oi, &raw).abi;
+            let (mut f, rep) = lift_one_sigs(
+                &name, rg.bytes, rg.base, start, end, &plan, &names, &abi, &sigs,
+            );
             clean(&mut f);
             out.push(Subject {
                 obj: file.clone(),
@@ -219,6 +246,50 @@ pub fn lift_all_named_sigs(
         }
     }
     Ok(out)
+}
+
+/// Load, discover, lift and clean every function in `files`, named by
+/// `name_of`, with every declared shape treated as fully typed. This is the
+/// entry point for a front end whose shapes are all shapes it resolved; a
+/// signature it cannot type goes through `lift_all_named_shapes` with
+/// `FnShape::typed: false`, so its callers stay refused instead of guessing.
+pub fn lift_all_named_sigs(
+    files: &[String],
+    name_of: &dyn Fn(usize, &str) -> String,
+    abi_of: &dyn Fn(usize, &str) -> rdec_arch_x86::lift::FnAbi,
+) -> Result<Vec<Subject>, String> {
+    lift_all_named_shapes(files, name_of, &|oi, raw| FnShape {
+        abi: abi_of(oi, raw),
+        typed: true,
+    })
+}
+
+/// The declared shape of every subject, keyed by the C name `Op::Call` carries.
+/// One source for the whole translation unit: the prototype a caller writes for
+/// `g` and the definition of `g` are both spelled from `g`'s own `Function`, so
+/// `clang -Werror` can never see `conflicting types` between them.
+pub fn protos_of(subjects: &[Subject]) -> Protos {
+    subjects
+        .iter()
+        .map(|s| (s.cname.clone(), callee_decl(&s.f)))
+        .collect()
+}
+
+/// The call census, on the same footing as the SSE census: counted by the lifter
+/// at its own call site, so the modelled number and each refused class are
+/// auditable, and the refused classes are the work list. Summed over the
+/// lifter's per-function reports - `clean` deletes instructions, so a scan of
+/// the surviving IR would count what the passes kept, not what the decoder saw.
+pub fn calls_line(subjects: &[Subject]) -> String {
+    let (mut m, mut ind, mut nosym, mut over, mut unty) = (0, 0, 0, 0, 0);
+    for s in subjects {
+        m += s.rep.calls_modelled;
+        ind += s.rep.calls_indirect;
+        nosym += s.rep.calls_no_symbol;
+        over += s.rep.calls_over_args;
+        unty += s.rep.calls_untypable;
+    }
+    format!("calls: {m} modelled | indirect {ind} | no symbol {nosym} | >4 args {over} | untypable {unty}")
 }
 
 /// Load, discover, lift and clean every function in `files`, named by
@@ -276,6 +347,11 @@ pub fn cmd_c(args: &[String]) -> Result<i32, String> {
     std::fs::create_dir_all(&out_dir).map_err(|e| format!("{out_dir}: {e}"))?;
 
     let subjects = lift_all(&files)?;
+    println!("{}", calls_line(&subjects));
+    // The callee shapes of the whole translation unit, built once, before the
+    // first function is emitted: a call to a sibling needs a prototype that
+    // already exists, and every definition is in this file, so the set is known.
+    let protos = protos_of(&subjects);
 
     let mut seen = 0usize;
     let mut emitted = 0usize;
@@ -307,7 +383,7 @@ pub fn cmd_c(args: &[String]) -> Result<i32, String> {
             }
             continue;
         }
-        match emit_c(&s.f) {
+        match emit_c_sig(&s.f, &protos) {
             Ok(out) => {
                 emitted += 1;
                 all.push_str(&out.text);
@@ -343,6 +419,14 @@ pub fn cmd_c(args: &[String]) -> Result<i32, String> {
     let mut ks: Vec<(String, usize)> = keys.into_iter().collect();
     ks.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     if !ks.is_empty() {
+        // The census has to be auditable against the refusal count: every
+        // refusal is in exactly one class, so the sum is the number of refusal
+        // records, and a class list that stops at six still says so.
+        let total: usize = ks.iter().map(|(_, n)| n).sum();
+        println!(
+            "refusal records: {total} in {refused} refused functions, {} classes",
+            ks.len()
+        );
         let top: Vec<String> = ks.iter().take(6).map(|(k, n)| format!("{n} {k}")).collect();
         println!("refusal classes: {}", top.join(" | "));
     }

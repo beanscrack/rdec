@@ -101,7 +101,7 @@ fn one(f: &Function, v: VId, memo: &mut HashMap<VId, u32>, path: &mut HashSet<VI
         Op::Copy(x) => go(*x),
         // Anything read from outside the IR - a parameter, memory, a call, an
         // unmodelled op, an undefined register - is as wide as its type.
-        Op::Param | Op::Undef | Op::Opaque(_) | Op::Load(..) | Op::Call { .. } => w,
+        Op::Param | Op::Undef | Op::Opaque(_) | Op::Clobber | Op::Load(..) | Op::Call { .. } => w,
         Op::ConstF(_) | Op::Flags(_) => w,
         // A float op's result is as wide as its type says (64 for F64, 32 for
         // F32, 1 for a comparison). It is NOT the width of the integer the cast

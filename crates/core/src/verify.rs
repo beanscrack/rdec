@@ -129,6 +129,66 @@ pub fn verify(f: &Function) -> Verdict {
                     }
                 }
             }
+            // A call is the one op whose meaning lives OUTSIDE this function, so
+            // it is the one op the verifier has to check against its own claim.
+            // Three rules, all hard, because all three produce C that compiles:
+            //
+            //  * the target's identity must be there. `Symbol("")` names nobody,
+            //    and the emitter would print a call to nothing.
+            //  * an argument is a register cell (int, float, pointer). A `Bool`
+            //    or a `Flags` value wired into an argument list has no C
+            //    spelling as an argument, and `Ty::Flags` reaching a call means
+            //    flag elimination did not run.
+            //  * the declared return type must be one C can spell, because the
+            //    prototype the emitter writes for the callee is spelled from it.
+            if let Op::Call {
+                callee,
+                args,
+                ret_ty,
+                ..
+            } = &i.op
+            {
+                match callee {
+                    Callee::Symbol(s) if s.trim().is_empty() => e.hard(format!(
+                        "bb{}: %{} call with an empty callee name",
+                        b.id, i.dest
+                    )),
+                    Callee::Indirect(v) if !defined(f, *v) => e.hard(format!(
+                        "bb{}: %{} indirect call through undefined %{}",
+                        b.id, i.dest, v
+                    )),
+                    _ => {}
+                }
+                for a in args.iter() {
+                    match f.ty_of(*a) {
+                        Some(ref t)
+                            if !matches!(t, Ty::Int { .. } | Ty::Float { .. } | Ty::Ptr(_)) =>
+                        {
+                            e.hard(format!(
+                                "bb{}: %{} call argument %{} is {t} (a call's arguments are register cells: int, float or pointer)",
+                                b.id, i.dest, a
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                if matches!(ret_ty, Ty::Flags | Ty::Func(..) | Ty::Struct { .. }) {
+                    e.hard(format!(
+                        "bb{}: %{} call declares an unspellable return type {ret_ty}",
+                        b.id, i.dest
+                    ));
+                }
+            }
+            // A clobber is a definition with no operands: the one thing to check
+            // is that it stayed a register cell, because the register file is one
+            // unsigned W64 word per register and the SSA transfer function keys on
+            // that, not on a second table.
+            if matches!(i.op, Op::Clobber) && !matches!(i.ty, Ty::Int { .. }) {
+                e.hard(format!(
+                    "bb{}: %{} clobber is {} (a clobbered register is a W64 cell)",
+                    b.id, i.dest, i.ty
+                ));
+            }
             // A float conversion whose SOURCE is not a float (or whose result
             // is not the float kind the kind names) is a pass bug: the C cast
             // syntax accepts all of them, and the answers differ.

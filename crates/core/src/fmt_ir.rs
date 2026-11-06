@@ -101,6 +101,7 @@ pub fn format_instr(f: &Function, i: &Instr) -> String {
                 if *pure { " [pure]" } else { "" }
             )
         }
+        Op::Clobber => "clobber".to_string(),
         Op::Opaque(msg) => format!("opaque \"{msg}\""),
     };
     let ty = if i.ty.is_void() {

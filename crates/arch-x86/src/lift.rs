@@ -37,8 +37,17 @@
 //!   and width comes from the operand TYPES, so operands handed to a `FlagsOp`
 //!   are truncated to the instruction's operand width first.
 //! * A call clobbers the caller-saved registers. That is modelled, as an
-//!   `Opaque` per clobbered register, because leaving a value live across a call
-//!   is a silent miscompile, and the silent kind is the one that ships.
+//!   [`Op::Clobber`] definition per clobbered register, because leaving a value
+//!   live across a call is a silent miscompile, and the silent kind is the one
+//!   that ships. A DIRECT call to a target the pipeline names and types is
+//!   modelled further: the call op carries the callee's identity and its
+//!   declared arguments, and DEFINES its answer — RAX for a declared integer
+//!   return, XMM0's cell for a declared float one — so a function that calls a
+//!   decompiled sibling and uses the answer emits C. The clobbers do not shrink
+//!   for it: the call defines its outputs and clobbers the rest. Everything the
+//!   identity or the shape does not reach — indirect, no symbol, more arguments
+//!   than the register pairs, an untypable callee — keeps its loud shape and its
+//!   refusal, and each class is counted in `Report`.
 //! * The Windows x64 ABI homes every parameter by REGISTER PAIR: declared
 //!   parameter `k` arrives in the pair that owns RCX/RDX/R8/R9[k] AND
 //!   XMM0-3[k], so a float parameter consumes no integer register and an
@@ -329,6 +338,79 @@ impl FnAbi {
     pub fn is_integer(&self) -> bool {
         self.args.is_empty() && self.ret == RetKind::Int
     }
+    /// The register PAIRS this shape's parameters occupy, in DECLARED order,
+    /// with the kinds that live in them — the single statement of the pair rule,
+    /// read by the seed (`new_abi`, which creates the parameters) and by every
+    /// CALL SITE (which has to read the same registers to pass the arguments).
+    /// A pair position with no register (Windows x64 has four pairs) is dropped
+    /// here and counted by the seed, never invented.
+    ///
+    /// The reason one function serves both jobs is the bug it prevents: a caller
+    /// that computed "which registers" its own way would pass `b` in RDX to a
+    /// callee that reads it from XMM1, and nothing downstream could see it.
+    pub fn seeded_pairs(&self) -> Vec<(Grp, ArgKind)> {
+        if self.args.is_empty() {
+            // The integer model: the four integer registers, four pairs.
+            return ARG_REGS.iter().map(|g| (*g, ArgKind::Int)).collect();
+        }
+        self.args
+            .iter()
+            .enumerate()
+            .filter_map(|(pos, &k)| {
+                let g = match k {
+                    ArgKind::Int => ARG_REGS.get(pos).copied(),
+                    ArgKind::F32 | ArgKind::F64 => ARG_XMM.get(pos).copied(),
+                };
+                g.map(|g| (g, k))
+            })
+            .collect()
+    }
+    /// The C-declared type of one parameter of this shape, as `new_abi` records
+    /// it in `Function::param_tys` (a float parameter's IR value is the register
+    /// cell; its DECLARED type is what the C spells).
+    pub fn declared_ty(k: ArgKind) -> Ty {
+        match k {
+            ArgKind::Int => Ty::u64(),
+            ArgKind::F32 => Ty::f32(),
+            ArgKind::F64 => Ty::f64(),
+        }
+    }
+}
+
+/// What the front end DECLARES about one function: the shape, and whether it is
+/// a shape at all. `typed: false` is the loud case — a signature the demangler
+/// could not fully type, for which the subject keeps the integer model. A call
+/// site reads this and refuses to pretend: an untypable callee gets no defined
+/// return value, so the caller that uses its answer is refused, exactly as it
+/// was before calls were modelled.
+#[derive(Clone, Debug, Default)]
+pub struct FnShape {
+    pub abi: FnAbi,
+    pub typed: bool,
+}
+
+/// What a call site knows about one callee: its identity in the generated
+/// translation unit, and its declared shape.
+#[derive(Clone, Debug)]
+pub struct CalleeSig {
+    /// The C name the pipeline gives this function — the identity `Op::Call`
+    /// records and the emitter declares. Not the COFF name: one C file holds
+    /// every function of every object, and `o7_f` is who `f` is there.
+    pub cname: String,
+    pub abi: FnAbi,
+    /// The declared shape is a shape (see `FnShape`).
+    pub typed: bool,
+}
+
+/// The callees of one object, keyed by the COFF symbol the discovery plan found
+/// at the call target. Keyed by the COFF name because that is what the lifter
+/// can look up from an address; the value carries the name the C uses.
+pub type CalleeTable = HashMap<String, CalleeSig>;
+
+/// An empty table: no call target is typable, which is the model as it was
+/// before direct calls were modelled at all.
+pub fn no_callees() -> CalleeTable {
+    CalleeTable::new()
 }
 
 /// Caller-saved: a call may overwrite these.
@@ -496,6 +578,20 @@ pub struct Report {
     pub exits: usize,
     /// Calls whose target we could not name from the symbol table.
     pub unnamed_calls: usize,
+    /// Direct calls to a callee the pipeline named AND typed: modelled as a call
+    /// that defines its own answer, so the caller's use of that answer emits C.
+    /// Counted at the call site, which is the only place the evidence is.
+    pub calls_modelled: usize,
+    /// `call *%rax`: no target, so no signature, so no answer.
+    pub calls_indirect: usize,
+    /// A direct call to a target with no COFF symbol: an address, not an identity.
+    pub calls_no_symbol: usize,
+    /// A direct call with more register arguments than the model has pairs
+    /// (Windows x64 has four): the stack-argument case, named not dropped.
+    pub calls_over_args: usize,
+    /// A direct call to a callee whose declared shape the front end could not
+    /// type: the identity is known, the signature is not, so the answer is not.
+    pub calls_untypable: usize,
     /// Blocks the entry cannot reach; their lifted contents dropped, counted.
     pub unreachable_blocks: usize,
     /// Live-in placeholders SSA construction resolved and deleted.
@@ -640,8 +736,15 @@ pub struct Lifter<'a> {
     undef: Option<VId>,
     pub rep: Report,
     names: &'a HashMap<u64, String>,
+    /// The callees of this object, keyed by COFF symbol: what a `call` target
+    /// resolves to, and what its declared shape says to pass. An empty table is
+    /// "no target is typable", which is the model exactly as it was.
+    sigs: &'a CalleeTable,
     fmt: Box<dyn iced_x86::Formatter>,
 }
+
+/// An empty callee table: the lifter sees no typable call target.
+static EMPTY_SIGS: std::sync::LazyLock<CalleeTable> = std::sync::LazyLock::new(CalleeTable::new);
 
 impl<'a> Lifter<'a> {
     /// Lift under the integer model: RCX/RDX/R8/R9 seeded as the four
@@ -652,22 +755,40 @@ impl<'a> Lifter<'a> {
         Lifter::new_abi(name, addr, names, &FnAbi::integer())
     }
 
-    /// Lift under a DECLARED shape. `abi.args` is the parameter list in
-    /// declaration order, and parameter `pos` is seeded from the register PAIR
-    /// its position owns: `ARG_REGS[pos]` for an integer kind, `ARG_XMM[pos]`
-    /// for a float kind. That is the Windows x64 rule as measured — a float
-    /// parameter consumes no integer register and an integer parameter no XMM,
-    /// so the index is the declared POSITION, not a per-class count. A member
-    /// needs no special case: `this` is `args[0]` and spends pair 0 in BOTH
-    /// classes, which is why its first `double` is XMM1 and a free
-    /// `int f(int a, double b)`'s is XMM1 too. A parameter past pair 3 has no
-    /// register: a loud, counted gap, never an invented value.
-    /// An empty `abi.args` is the integer model: the four integer registers.
+    /// Lift under a DECLARED shape, with no callee table: every call this
+    /// function makes stays a loud call. This is the constructor every gate and
+    /// test used before direct calls were modelled, and it seeds exactly what it
+    /// always seeded.
     pub fn new_abi(
         name: &str,
         addr: u64,
         names: &'a HashMap<u64, String>,
         abi: &FnAbi,
+    ) -> Lifter<'a> {
+        Lifter::new_sig(name, addr, names, abi, &EMPTY_SIGS)
+    }
+
+    /// Lift with the declared shapes of this object's CALLEES available, so a
+    /// direct call to a named, typed sibling becomes a call that DEFINES its
+    /// answer instead of a call plus a pile of clobbers.
+    ///
+    /// `abi` is this function's own declared shape: `abi.args` is its parameter
+    /// list in declaration order, and parameter `pos` is seeded from the register
+    /// PAIR its position owns: `ARG_REGS[pos]` for an integer kind,
+    /// `ARG_XMM[pos]` for a float kind. That is the Windows x64 rule as measured
+    /// — a float parameter consumes no integer register and an integer parameter
+    /// no XMM, so the index is the declared POSITION, not a per-class count. A
+    /// member needs no special case: `this` is `args[0]` and spends pair 0 in
+    /// BOTH classes, which is why its first `double` is XMM1 and a free
+    /// `int f(int a, double b)`'s is XMM1 too. A parameter past pair 3 has no
+    /// register: a loud, counted gap, never an invented value.
+    /// An empty `abi.args` is the integer model: the four integer registers.
+    pub fn new_sig(
+        name: &str,
+        addr: u64,
+        names: &'a HashMap<u64, String>,
+        abi: &FnAbi,
+        sigs: &'a CalleeTable,
     ) -> Lifter<'a> {
         let mut f = Function::new(name, addr);
         f.ret_ty = match abi.ret {
@@ -678,86 +799,47 @@ impl<'a> Lifter<'a> {
         let entry = f.entry;
         let mut regs = HashMap::new();
         let mut seeded: Vec<Grp> = Vec::new();
-        let mut over_budget = 0usize;
         let mut float_params = 0usize;
-        if abi.args.is_empty() {
-            for g in ARG_REGS {
-                // The four argument registers are REGISTER values, and a register is
-                // one unsigned W64 word in this model. Typed `int64_t` (the earlier
-                // spelling) makes the entry's params the only signed values in the
-                // register model, so as soon as they flow past the entry block -
-                // which they now do - every `and`/`add` that reads one reports
-                // "op type int64_t != recorded uint64_t": the verifier is right, the
-                // register model was inconsistent. Signedness is a property of a
-                // *read* (`movsx` asks for it, `sar` asks for it), and the emitter
-                // spells both; it is not a property of the bits in a register.
-                let v = f.new_value(Ty::u64());
-                f.params.push(v);
-                f.param_tys.push(Ty::u64());
-                f.block_mut(f.entry)
-                    .push(Instr::new(v, Op::Param, Ty::u64(), addr));
-                regs.insert(g, v);
-                seeded.push(g);
+        // One parameter per declared kind, seeded at its DECLARED POSITION by the
+        // pair rule in `FnAbi::seeded_pairs` — the SAME rule every call site
+        // reads, so a caller can never hand an argument in a register this seed
+        // did not create (that drift is invisible everywhere downstream).
+        // `int f(int a, double b)` = RCX + XMM1 and
+        // `int g(double a, int b, double c)` = XMM0 + RDX + XMM2, and a member's
+        // `this` at pair 0 spends both classes, which is why its first `double`
+        // is XMM1 — the bytes picked this, and `tests/float_abi.rs` pins it.
+        //
+        // A float parameter's IR value is the XMM cell - one unsigned W64 word,
+        // the register file's rule, signedness included (a register cell is
+        // unsigned; signedness is a property of a *read*, and the emitter spells
+        // both) - and its DECLARED type (`param_tys`) is what the C signature
+        // spells; the emitter moves bits through the memcpy helpers.
+        // An empty `abi.args` is the integer model: the same loop, four Ints.
+        let pairs = abi.seeded_pairs();
+        let over_budget = abi.args.len().saturating_sub(pairs.len());
+        for (g, k) in pairs {
+            if k != ArgKind::Int {
+                float_params += 1;
             }
-        } else {
-            // One parameter per declared kind, seeded at its DECLARED POSITION:
-            // pair `pos` owns `ARG_REGS[pos]` AND `ARG_XMM[pos]`, so
-            // `int f(int a, double b)` = RCX + XMM1 and
-            // `int g(double a, int b, double c)` = XMM0 + RDX + XMM2. A float
-            // parameter's IR value is the XMM cell - one unsigned W64 word, the
-            // register file's rule - and its DECLARED type (`param_tys`) is what
-            // the C signature spells; the emitter moves bits through the memcpy
-            // helpers at the assignment.
-            for (pos, &k) in abi.args.iter().enumerate() {
-                // The PAIR rule, identical for a free function and a member:
-                // parameter `pos` (a member's `this` is 0) lands in pair `pos`
-                // of its class, so a member's first declared `double` is XMM1
-                // and a free `f(int, double)`'s is XMM1 - the callee opens
-                // `movsd %xmm1, 0x8(%rsp)` in both cases. The corpus bytes and a
-                // harness driver's objdump, not a model preference, picked this,
-                // and `tests/float_abi.rs` pins it on assembled code.
-                let grp = match k {
-                    ArgKind::Int => ARG_REGS.get(pos).copied(),
-                    ArgKind::F32 | ArgKind::F64 => ARG_XMM.get(pos).copied(),
-                };
-                let declared = match k {
-                    ArgKind::Int => Ty::u64(),
-                    ArgKind::F32 => Ty::f32(),
-                    ArgKind::F64 => Ty::f64(),
-                };
-                let Some(g) = grp else {
-                    // No pair left for this position (Windows x64 has four):
-                    // loud, counted, and the parameter is NOT invented. The
-                    // front end is asked to hand in a fully-typed, in-budget
-                    // signature; this is the net under the guess.
-                    over_budget += 1;
-                    continue;
-                };
-                if k != ArgKind::Int {
-                    float_params += 1;
-                }
-                let v = f.new_value(Ty::u64());
-                f.params.push(v);
-                f.param_tys.push(declared);
-                f.block_mut(f.entry)
-                    .push(Instr::new(v, Op::Param, Ty::u64(), addr));
-                regs.insert(g, v);
-                seeded.push(g);
-            }
-            if over_budget > 0 {
-                // Loud, counted, and visible in the IR: a parameter that
-                // founds no register is an `Opaque`, never a guess.
-                f.emit_void(
-                    entry,
-                    Op::Opaque(
-                        format!(
-                            "{over_budget} declared parameters beyond the register-class budget"
-                        )
+            let v = f.new_value(Ty::u64());
+            f.params.push(v);
+            f.param_tys.push(FnAbi::declared_ty(k));
+            f.block_mut(f.entry)
+                .push(Instr::new(v, Op::Param, Ty::u64(), addr));
+            regs.insert(g, v);
+            seeded.push(g);
+        }
+        if over_budget > 0 {
+            // Loud, counted, and visible in the IR: a parameter that
+            // founds no register is an `Opaque`, never a guess.
+            f.emit_void(
+                entry,
+                Op::Opaque(
+                    format!("{over_budget} declared parameters beyond the register-class budget")
                         .into(),
-                    ),
-                    addr,
-                );
-            }
+                ),
+                addr,
+            );
         }
         // The machine stack is memory. In a flat-memory model the entry stack
         // pointer is a fixed address, which makes every rsp-relative access a real
@@ -791,6 +873,7 @@ impl<'a> Lifter<'a> {
             undef: None,
             rep: Report::default(),
             names,
+            sigs,
             fmt: crate::decode::formatter(crate::decode::Syntax::Intel),
         };
         l.rep.float_params = float_params;
@@ -1016,6 +1099,29 @@ impl<'a> Lifter<'a> {
     /// them is then a counted gap, not a stale value.
     fn clear_flags(&mut self) {
         self.flags = None;
+    }
+
+    /// Every caller-saved register the call destroys, as one `Op::Clobber`
+    /// DEFINITION each, written into the block's register map. `defined` is the
+    /// one register this call writes an answer into — a modelled call does not
+    /// clobber the register it defines, because its value is the call's, not a
+    /// destroyed one.
+    ///
+    /// Not one clobber is dropped for the sake of emission: a register the model
+    /// says is destroyed has no value, and every reader of that value (the
+    /// interpreter's `Fault::Clobbered`, the emitter's "opaque: clobbered by
+    /// call", the gate census) stays exactly as loud as it has always been.
+    /// What DCE may delete is an *unread* clobber, and an unread clobber is
+    /// genuinely dead — the call op itself stays, impure, in the same place.
+    fn clobber_all(&mut self, defined: Option<Grp>) {
+        for g in CALLER_SAVED {
+            if Some(g) == defined {
+                continue;
+            }
+            let v = self.f.emit(self.cur, Op::Clobber, Ty::u64(), self.addr());
+            self.set_reg(g, v);
+            self.rep.clobbers += 1;
+        }
     }
 
     fn get_flag(&mut self, fl: Flag) -> Option<VId> {
@@ -2300,59 +2406,136 @@ impl<'a> Lifter<'a> {
                 }
             }
             Mnemonic::Call => {
+                // A call destroys the caller's scratch registers: one
+                // `Op::Clobber` definition per caller-saved register, because
+                // leaving a value live across a call is a silent miscompile. The
+                // flags are clobbered too, and their cell is `None` (see
+                // `clear_flags`) — an `Op::Flags` there would let a compare before
+                // the call answer a flag after it.
+                //
+                // What is modelled on TOP of that: a DIRECT call to a target the
+                // pipeline names AND types is also a VALUE — the callee's answer,
+                // defined by the call, landing in the register its declared
+                // `RetKind` says carries it. The identity's evidence is the COFF
+                // symbol table at the target address; the shape's is the declared
+                // signature the front end resolved for that symbol.
                 if ins.op_kind(0) == OpKind::Register || ins.op_kind(0) == OpKind::Memory {
+                    // No target, so no signature, so no answer. Loud as it was.
                     self.f
                         .emit_void(self.cur, Op::Opaque("indirect call".into()), self.addr());
                     self.rep.gaps += 1;
-                } else {
-                    let t = self.target(ins).unwrap_or(0);
-                    let callee = match self.names.get(&t) {
-                        Some(n) => Callee::Symbol(n.clone()),
-                        None => {
-                            self.rep.unnamed_calls += 1;
-                            Callee::Addr(t)
-                        }
-                    };
-                    let args: Vec<VId> = ARG_REGS.iter().map(|g| self.read64(*g)).collect();
-                    if ins.op_count() > 1 {
-                        self.gap("call with more than four register arguments", Ty::i64());
+                    self.rep.calls_indirect += 1;
+                    self.clobber_all(None);
+                    self.clear_flags();
+                    return;
+                }
+                let t = self.target(ins).unwrap_or(0);
+                // More register arguments than the model has pairs (Windows x64
+                // has four): the 5th+ argument lives on the stack, unmodelled.
+                let over_args = ins.op_count() > 1;
+                if over_args {
+                    self.gap("call with more than four register arguments", Ty::i64());
+                    self.rep.calls_over_args += 1;
+                }
+                let sig = self.names.get(&t).and_then(|r| self.sigs.get(r));
+                // The callee's declared return type decides what the call defines.
+                let typed_call = sig.is_some() && sig.unwrap().typed && !over_args;
+                let ret_ty = if typed_call {
+                    match sig.unwrap().abi.ret {
+                        RetKind::Int => Ty::i64(),
+                        RetKind::F32 => Ty::f32(),
+                        RetKind::F64 => Ty::f64(),
                     }
-                    let v = self.f.new_value(Ty::i64());
-                    let a = self.addr();
-                    self.f.block_mut(self.cur).push(Instr::new(
-                        v,
-                        Op::Call {
-                            callee,
-                            ret_ty: Ty::i64(),
-                            args: args.into_boxed_slice(),
-                            pure: false,
-                        },
-                        Ty::i64(),
-                        a,
-                    ));
+                } else {
+                    Ty::i64()
+                };
+                // The arguments are the CALLER's cells for the pairs the CALLEE's
+                // declared shape occupies — the same `seeded_pairs` rule that seeds
+                // the callee's parameters, so a declared float argument goes in the
+                // XMM cell the callee reads, not the integer register. A call we
+                // cannot type keeps the integer model's four-integer-register
+                // spelling, because that is the shape it has always had.
+                let pairs: Vec<Grp> = match sig {
+                    Some(s) if s.typed && !over_args => {
+                        s.abi.seeded_pairs().into_iter().map(|(g, _)| g).collect()
+                    }
+                    _ => ARG_REGS.to_vec(),
+                };
+                let mut args: Vec<VId> = Vec::with_capacity(pairs.len());
+                for g in pairs {
+                    let a = self.read64(g);
+                    args.push(a);
+                }
+                let callee = match sig {
+                    Some(s) => Callee::Symbol(s.cname.clone()),
+                    None => {
+                        self.rep.unnamed_calls += 1;
+                        self.rep.calls_no_symbol += 1;
+                        Callee::Addr(t)
+                    }
+                };
+                if sig.is_some() && !typed_call {
+                    // Identity known, signature not: the answer is not known, so
+                    // the call defines nothing (RAX stays clobbered below) and the
+                    // caller that uses the answer is refused, as it always was.
+                    self.rep.calls_untypable += 1;
+                }
+                let v = self.f.new_value(ret_ty.clone());
+                let a = self.addr();
+                self.f.block_mut(self.cur).push(Instr::new(
+                    v,
+                    Op::Call {
+                        callee,
+                        ret_ty: ret_ty.clone(),
+                        args: args.into_boxed_slice(),
+                        pure: false,
+                    },
+                    ret_ty.clone(),
+                    a,
+                ));
+                // The callee's answer lands where its declared return type says:
+                // RAX for an integer, XMM0's cell for a float. The W64 view of a
+                // float answer is a BITCAST (the cell holds the bits — converting
+                // here would answer a different number), and the `float` case zexts
+                // the low 32 bits, which is the Windows x64 rule that the upper
+                // half of XMM0 is zeroed after a `float` return — the same rule the
+                // `cvtsi2ss` / `movss` paths follow.
+                if typed_call {
+                    match sig.unwrap().abi.ret {
+                        RetKind::Int => {
+                            let view = self.cast(CastKind::Bitcast, v, Width::W64);
+                            self.set_reg(Grp::Rax, view);
+                        }
+                        RetKind::F64 => {
+                            let view = self.cast(CastKind::Bitcast, v, Width::W64);
+                            self.set_reg(Grp::Xmm(0), view);
+                        }
+                        RetKind::F32 => {
+                            let low = self.cast(CastKind::Bitcast, v, Width::W32);
+                            let wide = self.cast(CastKind::ZExt, low, Width::W64);
+                            self.set_reg(Grp::Xmm(0), wide);
+                        }
+                    }
+                    self.rep.calls_modelled += 1;
+                } else {
                     // RAX is an unsigned W64 register value; `Op::Call`'s type is
-                    // its own declared return type (int64_t, the ABI's integer
-                    // answer), so the register reads the same bits as unsigned.
-                    // Without the view, any later partial write of RAX (`and
-                    // %call, 0xff00..` for `mov al, X`) reports the same signed /
-                    // unsigned mismatch the verifier flags for a param.
+                    // its own declared return type, so the register reads the same
+                    // bits as unsigned. Without the view, any later partial write
+                    // of RAX reports the signed/unsigned mismatch the verifier
+                    // flags for a param.
                     let view = self.cast(CastKind::Bitcast, v, Width::W64);
                     self.set_reg(Grp::Rax, view);
                 }
-                // Caller-saved registers are gone. Modelled, loudly, per register.
-                for g in CALLER_SAVED {
-                    let v = self.f.emit(
-                        self.cur,
-                        Op::Opaque("clobbered by call".into()),
-                        Ty::u64(),
-                        self.addr(),
-                    );
-                    // The clobber is a DEFINITION: a block whose register map
-                    // says "RCX is gone here" must say so to its successors, or
-                    // a value the call destroyed keeps flowing as if it survived.
-                    self.set_reg(g, v);
-                    self.rep.clobbers += 1;
-                }
+                // Caller-saved registers are gone. Modelled, loudly, per register
+                // — except the one this call DEFINES, whose value the call wrote.
+                self.clobber_all(if typed_call {
+                    match sig.unwrap().abi.ret {
+                        RetKind::Int => Some(Grp::Rax),
+                        RetKind::F32 | RetKind::F64 => Some(Grp::Xmm(0)),
+                    }
+                } else {
+                    None
+                });
                 self.clear_flags();
             }
             Mnemonic::Ret => {
@@ -2928,8 +3111,41 @@ pub fn lift_one_sig(
     names: &HashMap<u64, String>,
     abi: &FnAbi,
 ) -> (Function, Report) {
+    lift_one_sigs(
+        name,
+        bytes,
+        base,
+        start,
+        end,
+        plan,
+        names,
+        abi,
+        &no_callees(),
+    )
+}
+
+/// Lift one function with a declared shape AND the declared shapes of its
+/// callees, so a direct call to a named, typed sibling becomes a call op that
+/// defines its answer. An empty `sigs` is `lift_one_sig` exactly: every call
+/// keeps the loud shape (call + clobber per caller-saved register) it has always
+/// had, and the report counts each refused class.
+// The parameter list is the lift entry's, and `abi`/`sigs` are the evidence:
+// bundling the five code-range arguments into a struct is a refactor of every
+// caller in the repo, not a lint fix.
+#[allow(clippy::too_many_arguments)]
+pub fn lift_one_sigs(
+    name: &str,
+    bytes: &[u8],
+    base: u64,
+    start: u64,
+    end: u64,
+    plan: &Plan,
+    names: &HashMap<u64, String>,
+    abi: &FnAbi,
+    sigs: &CalleeTable,
+) -> (Function, Report) {
     let blocks = split_blocks(plan, start, end);
-    let mut l = Lifter::new_abi(name, start, names, abi);
+    let mut l = Lifter::new_sig(name, start, names, abi, sigs);
     let f = l.lift_function(bytes, base, &blocks);
     let rep = l.rep.clone();
     (f, rep)
@@ -2995,7 +3211,7 @@ fn rewrite_op(op: &mut Op, old: VId, new: VId) {
             }
         }
         Op::Flags(f) => rewrite_flags(f, old, new),
-        Op::Const(_) | Op::ConstF(_) | Op::Undef | Op::Param | Op::Opaque(_) => {}
+        Op::Const(_) | Op::ConstF(_) | Op::Undef | Op::Param | Op::Clobber | Op::Opaque(_) => {}
     }
 }
 

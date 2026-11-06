@@ -228,6 +228,20 @@ pub enum Fault {
     /// An operand with no definition. In SSA this cannot happen in valid IR, so
     /// it means a pass left a dangling reference -- loud, never a silent zero.
     MissingOperand(VId),
+    /// A call to a target named in the IR that is NOT in the model. The answer
+    /// is not guessed: `call_result`'s deterministic hash is the world's answer
+    /// for a callee outside the object (an import), and inventing one for a
+    /// callee that should have been in the program is how a missing function
+    /// becomes a plausible number.
+    UnknownCallee,
+    /// The call graph was followed deeper than the interpreter's nesting bound.
+    /// A real recursion is a fact about the program; a runaway is a bug in the
+    /// model, and both answer the same way: stop, say which.
+    CallDepth,
+    /// A read of a caller-saved register the call destroyed (`Op::Clobber`).
+    /// The value is not "0", and a decompiler that answers 0 here turns a
+    /// destroyed register into a plausible one.
+    Clobbered(VId),
 }
 
 /// Observable events, in execution order. TV compares these, not just the return
@@ -373,14 +387,32 @@ pub fn call_result(callee: &str, args: &[u64]) -> u64 {
 
 pub struct Interp<'a> {
     f: &'a Function,
+    /// The functions this run can call: the callee is looked up by NAME and
+    /// interpreted from its own body, in this same run, with the arguments bound
+    /// to its parameters. An empty table is "no sibling is in the model", and a
+    /// call to a named target then faults (`Fault::UnknownCallee`) instead of
+    /// answering a hash.
+    program: &'a [Function],
+    /// How deep the call graph has been followed in this run.
+    depth: usize,
     vals: Vec<Option<Val>>,
     mem: Mem,
     effects: Vec<Effect>,
     steps: usize,
     budget: usize,
+    /// Set by a nested call that ended the run: `Budget` (the callee exhausted
+    /// the shared step budget) or `NoReturn` (the callee reached `Exit`). The
+    /// caller cannot name an answer in either case, so the run reports the
+    /// callee's outcome, not a value.
+    abort: Option<Outcome>,
     /// Block we fell through from, for resolving `Op::Phi` incoming lists.
     prev_bb: Option<BbId>,
 }
+
+/// How deep `Op::Call` may nest inside one run. The corpus's functions call one
+/// level deep; a bound is here so a model bug (a callee that calls its caller)
+/// reports itself instead of consuming the step budget.
+pub const MAX_CALL_DEPTH: usize = 32;
 
 /// Default step budget. A function that exceeds it is reported as `Budget`,
 /// never silently truncated (§1.3's convergence rule, applied to interpretation).
@@ -391,13 +423,32 @@ pub fn run(f: &Function, inputs: &[u64]) -> Exec {
 }
 
 pub fn run_budget(f: &Function, inputs: &[u64], budget: usize) -> Exec {
+    run_program_budget(f, inputs, &[], budget)
+}
+
+/// Run `f` with `program` as the set of functions it may call: a call to a
+/// named target in the program executes that function's own body, in this run,
+/// with the arguments bound to its parameters and the same flat memory.
+pub fn run_program(f: &Function, inputs: &[u64], program: &[Function]) -> Exec {
+    run_program_budget(f, inputs, program, DEFAULT_BUDGET)
+}
+
+pub fn run_program_budget(
+    f: &Function,
+    inputs: &[u64],
+    program: &[Function],
+    budget: usize,
+) -> Exec {
     let mut it = Interp {
         f,
+        program,
+        depth: 0,
         vals: vec![None; f.values.len().max(f.next_value as usize) + 16],
         mem: Mem::default(),
         effects: Vec::new(),
         steps: 0,
         budget,
+        abort: None,
         prev_bb: None,
     };
     let outcome = it.exec_entry(inputs);
@@ -486,6 +537,40 @@ impl<'a> Interp<'a> {
         self.vals[i] = Some(val);
     }
 
+    /// Run one callee in this run: its own values, the SAME memory, effects,
+    /// step counter and program table (a callee may call a third function, and
+    /// its writes are the caller's writes). The arguments are bound to the
+    /// callee's parameters in declaration order, read at each parameter's own
+    /// type — the same rule `exec_entry` uses for the top-level function, so a
+    /// float parameter binds as the bit cell its caller passed.
+    fn exec_callee(&mut self, callee: &'a Function, args: &[u64]) -> Result<Val, Fault> {
+        if self.depth >= MAX_CALL_DEPTH {
+            return Err(Fault::CallDepth);
+        }
+        self.depth += 1;
+        let saved_f = std::mem::replace(&mut self.f, callee);
+        let saved_vals = std::mem::replace(
+            &mut self.vals,
+            vec![None; callee.values.len().max(callee.next_value as usize) + 16],
+        );
+        let saved_prev = self.prev_bb.take();
+        let out = self.exec_entry(args);
+        self.f = saved_f;
+        self.vals = saved_vals;
+        self.prev_bb = saved_prev;
+        self.depth -= 1;
+        match out {
+            Outcome::Ret(v) => Ok(v),
+            Outcome::Fault(f) => Err(f),
+            // A callee that ran out of budget, or reached control the model does
+            // not name, leaves the caller with no answer to have. Say which.
+            Outcome::Budget | Outcome::NoReturn => {
+                self.abort = Some(out.clone());
+                Ok(Val::Int(0))
+            }
+        }
+    }
+
     fn exec_bb(&mut self, bb: BbId) -> Outcome {
         let mut cur = bb;
         let mut from: Option<BbId> = None;
@@ -509,6 +594,12 @@ impl<'a> Interp<'a> {
                 match self.eval_op(dest, &op, &ty) {
                     Ok(()) => {}
                     Err(f) => return Outcome::Fault(f),
+                }
+                // A nested call that ended the run (budget, or a callee that
+                // reached `Exit`) is the run's outcome; the value it wrote is
+                // not an answer and must not flow into the next instruction.
+                if let Some(o) = self.abort.clone() {
+                    return o;
                 }
             }
             let term = self.f.blocks[cur as usize].term.clone();
@@ -764,24 +855,60 @@ impl<'a> Interp<'a> {
                     .iter()
                     .map(|a| self.fetch(*a))
                     .collect::<Result<Vec<_>, Fault>>()?;
-                let name = match callee {
-                    Callee::Symbol(s) => s.clone(),
-                    Callee::Addr(a) => format!("0x{a:x}"),
-                    Callee::Indirect(v) => format!("[{}]", self.fetch(*v)?),
-                };
-                self.effects.push(Effect::Call(name.clone(), abits.clone()));
-                // The result is a deterministic function of the call, so both
-                // sides of a TV pair react to the same world.
-                let r = call_result(&name, &abits);
-                let v = match ret_ty {
-                    Ty::Void => Val::Int(0),
-                    Ty::Bool => Val::Bl(r != 0),
-                    Ty::Float { .. } => Val::Fl(f64::from_bits(r)),
-                    _ => Val::Int(r),
+                let v = match callee {
+                    // A sibling in the model: run ITS body, here, with the
+                    // arguments bound to its parameters. This is what lets the
+                    // strict interpreter see through the call — a value the
+                    // callee never defines faults inside the callee, and a
+                    // callee that is not in the program at all is a fault, not a
+                    // hash.
+                    Callee::Symbol(s) => {
+                        self.effects.push(Effect::Call(s.clone(), abits.clone()));
+                        match self.program.iter().find(|g| g.name == *s) {
+                            Some(callee) => {
+                                let r = self.exec_callee(callee, &abits)?;
+                                match ret_ty {
+                                    Ty::Void => Val::Int(0),
+                                    Ty::Bool => Val::Bl(r.bits() != 0),
+                                    // The callee answered a float; the caller's
+                                    // declared return type says at which
+                                    // precision to read it.
+                                    Ty::Float { w } => match r {
+                                        Val::Fl(f) => Val::Fl(f),
+                                        other => Val::Fl(float_of_bits(*w, other.bits())),
+                                    },
+                                    _ => Val::Int(r.bits()),
+                                }
+                            }
+                            // Named, and not in the model: a hole, said out loud.
+                            None => return Err(Fault::UnknownCallee),
+                        }
+                    }
+                    // A target outside the object (an import) or through a
+                    // register: the world's answer, as a deterministic function
+                    // of the call, so both executions of a TV pair agree.
+                    _ => {
+                        let name = match callee {
+                            Callee::Addr(a) => format!("0x{a:x}"),
+                            Callee::Indirect(v) => format!("[{}]", self.fetch(*v)?),
+                            Callee::Symbol(s) => s.clone(),
+                        };
+                        self.effects.push(Effect::Call(name.clone(), abits.clone()));
+                        let r = call_result(&name, &abits);
+                        match ret_ty {
+                            Ty::Void => Val::Int(0),
+                            Ty::Bool => Val::Bl(r != 0),
+                            Ty::Float { .. } => Val::Fl(f64::from_bits(r)),
+                            _ => Val::Int(r),
+                        }
+                    }
                 };
                 self.set(dest, v);
                 let _ = pure;
             }
+            // The register's value is destroyed. There is no bit pattern to
+            // write, and 0 is a guess: fault.
+            Op::Clobber => return Err(Fault::Clobbered(dest)),
             Op::Opaque(msg) => {
                 self.effects.push(Effect::Opaque(msg.to_string()));
                 self.set(dest, Val::Int(0));

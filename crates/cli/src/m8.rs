@@ -1259,7 +1259,11 @@ pub fn cpp_pipeline(files: &[String]) -> Result<CppPipeline, String> {
     // any byte is lifted, and every subject carries it (`Subject::abi`). A
     // signature we cannot fully types keeps the integer model and lands in
     // `shape_gap`, named. Nothing here looks at the code to decide a type.
-    let subjects = crate::m4::lift_all_named_sigs(
+    // A callee's shape is modelable only when the demangler typed the whole
+    // signature: `typed: false` (no demangled name, or a `shape gap`) keeps the
+    // integer model for the subject AND tells every call site that this callee's
+    // answer is not typeable, so the caller that uses it is refused.
+    let subjects = crate::m4::lift_all_named_shapes(
         files,
         &|oi: usize, raw: &str| {
             c_name_of
@@ -1267,11 +1271,15 @@ pub fn cpp_pipeline(files: &[String]) -> Result<CppPipeline, String> {
                 .cloned()
                 .unwrap_or_else(|| format!("o{oi}_{}", crate::m4::c_ident(raw)))
         },
-        &|_, raw: &str| match dem_of.get(raw) {
-            Some(d @ Demangled::Name { text, .. }) => {
-                cpp_fn_abi(d, text).map(|s| s.abi).unwrap_or_default()
+        &|_, raw: &str| {
+            let sh = match dem_of.get(raw) {
+                Some(d @ Demangled::Name { text, .. }) => cpp_fn_abi(d, text),
+                _ => None,
+            };
+            rdec_arch_x86::lift::FnShape {
+                typed: sh.as_ref().is_some_and(|s| s.gap.is_none()),
+                abi: sh.map(|s| s.abi).unwrap_or_default(),
             }
-            _ => Default::default(),
         },
     )?;
 
@@ -1390,6 +1398,11 @@ pub fn cmd_cpp(args: &[String]) -> Result<i32, String> {
     all.push_str("#include <stdint.h>\n#include <string.h>\n\n");
     all.push_str(PRELUDE);
     all.push('\n');
+    // The callee shapes of this whole translation unit, built once: a call to a
+    // sibling is a call to a function this file also defines, so its prototype
+    // comes from that definition's own declared shape.
+    let protos = crate::m4::protos_of(&subjects);
+    println!("{}", crate::m4::calls_line(&subjects));
 
     for s in &subjects {
         lifted += 1;
@@ -1443,7 +1456,7 @@ pub fn cmd_cpp(args: &[String]) -> Result<i32, String> {
             );
             continue;
         }
-        match rdec_core::emit_c::emit_c(&s.f) {
+        match rdec_core::emit_c::emit_c_sig(&s.f, &protos) {
             Ok(out) => {
                 emitted += 1;
                 if this_modelled {
@@ -1473,7 +1486,12 @@ pub fn cmd_cpp(args: &[String]) -> Result<i32, String> {
                 // T2 runnability, with `rdec t2`'s own predicates, in its own
                 // order. Nothing here is weaker than the gate.
                 let skip: Option<String> = if !out.externs.is_empty() {
-                    Some("calls a symbol we do not model".to_string())
+                    // The call is modelled and the prototype is in the file; what
+                    // this harness cannot do is LINK the callee: its driver links
+                    // the one .obj, and the sibling's C definition is not in the
+                    // driver's translation unit. That is the harness's limit, and
+                    // the reason says so instead of "a symbol we do not model".
+                    Some("calls a sibling: the driver cannot link its definition".to_string())
                 } else if crate::t2::has_exit(&s.f) {
                     Some("unmodelled control flow (Exit)".to_string())
                 } else if crate::t2::synthetic(&s.sym, s.start) {

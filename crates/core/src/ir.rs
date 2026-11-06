@@ -361,6 +361,23 @@ pub enum Op {
     Select(VId, VId, VId),
     /// (value, predecessor block) pairs.
     Phi(Box<[(VId, BbId)]>),
+    /// A call. `callee` carries the target's IDENTITY — the callee's function
+    /// name as the generated translation unit spells it (`Symbol`), not an
+    /// address: an address is only an identity inside one object's byte range,
+    /// and the emitter, the interpreter and the gates all have to agree on who
+    /// is being called. `Addr` is the loud case (a target with no symbol),
+    /// `Indirect` the one no signature model reaches.
+    ///
+    /// `args` are the argument VALUES in the callee's DECLARED order: the
+    /// caller's register cells for the pair each declared parameter owns
+    /// (`ARG_REGS[pos]` for an integer kind, `ARG_XMM[pos]` for a float kind).
+    /// `ret_ty` is the callee's declared return type, so the op's result is
+    /// RAX's answer for an integer return and XMM0's answer for a float one.
+    ///
+    /// The op defines ONLY its result. The registers the call destroys are
+    /// separate `Op::Clobber` definitions, one per caller-saved register the
+    /// call does not itself define — a definition per register, because the
+    /// block's outgoing register map is the transfer function SSA solves.
     Call {
         callee: Callee,
         ret_ty: Ty,
@@ -371,6 +388,24 @@ pub enum Op {
         /// whose behaviour is not modelled.
         pure: bool,
     },
+    /// A caller-saved register destroyed by a call. It reads nothing and
+    /// defines a value no C expression can name.
+    ///
+    /// This is the clobber, and it is an op of its own (not `Op::Opaque`) for
+    /// one reason: an *unused* clobber is dead. DCE may delete a definition
+    /// that no read observes, and that is what lets a function that calls a
+    /// sibling and never re-reads RCX emit C at all. `Op::Opaque` deliberately
+    /// blocks DCE (an unmodelled instruction must never vanish quietly), and
+    /// applying that rule to the clobber is exactly why every function that
+    /// calls anything used to be refused.
+    ///
+    /// Nothing is lost by the split. A *read* of this value stays loud
+    /// everywhere it must be: the interpreter faults (`Fault::Clobbered`, never
+    /// a zero), and the emitter refuses with the class it has always used
+    /// ("opaque: clobbered by call"). A function that reads a caller-saved
+    /// register after a call is a function whose answer the call destroyed, and
+    /// that stays a refusal.
+    Clobber,
     /// Something we could not model. Prints as a comment; blocks DCE.
     Opaque(Box<str>),
 }
@@ -389,6 +424,9 @@ impl Op {
             Op::Const(_) => return None,
             Op::ConstF(_) => Ty::f64(),
             Op::Undef | Op::Opaque(_) => return None,
+            // A register cell: the register file is one unsigned W64 word per
+            // register, caller-saved clobber included (GPR or XMM cell alike).
+            Op::Clobber => Ty::u64(),
             Op::Param | Op::Copy(_) => return None,
             Op::Bin(op, a, _) => {
                 // Width comes from the operands; division/mul keep operand type.
@@ -419,7 +457,7 @@ impl Op {
     pub fn uses(&self, out: &mut Vec<VId>) {
         out.clear();
         match *self {
-            Op::Const(_) | Op::ConstF(_) | Op::Undef | Op::Opaque(_) | Op::Param => {}
+            Op::Const(_) | Op::ConstF(_) | Op::Undef | Op::Opaque(_) | Op::Clobber | Op::Param => {}
             Op::Copy(a) => out.push(a),
             Op::Bin(_, a, b) => out.extend([a, b]),
             Op::FBin(_, a, b) | Op::FCmp(_, a, b) => out.extend([a, b]),
@@ -467,6 +505,9 @@ impl Op {
             Op::Flags(_) => true,
             Op::GetFlag(..) => true,
             Op::Phi(_) | Op::Load(..) | Op::Store(..) | Op::Call { .. } | Op::Opaque(_) => false,
+            // The clobber defines "a value the call destroyed": not a value any
+            // use site may recompute, and not one it may name.
+            Op::Clobber => false,
         }
     }
 
@@ -475,6 +516,11 @@ impl Op {
         match self {
             Op::Call { pure, .. } => *pure,
             Op::Store(..) | Op::Opaque(_) => false,
+            // The clobber computes nothing and mutates nothing: it is a
+            // DEFINITION whose only meaning is what a later read of it means.
+            // Delete it when nothing reads it — the call that destroyed the
+            // register is a separate, impure op and stays put.
+            Op::Clobber => true,
             _ => true,
         }
     }

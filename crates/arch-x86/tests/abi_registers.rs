@@ -323,7 +323,10 @@ fn a_successor_of_a_call_reads_the_clobber_not_the_pre_call_argument() {
         "the nine caller-saved registers, counted"
     );
     assert!(
-        opaque_texts(&f).iter().any(|t| t == "clobbered by call"),
+        f.blocks
+            .iter()
+            .flat_map(|b| b.instrs.iter())
+            .any(|i| matches!(i.op, Op::Clobber)),
         "the clobber is in the IR: {:?}\n{}",
         opaque_texts(&f),
         rdec_core::fmt_ir::format_function(&f)
@@ -344,7 +347,7 @@ fn a_successor_of_a_call_reads_the_clobber_not_the_pre_call_argument() {
     let has_clobber = ancestors(&f, v).iter().any(|&x| {
         matches!(
             f.def(x).map(|(bb, ix)| &f.block(bb).instrs[ix].op),
-            Some(Op::Opaque(t)) if &**t == "clobbered by call"
+            Some(Op::Clobber)
         )
     });
     assert!(
