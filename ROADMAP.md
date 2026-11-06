@@ -1937,3 +1937,30 @@ over-a-store (that fixture RUNS 5 vectors: the C returns 00 where the graph retu
 `aa == ab` was before its witness): the DFS back-edge refusal has no red fixture —
 18/18 stay green when the check is deleted; the back-edge-stays-backward property
 is asserted as a layout THEOREM test over every fixture, not a refusal path.
+
+## M7 probe (2026-11-06): a real linked EXE exists; the loader's first answer about it is LOUD
+
+Artifact (reproducible): `clang -O1 -c` of `main.c` (`int main(){return (int)f(7);}`) +
+`corpus/src/arith_basic.c`, linked by `clang main.obj arith.obj -o m7.exe` (VS BuildTools
+14.44 link under the hood). 111,104 bytes; sections: .text 0xeff7 at VMA 0x140001000,
+.rdata, .data, **.pdata 0xfc0** (SEH unwind tables, ~300+ functions of CRT), .fptable,
+_RDATA, **.reloc** — the two structures M1 never saw in a .obj.
+Today's first behavior on it (measured): `rdec discover m7.exe` prints
+`section 1 (?) has SizeOfRawData 1750344141 at PointerToRawData 1881174889, past the
+end of a 111104-byte file` — the COFF-object reader reads the PE IMAGE_HEADER as a
+section table and REFUSES with exact bytes. No silent misparse: the audit standard
+holds on images it was never built for. Exit code NOT yet asserted (the measuring
+command piped through head — the exit-code lesson cuts both ways; a probe test must
+run the binary un-piped).
+M7 scope this pins: (1) PE image headers + section VA->file mapping; (2) .pdata/.xdata
+SEH unwind (function starts WITHOUT symbols — the whole-binary discovery source);
+(3) .reloc base relocations as evidence (the REL32 story re-used at image base
+0x140000000); (4) CRT machine code => library signatures (discover must not promise
+100% on 61 KB of CRT it will never emit); (5) entry point + IAT (imports are calls
+to a boundary that must stay LOUD). The m7.exe corpus (plus a /RELEASE build with a
+symbol table) is the fixture set.
+GHIDRA BASELINE (M6 gate) is BLOCKED ON THE HOST, not on the code: no ghidra install;
+java is 27 (Ghidra 11.x supports 17/21). Headless Ghidra = ~500 MB download + a second
+JDK: a heavyweight install that needs the user's go-ahead, not a silent autonomous
+step. When approved: run headless analyzeHeadless over corpus/c/all.c objects, emit
+its C, and diff against `rdec c` per function as a readability/type-recovery baseline.
