@@ -1800,3 +1800,51 @@ the per-`Gap` `discover.<gap>` loop, because master's `Vec<Subject>` carries no 
 Re-based equivalents from the lifter's own report: `lift.jump_tables`, `lift.jump_table_edges`,
 `lift.jump_table_partial`, `lift.jump_table_missing`, `lift.insns`. A census counter is removed
 by name, never by silence.
+
+## Middle end at production scale: LANDED 2026-11-06 at `fe425cf`
+
+The scaling test's named gap is closed with the root cause MEASURED, not guessed
+(`RDEC_PASS_TRACE=*** on `ladder(250)`, 256 lines):
+
+* `merge_blocks` collapsed **exactly one edge per call** — `changed=true` in 32 of
+  32 rounds, 251 live blocks → 220, every delta 1. A 250-block chain owes ~250
+  collapses; the 32-round budget fired on IR that converges in a handful of sweeps.
+* `dead_code_elimination` deleted NOTHING (0 changed rounds) and ate **89.3%** of
+  the runtime (1962 ms of 2196 ms): it asked `Function::use_count` — a full node
+  scan — once per instruction, every round, and the per-round cost never shrank
+  (round 1: 67.2 ms; round 32: 70.0 ms).
+* Shape of the defect: `time = rounds(∝ blocks, capped 32) × round-cost(∝ nodes²)`.
+
+The fix is structural, not a bigger budget: every pass collapses to its OWN
+**bounded** fixpoint (`nodes+blocks+16`, min 32); merges sweep every eligible edge
+per call (chains halve per sweep); the per-node passes answer from per-sweep tables
+so a sweep is O(nodes). `PipelineReport` gained `rounds` and `pass_invocations`
+and stays truthful: `not_converged` is true only when the outer budget is
+exhausted with passes still changing, or a fixpoint bound is exhausted — never a
+function of size. A driver bug fell out of the wiring: a fixpoint loop's LAST call
+always reports "no change", so the round must OR across calls — the pre-fix shape
+hid a false-convergence class.
+
+Measured (debug): 50 blocks 100 ms → 0.92 ms; 1k 8.5 s → 17.2 ms; 5k >1500 s
+(killed) → 89.6 ms; **20k: never finished → 357 ms, converged after 2 rounds,
+6.3 MB of C emitted, answer 10002 = N/2+2 hand-derived**. Growth 1k→5k is ×5.2
+for ×5 blocks — linear. The 20k probe is un-`#[ignore]`d and asserts the answer.
+
+Red-first and sabotage, all in the test file's history: the 250-block convergence
+test quoted `stopped: pass budget (32 rounds) exhausted` BEFORE `src/` was touched;
+single-collapse-per-call and cap-at-1 sabotages redden it; a synthetic oscillating
+pass is caught by the bound (RED, terminates in 65 s) and with the bound REMOVED
+never answers (exit=124) — the bound is load-bearing; no oscillating input is
+reachable in the corpus, so the bound is stated as defensive. Honest redundancy
+finding: capping only the INNER loop with the driver's re-call net intact stays
+GREEN — what is load-bearing is "re-call until no change, multi-collapse per
+call", not the counter.
+
+Floors: census lines byte-identical (diffed against a reverse-patched baseline),
+t2 1412|1412|0|4, t2 --cpp 856/856/0, cpp 64/5, discover 100.00% gaps none.
+
+New named gap, measured, not papered: **`verify_ssa` on 20k blocks costs 274.7 s**
+(quadratic; `crates/core/src/verify.rs` was outside this lane). The release-only
+ignored test carries the number in its reason. Fix shape: the same per-sweep-table
+pattern; the acceptance test is the 20k probe un-ignored on the SSA-verification
+leg.
