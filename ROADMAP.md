@@ -1544,3 +1544,52 @@ Next: (1) tail calls + `noreturn`, cheap on the new machinery and it feeds the T
 exclusion bucket (16 functions); (2) `cdq`/`imul`/`div` arithmetic facts (10 + 6 + 4 = the
 bulk of the 34 remaining C refusals, each with a red-first fixture and a sabotage check);
 (3) M5 structuring, which now has real control flow to structure.
+
+### The corpus has 124 C functions, not 141: phantom starts deleted (`msg8` commit, 2026-11-06)
+
+`rdec discover --corpus` printed `17 extra starts` for the entire project. They were
+functions seeded from the **unrelocated displacement** of a `call`/`jmp` — the next-IP
+immediate (`callq 0x15 <f+0x15>`), which in a clang COFF object is not the target at all. Now
+targets seed from the symbol a relocation NAMES:
+
+    discover: 120 objects, 124 symbol-table functions, 0 missing, 0 extra starts
+    coverage: 5956/5956 = 100.00%; uncovered 0 bytes in 0 runs; jump tables 2/12/0; gaps: none
+
+New gate baselines from here on (the old 141/107/78/74/760 numbers are history, and the
+re-baseline is arithmetic, not drift):
+
+| gate | was | now |
+|---|---|---|
+| `c --corpus` | 141 lifted, 107 emitted / 34 refused | **124 lifted, 86 emitted / 38 refused, 0 invalid** |
+| `cpp --corpus` | 78 lifted, 74 emitted / 4 refused | **69 lifted, 64 emitted / 5 refused** |
+| `lift --corpus` | 141/141 | **124/124** valid IR, exit 0 |
+| `t2 --corpus` | 1412/1412/0, 41 excluded | **1412/1412/0, 20 excluded** (`16 memory outside the modelled frame \| 4 symbol is file-static`) |
+| `t2 --cpp` | 760/760/0, buckets sum 78 | **856/856/0**, buckets `39 + 25 + 5` sum 69 == lifted |
+| tests | 163 | **176**, clippy/fmt clean, `status` exit 0 |
+
+141 − 17 phantoms = 124 lifted; 107 − 17 = 90, and 4 of those real functions now live in their
+true caller where a call clobbers a register they read, so they are refused loudly: 90 − 4 = 86
+emitted, 34 + 4 = 38 refused, 86 + 38 = 124. **Emitted-per-real-function went 75.9% -> 69.4%:
+that is the honest cost of deleting invented functions, and it is the number to improve from
+now on.** T2's exclusion list is the tell — the 16 `unmodelled control flow (Exit)` and 5
+`no COFF symbol to link` entries were CFG guard-dispatch thunks (`lea rcx,[rip+_tail_call_
+indirect@N]; jmp [rip+__guard_x86]`) that existed only as phantoms.
+
+M3 status after this: jump-table resolution done, tail calls modelled, noreturn modelled,
+stable IDs open. **The corpus has 0 tail calls and 0 noreturn calls** — 65 `jmp` sites, 0 with
+a relocation naming a defined function (the relocated ones name `__guard_x86` x23); 31 call
+sites, none to abort/exit/__fastfail/a throw. The model is pinned by hermetic fixtures with
+embedded bytes and quoted objdump ground truth, never by a fabricated corpus witness.
+
+Red-direction proofs on this commit, each put back and shown red then restored: `jmp` reads the
+immediate -> `a_direct_jmp_inside_one_function_is_a_not_a_tail_call` red; `TailReturn` reads
+RAX -> red (the verifier hard-errors, a `jmp` computes no value); `noreturn_site` falls through
+-> 2 red; **noreturn read from the callee's name -> the anti-invention test goes red** (left 1,
+right 0); emitter drops the tail-return statement -> the emitted-text test goes red.
+
+Named next steps, in the order the evidence ranks them: (1) the 38 C refusals — `cdq` (10),
+`imul` (6), `div` (4) arithmetic facts, and the grown `opaque: clobbered by call` class (8)
+which is now about real callers, so it is worth modelling register liveness across a call;
+(2) the MSVC CFG guard dispatcher, the only route to the 16 guard-thunk regions and the
+corpus-visible tail-call witness; (3) M5 structuring, now on a truthful CFG of 124 real
+functions; (4) stable IDs, M3's last open item.
