@@ -1497,3 +1497,50 @@ closes M1 and feeds M5 structuring; (2) `cdq` / `imul` / `div` arithmetic facts 
 the bulk of the 36 C refusals, each needing a red-first fixture); (3) the 6 remaining
 non-RIP `lea` refusals, which are artifacts of mis-decoded blocks and therefore belong with
 discovery, not with the emitter.
+
+### M1 GREEN: 100.00% coverage, and the switch bodies are value-verified (2026-11-05, `f2fe789`)
+
+The gate that was red since the beginning closed on the relocation evidence source, not on a
+threshold change. `rdec discover --corpus`:
+
+    coverage: 5956/5956 non-padding code bytes = 100.00%; uncovered = 0 bytes in 0 runs
+    jump tables: 2 recovered from relocations (12 slots, 12 targets, 0 slots unresolved)
+    gaps: none
+
+N is derived from the count of consecutive 4-byte `.rdata` entries each carrying its own
+`REL32 -> .text`, so nothing hardcodes 8 or 4; the C++ corpus, which is vtable- and
+thunk-heavy, yields **0** tables, asserted. `Terminator::Switch{index, targets}` makes the
+table the CFG's successor list, so verifier, interpreter, emitter, passes and T2 read the
+same control flow; the interpreter faults `SwitchOutOfRange` past the end.
+
+| gate | before | after |
+|---|---|---|
+| `discover --corpus` | 97.88% RED, 126 bytes / 2 runs, 2 indirect gaps | **100.00% GREEN**, 0 runs, gaps none |
+| `t2 --corpus` | 1364/1364/0, 64 runnable | **1412 / 1412 / 0**, 66 runnable, same 4 timeouts |
+| `c --corpus` | 105 / 36 / 0 | **107 / 34 / 0**, clang -Werror OK |
+| `t2 --cpp` · `cpp` · `lift` · `objdump` · `demangle` | 760/760/0 · 74/4 · 141/141 · 124/124 · 68/68 | **unchanged** · tests 149 -> **163** |
+
+Two real bugs came out of the switch path. **`CF` on a 64-bit `sub` was always 0**:
+`((x-y-bin) & !mask) != 0` is exact at every width except the widest, where the complement of
+the mask is 0 - so `subq $0x7,%rax; ja` read "above" for every index and the dense table
+answered only for its last case. And the core passes did not know `Switch` (DCE deleted the
+selector, `redirect` ignored the table), which is what made the switches comparable at all.
+
+The CF test is the durable lesson here. It built two `Op::Param` nodes and never assigned
+`f.params`, so nothing bound, both operands read as nothing, and CF answered "no borrow" for
+every case: it **passed on the broken code**. After binding the params, restoring the old
+`!mask` expression in this session makes it fail (`CF of 0x0 - 0x7: left false, right true`)
+and the fix makes it pass. A fixture whose expected values come from the code under test
+agrees with any bug - prove the red direction by putting the bug back.
+
+M3 bookkeeping, grep-verified: jump-table target resolution is **done** by `f2fe789`
+(`JumpTable` in `discover.rs`); `noreturn` and `tail_call` remain at **0** occurrences in
+`lift.rs`/`discover.rs`/`ir.rs`. Of the three that remain, tail calls are now the cheap one:
+the hard part - an indirect branch whose target comes from relocation evidence, consumed as
+real CFG edges by every downstream reader - is exactly what landed, and a tail call is the
+same evidence naming a function symbol instead of a table.
+
+Next: (1) tail calls + `noreturn`, cheap on the new machinery and it feeds the T2 `Exit`
+exclusion bucket (16 functions); (2) `cdq`/`imul`/`div` arithmetic facts (10 + 6 + 4 = the
+bulk of the 34 remaining C refusals, each with a red-first fixture and a sabotage check);
+(3) M5 structuring, which now has real control flow to structure.
