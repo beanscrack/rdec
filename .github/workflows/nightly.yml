@@ -1,0 +1,43 @@
+# Nightly hardening: the long fuzz census and the release test suite, on a
+# schedule, on the shipped build shape. The push CI stays fast; this is the
+# deep lane. Every command's exit code is the verdict (no pipes that hide it).
+name: nightly-hardening
+on:
+  schedule:
+    - cron: "30 6 * * *"   # 01:30 Central
+  workflow_dispatch: {}
+
+jobs:
+  fuzz:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: corpus (the fuzz --cpp leg reads generated objects)
+        run: cargo run -q -p rdec-cli -- corpus
+      - name: corpus --cpp
+        run: cargo run -q -p rdec-cli -- corpus --cpp
+      - name: build release (the shipped shape)
+        run: cargo build -q --release -p rdec-cli
+      - name: long fuzz census, debug (100k inputs, four seeds)
+        run: |
+          foreach ($s in 7, 123, 31337, 20261106) {
+            cargo run -q -p rdec-cli -- fuzz --iterations 100000 --seed $s --cpp
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+      - name: long fuzz census, release (300k inputs, one seed)
+        run: cargo run -q --release -p rdec-cli -- fuzz --iterations 300000 --seed 7 --cpp
+
+  release-suite:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: corpus (C + C++ objects, as the gates expect)
+        run: |
+          cargo run -q -p rdec-cli -- corpus
+          cargo run -q -p rdec-cli -- corpus --cpp
+      - name: full test suite in release (debug_asserts compiled out)
+        run: cargo test --release --workspace
