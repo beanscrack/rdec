@@ -1593,3 +1593,44 @@ which is now about real callers, so it is worth modelling register liveness acro
 (2) the MSVC CFG guard dispatcher, the only route to the 16 guard-thunk regions and the
 corpus-visible tail-call witness; (3) M5 structuring, now on a truthful CFG of 124 real
 functions; (4) stable IDs, M3's last open item.
+
+### Gate ledger: `fcee470` — recognition rules must not depend on the compiler version
+
+CI was red on 4 tests that were green locally, and the fix is a fact about the project's
+verification architecture, not about jump tables.
+
+The CI probe (run 42166188651) dumped the runner's OWN objects. CI's clang is 20.1.8, this box
+is 22.1.8, and for the same C source the two compilers emit the same `.rdata` bytes, the same 8
+relocations and the same 8 targets, with the jump-table fold's register roles swapped:
+
+    clang 22:  movslq (%rax,%rcx,4),%rcx ; addq %rcx,%rax      delta loaded into the BASE
+    clang 20:  movslq (%rcx,%rax,4),%rax ; addq %rcx,%rax      delta loaded into the INDEX
+
+The fold check pinned a lowering (`split(load.op_register(0)) == split(add.op_register(1))`),
+so the corpus's two switches modelled locally and were REFUSED on CI. Measured damage, both
+runs green: CI census `switches: 0 modelled` and `t2 --corpus compared: 1364` against **1412**
+locally. The floors are CI-calibrated, which is exactly why a green gate was measuring a
+smaller claim than local was.
+
+The rule now cites machine facts that survive any lowering: the indirect jump reads the fold's
+destination; the fold's two operands are the relocation-named table base and the delta loaded
+at 4-byte scale off that base; every slot target is a block this function owns. Exactly two
+role assignments satisfy that; `add r,r` is rejected as degenerate.
+
+Post-merge verification, parent-run: `t2 --corpus` on CI now reports **compared: 1412 | match:
+1412 | mismatch: 0** — the number that was the symptom is now the proof. Locally unchanged
+(124 lifted / 86 emitted / 38 refused / 0 invalid; 1412/1412/0; 856/856/0; 100.00% coverage;
+180 tests; fmt/clippy clean; `status` exit 0).
+
+Two rules promoted to the skill: (1) when local and CI numbers differ, that difference is a
+finding — report both numbers and identify which claim each side measures; (2) a recognition
+rule must never name a register role one compiler chose, and every accepted shape gets an
+embedded fixture (fixtures A and D in `jump_table_fixtures.rs` are the two roles of ONE switch).
+
+Open, named: the `aa == ab` (degenerate `add`) guard has no fixture witness — a hand-built
+object for it needs the builder's REL32 addend convention, and a first attempt produced targets
+`[0x2, 0x4, 0x6, 0x8]`. It is defensive, not load-bearing for any observed shape.
+
+Two lanes are in flight on this HEAD: production robustness (`rdec fuzz`, hostile-input hardening
+across loader/demangler/discovery/decoder/emitter) and M5's first structuring slice (`if` /
+`if-else` / `while` recovery, conservatively, with T2 mismatch 0 as the semantic proof).
