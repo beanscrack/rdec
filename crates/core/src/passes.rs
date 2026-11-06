@@ -428,6 +428,16 @@ pub(crate) fn redirect(t: &mut Terminator, from: BbId, to: BbId) {
                 *else_bb = to;
             }
         }
+        // A table slot redirected at a merged block names the survivor, exactly
+        // as a branch target does. Skipping this would leave the slot pointing
+        // at an emptied block.
+        Terminator::Switch { targets, .. } => {
+            for t in targets.iter_mut() {
+                if *t == from {
+                    *t = to;
+                }
+            }
+        }
         _ => {}
     }
 }

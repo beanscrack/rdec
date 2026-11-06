@@ -22,7 +22,9 @@
 //
 // Two functions in one buffer, hand-assembled bytes, no corpus dependency.
 use rdec_arch_x86::discover::{discover_all, Code};
-use rdec_arch_x86::lift::{lift_one_sigs, no_relocs, ArgKind, CalleeSig, FnAbi, Lifter, RetKind};
+use rdec_arch_x86::lift::{
+    lift_one_sigs, no_relocs, no_tables, ArgKind, CalleeSig, FnAbi, Lifter, RetKind,
+};
 use rdec_core::emit_c::{callee_decl, emit_c_sig, Protos};
 use rdec_core::interp::{run_program_budget, Fault, Outcome, Val};
 use rdec_core::ir::{Function, Op, Terminator};
@@ -81,6 +83,7 @@ fn lift_pair(
         abi,
         sigs,
         &no_relocs(),
+        &no_tables(),
     )
 }
 
@@ -280,6 +283,7 @@ fn a_register_live_across_the_call_is_still_a_refusal() {
         &FnAbi::integer(),
         &g_table(),
         &no_relocs(),
+        &no_tables(),
     );
     clean(&mut f);
     verify_ssa(&f).expect("valid SSA");
@@ -351,6 +355,7 @@ fn an_indirect_call_stays_loud() {
         &FnAbi::integer(),
         &std::collections::HashMap::new(),
         &no_relocs(),
+        &no_tables(),
     );
     verify_ssa(&f).expect("valid SSA");
     assert_eq!(rep.calls_indirect, 1);
@@ -421,6 +426,7 @@ fn a_double_returning_call_passes_bits_and_declares_double() {
         &abi_g,
         &sigs,
         &no_relocs(),
+        &no_tables(),
     );
     let (mut f, rep) = lift_one_sigs(
         "f",
@@ -433,6 +439,7 @@ fn a_double_returning_call_passes_bits_and_declares_double() {
         &abi_f,
         &sigs,
         &no_relocs(),
+        &no_tables(),
     );
     clean(&mut g);
     clean(&mut f);

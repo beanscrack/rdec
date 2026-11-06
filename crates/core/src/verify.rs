@@ -266,6 +266,47 @@ pub fn verify(f: &Function) -> Verdict {
                     }
                 }
             }
+            Terminator::Switch { index, targets } => {
+                // The index is read by the dispatch, so it must be a value this
+                // function defines (or a parameter): an undefined selector means
+                // the lifter pointed the switch at nothing.
+                if !defined(f, *index) {
+                    e.hard(format!("bb{}: switch on undefined index %{}", b.id, index));
+                }
+                // A switch over no target at all is the shape a half-resolved
+                // table leaves behind. It has no successor, so it is not control
+                // flow, and a function whose dispatch reaches it has lost the
+                // case bodies: refuse to certify it.
+                if targets.is_empty() {
+                    e.hard(format!(
+                        "bb{}: switch with an empty target list (a partially resolved table)",
+                        b.id
+                    ));
+                }
+                // EVERY DECLARED TARGET MUST BE A BLOCK OF THIS FUNCTION. The
+                // successors above came from the same list, so this is the check
+                // that makes "every target is a real CFG edge" a property of the
+                // IR: a target the lifter invented, outside the block set, is a
+                // hard failure, not a note.
+                for (k, &t) in targets.iter().enumerate() {
+                    if t as usize >= f.blocks.len() {
+                        e.hard(format!(
+                            "bb{}: switch slot {k} names bb{t}, not a block of this function",
+                            b.id
+                        ));
+                    }
+                }
+                // Duplicate slots are legal (two table entries may name one body,
+                // which is what a C `switch` with shared case labels compiles to),
+                // so they are not checked. A slot that names the dispatch block
+                // itself is not: it is a self-loop with no condition, and no
+                // machine code table a `switch` came from says that.
+                for &t in targets.iter() {
+                    if t == b.id {
+                        e.hard(format!("bb{}: switch slot names its own block", b.id));
+                    }
+                }
+            }
             Terminator::Branch { cond, .. } => {
                 if !defined(f, *cond) {
                     e.hard(format!("bb{}: branch on undefined %{}", b.id, cond));

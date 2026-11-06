@@ -81,7 +81,7 @@ use rdec_core::ir::{
 };
 use rdec_core::ty::{FWidth, Ty, Width};
 
-use crate::discover::Plan;
+use crate::discover::{Plan, Tables};
 
 /// A named register group: every width view of one register names one SSA value.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
@@ -446,6 +446,14 @@ pub fn no_relocs() -> RelocMap {
 /// named symbol, which is the model as it was.
 static EMPTY_RELOCS: std::sync::LazyLock<RelocMap> = std::sync::LazyLock::new(RelocMap::new);
 
+/// No jump table resolved for any site: every indirect jump keeps the loud
+/// `Op::Opaque("indirect jmp")` refusal it has always had.
+pub fn no_tables() -> Tables {
+    Tables::new()
+}
+
+static EMPTY_TABLES: std::sync::LazyLock<Tables> = std::sync::LazyLock::new(Tables::new);
+
 /// Caller-saved: a call may overwrite these.
 const CALLER_SAVED: [Grp; 25] = [
     Grp::Rax,
@@ -546,6 +554,10 @@ enum Pending {
     Ret,
     /// An indirect jump/call, or a terminator we do not model.
     OpaqueTerm,
+    /// A terminator built on the spot: the switch over a jump table's resolved
+    /// targets. `close` installs it as it installs any other, so a block's
+    /// terminator is still set in exactly one place.
+    Switch(Terminator),
 }
 
 /// A block: its start, and the (address, length) of each instruction in it.
@@ -695,6 +707,20 @@ pub struct Report {
     /// modelled path writes" is. Same rule as the self-idiom count: a gap a
     /// reader cannot check is a gap that gets quietly believed.
     pub undef_sites: Vec<(u64, Grp)>,
+    /// Computed jumps modelled as control flow: one per dispatch whose table
+    /// resolved. Counted at the `jmp *`, where the evidence is.
+    pub jump_tables: usize,
+    /// Real successor edges those tables added: one per table slot that names a
+    /// block of this function. `jump_table_edges` is the number of case bodies
+    /// the CFG can now walk into, which is the claim M1's coverage makes.
+    pub jump_table_edges: usize,
+    /// Dispatches whose table did NOT fully resolve: every resolved slot is
+    /// discovered and counted, and the dispatch keeps its `indirect jmp` refusal,
+    /// because the alternative is a switch over half the case bodies.
+    pub jump_table_partial: usize,
+    /// Table slots whose target is not a block of this function: a counted gap,
+    /// because an edge that goes nowhere is worse than a refusal that says so.
+    pub jump_table_missing: usize,
 }
 
 /// `op reg, reg` where both operands name the SAME register group. Each variant
@@ -797,13 +823,48 @@ pub struct Lifter<'a> {
     /// field they name. Empty is the model as it was: no call target and no
     /// RIP-relative address is resolved from the table.
     relocs: &'a RelocMap,
+    /// The object's resolved jump tables, keyed by dispatch site. Empty is the
+    /// model as it was: `jmp *%rax` refuses loudly.
+    tables: &'a Tables,
+    /// The instructions of a dispatch the scan matched, by address: what to skip,
+    /// and what to capture on the way to the switch over the table's resolved
+    /// targets.
+    skip: HashMap<u64, Step>,
+    /// The table index, captured at the slot read: the load overwrites the index
+    /// register, so the selector has to be read before it goes.
+    table_index: Option<VId>,
     fmt: Box<dyn iced_x86::Formatter>,
+}
+
+/// One instruction of a matched jump-table dispatch, by address.
+#[derive(Clone, Debug)]
+enum Step {
+    /// `lea (%rip),%base`: names the table. The model branches on the table's
+    /// SLOT, so no code address is built and none is needed.
+    Lea,
+    /// `movslq (%base,%idx,4),%tmp`: the slot read. `.rdata`'s bytes are not in
+    /// the flat memory the model runs on, so this load is not a value - it is the
+    /// evidence for the edge, and the index is the selector.
+    Load(Grp),
+    /// `add %tmp,%base`: the target's address arithmetic, subsumed by the edges.
+    Add,
+    /// `jmp *%base`: the dispatch, replaced by the switch over these targets.
+    Site(Vec<u64>),
 }
 
 /// An empty callee table: the lifter sees no typable call target.
 static EMPTY_SIGS: std::sync::LazyLock<CalleeTable> = std::sync::LazyLock::new(CalleeTable::new);
 
 impl<'a> Lifter<'a> {
+    /// Hand this lifter the object's resolved jump tables. Without them every
+    /// indirect jump keeps its `Op::Opaque("indirect jmp")` refusal; with them a
+    /// dispatch whose table resolved becomes a `Terminator::Switch` whose
+    /// successors are the case bodies.
+    pub fn with_tables(mut self, tables: &'a Tables) -> Self {
+        self.tables = tables;
+        self
+    }
+
     /// Lift under the integer model: RCX/RDX/R8/R9 seeded as the four
     /// parameters, `ret` answers from RAX. Identical in behaviour to every
     /// gate that ran before the float ABI existed - `FnAbi::integer()` seeds
@@ -933,6 +994,9 @@ impl<'a> Lifter<'a> {
             names,
             sigs,
             relocs,
+            tables: &EMPTY_TABLES,
+            skip: HashMap::new(),
+            table_index: None,
             fmt: crate::decode::formatter(crate::decode::Syntax::Intel),
         };
         l.rep.float_params = float_params;
@@ -2140,6 +2204,48 @@ impl<'a> Lifter<'a> {
         let nm = self.name_of(ins);
         let w = self.op_w(ins);
 
+        // A jump-table dispatch, instruction by instruction. See
+        // `scan_dispatches`: the slot read's bytes are `.rdata`, not modelled
+        // memory, so the four instructions are replaced by the edges the
+        // relocations name - and the register the slot read wrote keeps no
+        // definition, which is what makes a later read of it a live-in (a counted
+        // gap) instead of a value the model does not have.
+        match self.skip.get(&self.at).cloned() {
+            Some(Step::Lea) | Some(Step::Add) => return,
+            Some(Step::Load(idx)) => {
+                self.table_index = Some(self.read64(idx));
+                return;
+            }
+            Some(Step::Site(targets)) => {
+                let idx = match self.table_index {
+                    Some(v) => v,
+                    None => {
+                        // The scan matched the shape; the sweep did not reach the read
+                        // that supplies its index. Say so, keep the refusal.
+                        self.gap("jump table dispatch with no reachable slot read", Ty::Void);
+                        self.pending = Pending::OpaqueTerm;
+                        return;
+                    }
+                };
+                match self.switch_term(self.at, idx, &targets) {
+                    Some(t) => {
+                        self.table_index = None;
+                        self.pending = Pending::Switch(t);
+                    }
+                    None => {
+                        // Not every slot names a body: keep the refusal. The slots
+                        // that did resolve stay discovered, and the count says a
+                        // table was here and half of it is not at hand.
+                        self.table_index = None;
+                        self.gap("indirect jmp", Ty::Void);
+                        self.pending = Pending::OpaqueTerm;
+                    }
+                }
+                return;
+            }
+            None => {}
+        }
+
         // SSE, scalar subset. Counted at this gate, before the modelled/refused
         // split, so the census the gates print is "what the decoder saw".
         if Self::sse_family(&nm) {
@@ -2818,6 +2924,11 @@ impl<'a> Lifter<'a> {
             self.bb_of.insert(b.start, id);
             self.order.push(b.start);
         }
+        // Which instructions this function's resolved jump tables consume. Set
+        // before any block is lifted, because the sweep has to skip a dispatch's
+        // `lea`/`movslq`/`add` at the moment it meets them, and the block that
+        // holds the `jmp` is not necessarily the first.
+        self.skip = self.scan_dispatches(bytes, base, blocks);
         for (i, b) in blocks.iter().enumerate() {
             let id = match self.bb_of.get(&b.start) {
                 Some(x) => *x,
@@ -3152,6 +3263,144 @@ impl<'a> Lifter<'a> {
         self.place_undef();
     }
 
+    /// Find the jump-table dispatches of this function: the four-instruction idiom
+    /// clang emits for a computed jump (`lea (%rip),%base` naming the table,
+    /// `movslq (%base,%idx,4),%tmp` reading a slot, `add %tmp,%base` folding it in,
+    /// `jmp *%base`), matched against a table discovery resolved FROM THE
+    /// RELOCATIONS. The match is on the shape the machine code has, the table on
+    /// the container's evidence; both are required, and the site key is discovery's
+    /// link from the naming relocation to this `jmp`.
+    ///
+    /// The four addresses are recorded so the sweep skips them: `.rdata`'s bytes
+    /// are not in the flat memory the model runs on, so lifting the slot read as a
+    /// `Load` would make the interpreter fault on a table byte and the emitted C
+    /// read uninitialised memory. The index register's value at the read is the
+    /// selector, captured there because the read overwrites that register.
+    fn scan_dispatches(
+        &self,
+        bytes: &[u8],
+        base: u64,
+        blocks: &[BlockInsns],
+    ) -> HashMap<u64, Step> {
+        let mut out: HashMap<u64, Step> = HashMap::new();
+        if self.tables.is_empty() {
+            return out;
+        }
+        for b in blocks {
+            let mut v: Vec<iced_x86::Instruction> = Vec::new();
+            for (va, len) in &b.insns {
+                let off = (*va).saturating_sub(base) as usize;
+                if off + *len > bytes.len() {
+                    continue;
+                }
+                let mut d = Decoder::with_ip(
+                    64,
+                    &bytes[off..off + *len],
+                    *va,
+                    iced_x86::DecoderOptions::NONE,
+                );
+                let mut ins = iced_x86::Instruction::default();
+                d.decode_out(&mut ins);
+                if ins.code() as u16 == 0 {
+                    continue;
+                }
+                v.push(ins);
+            }
+            for i in 3..v.len() {
+                let site = &v[i];
+                if site.mnemonic() != Mnemonic::Jmp || site.op_kind(0) != OpKind::Register {
+                    continue;
+                }
+                let table = match self.tables.get(&site.ip()) {
+                    Some(t) if !t.targets.is_empty() => t,
+                    _ => continue,
+                };
+                let (add, load, lea) = (&v[i - 1], &v[i - 2], &v[i - 3]);
+                // `add %tmp,%base`: the fold, into the register the jump reads.
+                if add.mnemonic() != Mnemonic::Add
+                    || add.op_kind(0) != OpKind::Register
+                    || add.op_register(0) != site.op_register(0)
+                    || add.op_kind(1) != OpKind::Register
+                {
+                    continue;
+                }
+                // `movslq (%base,%idx,4),%tmp`: a 4-byte slot, indexed, into the
+                // register the fold reads, off the register the `lea` wrote.
+                // `movslq` is iced's `Movsxd`: sign-extend a memory 32-bit
+                // value into a 64-bit register. `Movsx` is the 8/16-bit form.
+                if load.mnemonic() != Mnemonic::Movsxd
+                    || load.op_kind(1) != OpKind::Memory
+                    || split(load.op_register(0)) != split(add.op_register(1))
+                    || load.memory_index_scale() != 4
+                    || lea.op_kind(0) != OpKind::Register
+                    || load.memory_base() != lea.op_register(0)
+                {
+                    continue;
+                }
+                let Some((idx, _)) = split(load.memory_index()) else {
+                    continue;
+                };
+                // `lea (%rip),%base`: the RIP-relative form is what the naming
+                // relocation applies to, and it is what makes the table reachable.
+                if lea.mnemonic() != Mnemonic::Lea
+                    || lea.op_kind(1) != OpKind::Memory
+                    // iced spells a RIP-relative memory operand as base = RIP.
+                    || lea.memory_base() != Register::RIP
+                {
+                    continue;
+                }
+                out.insert(lea.ip(), Step::Lea);
+                out.insert(load.ip(), Step::Load(idx));
+                out.insert(add.ip(), Step::Add);
+                out.insert(site.ip(), Step::Site(table.targets.clone()));
+            }
+        }
+        out
+    }
+
+    /// The computed jump over a resolved table: `Terminator::Switch`, whose
+    /// successors ARE the table. One edge per slot, each naming a block of this
+    /// function - there is no target list beside the CFG, so the verifier, the
+    /// interpreter and the emitter all see the same N destinations, and the
+    /// verifier is the thing that proves every one of them is a block.
+    ///
+    /// `None` means the table is not fully at hand: a slot whose target is not a
+    /// block of this function. Then nothing is emitted and the caller keeps the
+    /// refusal, because a switch over the targets that happened to resolve is a
+    /// partial switch - a body with a hole in it - and this repo does not emit
+    /// those. The missing slot is counted, and named.
+    fn switch_term(&mut self, site: u64, idx: VId, targets: &[u64]) -> Option<Terminator> {
+        let mut arms: Vec<BbId> = Vec::with_capacity(targets.len());
+        for t in targets {
+            match self.bb_of.get(t) {
+                Some(&b) => arms.push(b),
+                None => {
+                    self.rep.gaps += 1;
+                    self.rep.jump_table_missing += 1;
+                    self.f.emit_void(
+                        self.cur,
+                        Op::Opaque(
+                            format!("jump table target {t:#x} is not a block of this function")
+                                .into(),
+                        ),
+                        site,
+                    );
+                }
+            }
+        }
+        if !arms.is_empty() && arms.len() == targets.len() {
+            self.rep.jump_tables += 1;
+            self.rep.jump_table_edges += arms.len();
+            Some(Terminator::Switch {
+                index: idx,
+                targets: arms,
+            })
+        } else {
+            self.rep.jump_table_partial += 1;
+            None
+        }
+    }
+
     /// A block's terminator, from what its last instruction said.
     fn close(&mut self, i: usize) {
         let fall = self
@@ -3218,6 +3467,7 @@ impl<'a> Lifter<'a> {
                 self.rep.exits += 1;
                 Terminator::Exit
             }
+            Pending::Switch(t) => t,
         };
         self.f.block_mut(self.cur).term = term;
     }
@@ -3275,6 +3525,7 @@ pub fn lift_one_sig(
         abi,
         &no_callees(),
         &no_relocs(),
+        &no_tables(),
     )
 }
 
@@ -3298,9 +3549,10 @@ pub fn lift_one_sigs(
     abi: &FnAbi,
     sigs: &CalleeTable,
     relocs: &RelocMap,
+    tables: &Tables,
 ) -> (Function, Report) {
     let blocks = split_blocks(plan, start, end);
-    let mut l = Lifter::new_sig(name, start, names, abi, sigs, relocs);
+    let mut l = Lifter::new_sig(name, start, names, abi, sigs, relocs).with_tables(tables);
     let f = l.lift_function(bytes, base, &blocks);
     let rep = l.rep.clone();
     (f, rep)
@@ -3393,6 +3645,9 @@ fn rewrite_term(t: &mut Terminator, old: VId, new: VId) {
     match t {
         Terminator::Return(v) => *v = map(*v, old, new),
         Terminator::Branch { cond, .. } => *cond = map(*cond, old, new),
+        // A switch's index is a value like any other, and SSA rewriting rewrites
+        // it: the destinations are blocks, not values, so they are untouched.
+        Terminator::Switch { index, .. } => *index = map(*index, old, new),
         Terminator::Jump(_) | Terminator::Unreachable | Terminator::Exit => {}
     }
 }

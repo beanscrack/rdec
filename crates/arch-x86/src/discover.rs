@@ -11,7 +11,7 @@
 //! block, not a function. Conflating them is how a decompiler invents functions
 //! inside a switch statement.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 /// Bytes claimed by a sweep: address -> instruction length. This is the
 /// invariant that makes overlap impossible: a byte is claimed once, and a sweep
@@ -22,12 +22,18 @@ use std::collections::{HashMap, HashSet, VecDeque};
 pub type Decoded = HashMap<u64, usize>;
 
 use crate::decode::{decode, Syntax};
+use crate::loader::Object;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Gap {
-    /// `jmp *%rax`, `call *%rax`, `jmp [tbl+rcx*8]`: the target set is not in
-    /// the bytes. Jump-table recovery is M5; recording the site is M1.
+    /// `jmp *%rax`, `jmp [tbl+rcx*8]` with no relocation evidence behind it: the
+    /// target set is not in the bytes and not in the container. A site that
+    /// *does* have a fully resolved table behind it is not a gap at all.
     IndirectBranch,
+    /// An indirect jump whose table resolved only in part: the entries that
+    /// resolved are discovered, the ones that did not are counted here, so a
+    /// half-recovered table is reported as half-recovered and not as success.
+    PartialTable,
     IndirectCall,
     /// The decoder refused here.
     Undecodable,
@@ -39,6 +45,215 @@ pub enum Gap {
 pub struct Site {
     pub va: u64,
     pub gap: Gap,
+}
+
+/// One computed-jump table recovered from the container, not from the bytes.
+///
+/// The evidence, and all of it is the object's own:
+///
+/// * a `REL32` relocation in a code section names a symbol in a DATA section -
+///   that is the instruction (`lea (%rip),%reg`) that materialises the table's
+///   address;
+/// * the object bytes at that symbol are 4-byte slots, and each slot is itself
+///   covered by a `REL32` relocation whose symbol is in a code section;
+/// * the dispatch is the first indirect `jmp` after the instruction that carries
+///   the naming relocation, with no terminator in between - which is what makes
+///   the data object a *jump table* and not a pointer that a call reads.
+///
+/// `entries` is derived from the consecutive relocation-covered slots, never
+/// hardcoded, so an 8-entry table and a 4-entry table are the same rule.
+#[derive(Clone, Debug)]
+pub struct JumpTable {
+    /// The `jmp *...` that dispatches through this table.
+    pub site: u64,
+    /// Section the table lives in (`.rdata` for clang's switch tables).
+    pub base_section: String,
+    /// Offset of the table's first entry within that section.
+    pub base_offset: u64,
+    /// Slots in the run: consecutive 4-byte entries carrying a REL32.
+    pub entries: usize,
+    /// Resolved targets, in table order, deduplicated.
+    pub targets: Vec<u64>,
+    /// (slot offset in the section, why it failed) for every slot that did not
+    /// resolve. A table is only as good as this list being empty.
+    pub unresolved: Vec<(u64, String)>,
+}
+
+impl JumpTable {
+    /// Fully recovered: at least one target, nothing left unresolved.
+    pub fn complete(&self) -> bool {
+        self.unresolved.is_empty() && !self.targets.is_empty()
+    }
+}
+
+/// Resolved tables, keyed by the address of the indirect jump they feed.
+pub type Tables = BTreeMap<u64, JumpTable>;
+
+/// The COFF `REL32` arithmetic for a jump-table slot.
+///
+/// In an unlinked object every section's own offset 0 is its origin, and the
+/// bytes at a `REL32` site are the addend: the value the linker writes is
+/// `symbol + addend - (site + 4)`. A clang switch table's dispatch is
+/// `movslq (%base,%idx,4),%tmp; add %tmp,%base; jmp *%base`, i.e. the runtime
+/// target is `table_base + slot_value`, so the target's offset *inside its own
+/// section* is
+///
+/// ```text
+/// sym_offset + addend - (slot_offset - table_base_offset) - 4
+/// ```
+///
+/// Measured on `corpus/obj/switch_dense.O0.obj`: entry 0 is addend `0x2e` at
+/// slot 0 of a table based at `.rdata+0`, naming `.text+0`, giving
+/// `0 + 0x2e - 0 - 4 = 0x2a` - the first case body in `llvm-objdump -d`; entry 7
+/// is `0x90 - 28 - 4 = 0x70` - the last. `tests/jump_tables.rs` pins all twelve
+/// corpus entries against objdump's printed bodies.
+fn table_target(sym_offset: u64, addend: i32, slot: u64, table_base: u64) -> i64 {
+    sym_offset as i64 + addend as i64 - (slot - table_base) as i64 - 4
+}
+
+/// Find the indirect `jmp` that dispatches through a table, starting from the
+/// instruction carrying the relocation that names the table's address.
+///
+/// The scan is bounded by the control flow: a `ret`, a direct `jmp`/`jcc` or a
+/// decoder refusal before the indirect jump means the data object's address was
+/// materialised for some other reason (a vtable pointer a `call` reads, a
+/// static's address), and the site stays a counted gap.
+fn dispatch_site(bytes: &[u8], code_base: u64, disp: u64) -> Option<u64> {
+    let end = (disp as usize + 4).min(bytes.len());
+    let prefix = decode(&bytes[..end], code_base, Syntax::Intel);
+    let at = prefix.iter().rev().find(|i| {
+        i.valid() && i.va <= code_base + disp && code_base + disp < i.va + i.len as u64
+    })?;
+    let start = (at.va - code_base) as usize;
+    let fwd = decode(&bytes[start..], at.va, Syntax::Intel);
+    for i in fwd.iter().take(16) {
+        if !i.valid() {
+            return None;
+        }
+        if i.is_indirect && !i.is_call {
+            return Some(i.va);
+        }
+        if i.is_ret || ((i.is_jmp || i.is_jcc) && i.target.is_some()) {
+            return None;
+        }
+    }
+    None
+}
+
+/// Every jump table in an object, keyed by dispatch site, addressed in the
+/// caller's flat per-object space (`base_of`: section index -> that section's
+/// base, exactly as every gate builds it for its code ranges).
+///
+/// A table with no relocation naming it, a table whose slots are 8-byte
+/// `ADDR64` entries (a C++ vtable), and a table whose run stops before two
+/// entries all produce nothing here, which leaves the indirect jump in the
+/// counted `Gap::IndirectBranch` bucket.
+pub fn jump_tables(obj: &Object, base_of: &dyn Fn(usize) -> Option<u64>) -> Tables {
+    let mut out: Tables = BTreeMap::new();
+    for (csi, sec) in obj.sections.iter().enumerate() {
+        if !obj.is_code(csi) {
+            continue;
+        }
+        let Some(code_base) = base_of(csi) else {
+            continue;
+        };
+        for rl in &sec.relocations {
+            if !rl.kind().is_rel32() {
+                continue;
+            }
+            let Some(base_sym) = obj.symbol_of(rl.symbol) else {
+                continue;
+            };
+            let Some(dsi) = base_sym.section else {
+                continue;
+            };
+            if dsi == csi || obj.is_code(dsi) {
+                continue; // a call/lea of code, not a data object's address
+            }
+            let dsec = &obj.sections[dsi];
+            // The run: consecutive 4-byte slots, each covered by a REL32.
+            let base_off = base_sym.offset;
+            let mut slots: Vec<(u64, usize, i32)> = Vec::new();
+            loop {
+                let off = base_off + 4 * slots.len() as u64;
+                let Some(w) = dsec.bytes.get(off as usize..off as usize + 4) else {
+                    break;
+                };
+                let Some(er) = obj.reloc_at(dsi, off) else {
+                    break;
+                };
+                if !er.kind().is_rel32() {
+                    break;
+                }
+                slots.push((off, er.symbol, i32::from_le_bytes([w[0], w[1], w[2], w[3]])));
+                // A relocation run this long is a data object, not a switch:
+                // clang's dense tables are tens of entries, and a table of
+                // thousands means we are reading a struct of pointers.
+                if slots.len() >= 4096 {
+                    break;
+                }
+            }
+            // One entry is a pointer, two is the smallest computed jump.
+            if slots.len() < 2 {
+                continue;
+            }
+            let Some(site) = dispatch_site(&sec.bytes, code_base, rl.address) else {
+                continue;
+            };
+            let t = out.entry(site).or_insert_with(|| JumpTable {
+                site,
+                base_section: dsec.name.clone(),
+                base_offset: base_off,
+                entries: 0,
+                targets: Vec::new(),
+                unresolved: Vec::new(),
+            });
+            t.entries = t.entries.max(slots.len());
+            for (off, sym_idx, addend) in &slots {
+                let sym = obj.symbol_of(*sym_idx);
+                let name = sym.map(|s| s.name.as_str()).unwrap_or("?");
+                // `t` is already `&mut JumpTable` from `last_mut()`; passing it
+                // by value moves the reborrow, and the closure writes through it.
+                let fail = |t: &mut JumpTable, why: String| {
+                    if !t.unresolved.iter().any(|(o, _)| o == off) {
+                        t.unresolved.push((*off, why));
+                    }
+                };
+                let Some(s) = sym else {
+                    fail(t, format!("slot {off:#x} names a symbol this object lacks"));
+                    continue;
+                };
+                let Some(tsi) = s.section else {
+                    fail(t, format!("slot {off:#x} names `{name}`, undefined here"));
+                    continue;
+                };
+                let Some(tb) = base_of(tsi) else {
+                    fail(
+                        t,
+                        format!("slot {off:#x} names `{name}`, not in a code section"),
+                    );
+                    continue;
+                };
+                let rel = table_target(s.offset, *addend, *off, base_off);
+                let lo = tb as i64;
+                let hi = tb as i64 + obj.sections[tsi].bytes.len() as i64;
+                if rel < lo || rel >= hi {
+                    fail(
+                        t,
+                        format!("slot {off:#x} of `{name}` resolves to {rel:#x}, outside the code"),
+                    );
+                    continue;
+                }
+                let va = rel as u64;
+                if !t.targets.contains(&va) {
+                    t.targets.push(va);
+                }
+            }
+            t.targets.sort_unstable();
+            t.unresolved.sort_by_key(|(o, _)| *o);
+        }
+    }
+    out
 }
 
 #[derive(Clone, Debug, Default)]
@@ -57,6 +272,10 @@ pub struct Plan {
     /// header has no identity, no join, and no phi. Lifting splits on these.
     pub targets: Vec<u64>,
     pub gaps: Vec<Site>,
+    /// The indirect-jump sites this descent met, with the table behind each one.
+    /// A site with a complete table is not a gap: its targets are in `targets`
+    /// and its case bodies are in `blocks`.
+    pub tables: Vec<JumpTable>,
 }
 
 impl Plan {
@@ -87,8 +306,20 @@ impl<'a> Code<'a> {
 
 /// Recursive descent over one code range.
 pub fn discover(code: Code<'_>, entries: &[u64], call_targets: &[u64]) -> Plan {
+    discover_with_tables(code, entries, call_targets, &Tables::new())
+}
+
+/// The same descent with the object's resolved jump tables in hand, so an
+/// indirect jump over a relocation-covered table becomes N successors instead of
+/// a gap. An empty `tables` is `discover` exactly.
+pub fn discover_with_tables(
+    code: Code<'_>,
+    entries: &[u64],
+    call_targets: &[u64],
+    tables: &Tables,
+) -> Plan {
     let mut decoded: Decoded = HashMap::new();
-    discover_into(code, entries, call_targets, &mut decoded)
+    discover_into(code, entries, call_targets, &mut decoded, tables)
 }
 
 /// The same descent, claiming into a caller-owned `decoded` map so several
@@ -98,6 +329,7 @@ pub fn discover_into(
     entries: &[u64],
     call_targets: &[u64],
     decoded: &mut Decoded,
+    tables: &Tables,
 ) -> Plan {
     let mut plan = Plan::default();
     let mut functions: HashSet<u64> = entries
@@ -153,10 +385,39 @@ pub fn discover_into(
                 break; // a return transfers control to the caller
             }
             if i.is_indirect && !i.is_call {
-                plan.gaps.push(Site {
-                    va: i.va,
-                    gap: Gap::IndirectBranch,
-                });
+                // The target set is not in the bytes. It may still be in the
+                // CONTAINER: a resolved table turns this site into N block
+                // successors, which is what claims the case bodies.
+                match tables.get(&i.va) {
+                    Some(t) => {
+                        for &tg in &t.targets {
+                            if !code.contains(tg) {
+                                plan.gaps.push(Site {
+                                    va: i.va,
+                                    gap: Gap::OutsideCode,
+                                });
+                                continue;
+                            }
+                            targets.insert(tg);
+                            if known.insert(tg) {
+                                queue.push_back(tg);
+                            }
+                        }
+                        if t.complete() {
+                            plan.tables.push(t.clone());
+                        } else {
+                            plan.tables.push(t.clone());
+                            plan.gaps.push(Site {
+                                va: i.va,
+                                gap: Gap::PartialTable,
+                            });
+                        }
+                    }
+                    None => plan.gaps.push(Site {
+                        va: i.va,
+                        gap: Gap::IndirectBranch,
+                    }),
+                }
                 break; // the target set is not in the bytes
             }
             if i.is_call {
@@ -248,15 +509,25 @@ pub fn discover_into(
 
 /// Discovery across several ranges, merged and sorted.
 pub fn discover_all(ranges: &[Code<'_>], seeds: &HashMap<usize, (Vec<u64>, Vec<u64>)>) -> Plan {
+    discover_all_with_tables(ranges, seeds, &Tables::new())
+}
+
+/// The same merge with the object's resolved jump tables, keyed by dispatch site.
+pub fn discover_all_with_tables(
+    ranges: &[Code<'_>],
+    seeds: &HashMap<usize, (Vec<u64>, Vec<u64>)>,
+    tables: &Tables,
+) -> Plan {
     let mut acc = Plan::default();
     for (idx, r) in ranges.iter().enumerate() {
         let (entries, calls) = seeds.get(&idx).cloned().unwrap_or_default();
-        let p = discover(*r, &entries, &calls);
+        let p = discover_with_tables(*r, &entries, &calls, tables);
         acc.functions.extend(p.functions);
         acc.targets.extend(p.targets);
         acc.blocks.extend(p.blocks);
         acc.insns.extend(p.insns);
         acc.gaps.extend(p.gaps);
+        acc.tables.extend(p.tables);
     }
     acc.functions.sort_unstable();
     acc.functions.dedup();

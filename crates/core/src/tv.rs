@@ -235,6 +235,7 @@ fn live_use(f: &Function, v: u32) -> bool {
         match &b.term {
             crate::ir::Terminator::Return(x) => t.push(*x),
             crate::ir::Terminator::Branch { cond, .. } => t.push(*cond),
+            crate::ir::Terminator::Switch { index, .. } => t.push(*index),
             _ => {}
         }
         if t.contains(&v) {

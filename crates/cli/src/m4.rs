@@ -9,7 +9,7 @@
 //!     an uninitialised-local problem is a build failure, not a shrug;
 //!  3. the passes that run before emission must not break SSA - checked with the
 //!     same verifier, not with trust.
-use rdec_arch_x86::discover::{discover_all, Code};
+use rdec_arch_x86::discover::Code;
 use rdec_arch_x86::lift::{lift_one_sigs, CalleeSig, CalleeTable, FnShape, RelocMap, RelocTarget};
 use rdec_core::emit_c::{callee_decl, emit_c_sig, Protos, Refusal, PRELUDE};
 use rdec_core::ir::Function;
@@ -285,7 +285,24 @@ pub fn lift_all_named_shapes(
                 }
             }
         }
-        let plan = discover_all(&ranges, &seeds);
+        // The jump tables this object's relocations name, keyed by dispatch site:
+        // the evidence that turns `jmp *%rax` into N successors. An object with no
+        // such table lifts exactly as it did.
+        let tables = rdec_arch_x86::discover::jump_tables(&obj, &|sec: usize| {
+            idx_of.get(&sec).copied().map(|r| base_of[r])
+        });
+        let plan = rdec_arch_x86::discover::discover_all_with_tables(&ranges, &seeds, &tables);
+        // Say it out loud: the tables this object's relocations name, and how
+        // many slots resolved. A table with a hole in it is visible here, not
+        // only as a refusal of the one function that dispatches through it.
+        let slots: usize = tables.values().map(|t| t.entries).sum();
+        let unresolved: usize = tables.values().map(|t| t.unresolved.len()).sum();
+        if !tables.is_empty() {
+            println!(
+                "  jump tables: {} recovered from relocations ({slots} slots, {unresolved} unresolved)",
+                tables.len()
+            );
+        }
         let mut names: HashMap<u64, String> = HashMap::new();
         let mut external: HashSet<u64> = HashSet::new();
         for i in obj.code_symbols() {
@@ -349,7 +366,7 @@ pub fn lift_all_named_shapes(
             let name = name_of(oi, &raw);
             let abi = shape_of(oi, &raw).abi;
             let (mut f, rep) = lift_one_sigs(
-                &name, rg.bytes, rg.base, start, end, &plan, &names, &abi, &sigs, &relocs,
+                &name, rg.bytes, rg.base, start, end, &plan, &names, &abi, &sigs, &relocs, &tables,
             );
             clean(&mut f);
             out.push(Subject {

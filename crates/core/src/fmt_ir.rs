@@ -120,6 +120,10 @@ pub fn format_term(f: &Function, t: &Terminator) -> String {
             then_bb,
             else_bb,
         } => format!("br {}, bb{then_bb}, bb{else_bb}", vname(f, *cond)),
+        Terminator::Switch { index, targets } => {
+            let t: Vec<String> = targets.iter().map(|b| format!("bb{b}")).collect();
+            format!("switch {} [{}]", vname(f, *index), t.join(", "))
+        }
         Terminator::Return(v) if *v == NO_VAL => "ret".into(),
         Terminator::Return(v) => format!("ret {}", vname(f, *v)),
         Terminator::Unreachable => "unreachable".into(),

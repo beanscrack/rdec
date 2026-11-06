@@ -344,7 +344,7 @@ pub fn cmd_objdump_check(args: &[String]) -> Result<i32, String> {
 /// starts are the failure mode, because a function we never reach is a function
 /// we cannot decompile.
 pub fn cmd_discover(args: &[String]) -> Result<i32, String> {
-    use rdec_arch_x86::discover::{discover_all, overlap_free, Code, Gap};
+    use rdec_arch_x86::discover::{discover_all_with_tables, jump_tables, overlap_free, Code, Gap};
     use std::collections::HashMap;
 
     const TAKES_VALUE: [&str; 2] = ["--limit", "--syntax"];
@@ -398,6 +398,12 @@ pub fn cmd_discover(args: &[String]) -> Result<i32, String> {
     let mut padding_total = 0u64;
     let mut other_uncovered_total = 0u64;
     let mut other_runs_total = 0usize;
+    // The jump-table census, next to the coverage number it produced: tables
+    // recovered, slots they carry, targets they name, slots left unresolved.
+    let mut tables_resolved = 0usize;
+    let mut table_slots = 0usize;
+    let mut table_targets = 0usize;
+    let mut table_unresolved = 0usize;
     let mut first_missing: Option<String> = None;
     let mut budget = limit;
 
@@ -456,7 +462,13 @@ pub fn cmd_discover(args: &[String]) -> Result<i32, String> {
                 }
             }
         }
-        let plan = discover_all(&ranges, &seeds);
+        // The jump-table evidence: relocation-covered tables in the object's
+        // data sections, keyed by the indirect jump they feed. An object with no
+        // such table is an object whose indirect jumps stay counted gaps.
+        let tables = jump_tables(&obj, &|sec: usize| {
+            idx_of.get(&sec).copied().map(|r| base_of[r])
+        });
+        let plan = discover_all_with_tables(&ranges, &seeds, &tables);
         let truth_n = truth.len();
         let missing: Vec<u64> = truth
             .iter()
@@ -565,11 +577,18 @@ pub fn cmd_discover(args: &[String]) -> Result<i32, String> {
         for g in &plan.gaps {
             let name = match g.gap {
                 Gap::IndirectBranch => "indirect branch",
+                Gap::PartialTable => "indirect jump over a partially-resolved table",
                 Gap::IndirectCall => "indirect call",
                 Gap::Undecodable => "undecodable",
                 Gap::OutsideCode => "outside code",
             };
             *gaps.entry(name).or_default() += 1;
+        }
+        for t in &plan.tables {
+            tables_resolved += 1;
+            table_slots += t.entries;
+            table_targets += t.targets.len();
+            table_unresolved += t.unresolved.len();
         }
         if !missing.is_empty() && first_missing.is_none() {
             first_missing = Some(format!("{}: missing starts {:?}", file, missing));
@@ -590,6 +609,9 @@ pub fn cmd_discover(args: &[String]) -> Result<i32, String> {
     );
     println!(
         "coverage: {covered}/{code_no_pad} non-padding code bytes = {pct:.2}%; uncovered non-padding = {other_uncovered_total} bytes in {other_runs_total} runs"
+    );
+    println!(
+        "jump tables: {tables_resolved} recovered from relocations ({table_slots} slots, {table_targets} targets, {table_unresolved} slots unresolved)"
     );
     let mut gs: Vec<_> = gaps.into_iter().collect();
     gs.sort();

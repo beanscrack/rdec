@@ -551,6 +551,21 @@ pub enum Terminator {
         else_bb: BbId,
     },
     Return(VId),
+    /// A computed jump whose destinations are known: one successor per table
+    /// slot, `targets[i]` for index `i`. THE SUCCESSORS ARE THE TABLE - there is
+    /// no target list beside the CFG, so the verifier, the interpreter and the
+    /// emitter all see the same control flow, and a target that is not a block of
+    /// this function is a verifier failure, not a note.
+    ///
+    /// The index is a 64-bit value. An index at or past `targets.len()` is not
+    /// modelled: a machine code jump table covers exactly the slots it has, and
+    /// the arm of a C `switch` that is not in the table is not a destination this
+    /// terminator can name. The interpreter faults there and the emitter refuses;
+    /// neither of them guesses.
+    Switch {
+        index: VId,
+        targets: Vec<BbId>,
+    },
     /// Falls off the end / never executes.
     Unreachable,
     /// We ran out of modeled control flow (indirect jump, syscall, ...).
@@ -569,6 +584,7 @@ impl Terminator {
                 out.push(then_bb);
                 out.push(else_bb);
             }
+            Terminator::Switch { targets: ref t, .. } => out.extend(t.iter().copied()),
             Terminator::Return(_) | Terminator::Unreachable | Terminator::Exit => {}
         }
     }
@@ -745,6 +761,9 @@ impl Function {
             let top: Option<VId> = match b.term {
                 Terminator::Branch { cond, .. } => Some(cond),
                 Terminator::Return(x) if x != NO_VAL => Some(x),
+                // The switch's selector is a use: a pass that deletes its
+                // definition leaves a jump on a value that does not exist.
+                Terminator::Switch { index, .. } => Some(index),
                 _ => None,
             };
             if top == Some(v) {
@@ -775,6 +794,7 @@ impl Function {
             match &mut b.term {
                 Terminator::Branch { cond, .. } if *cond == old => *cond = new,
                 Terminator::Return(x) if *x == old => *x = new,
+                Terminator::Switch { index, .. } if *index == old => *index = new,
                 _ => {}
             }
         }

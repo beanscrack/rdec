@@ -884,6 +884,42 @@ impl<'a> Emitter<'a> {
                     "    if ({c}) goto l{then_bb}; else goto l{else_bb};"
                 );
             }
+
+            Terminator::Switch { index, targets } => {
+                // A computed jump whose destinations are the CFG's own successors:
+                // every slot gets a `case` naming the same label the rest of the
+                // emitted C uses for that block, so the C's control flow and the
+                // CFG's edges are the same N edges - the emitter adds no
+                // destination and drops none. An index past the end of the table
+                // has no destination in this function, so the emitted C traps:
+                // that is the model's standing answer, and T2 compares a trap.
+                //
+                // `default` is required: C's `switch` on an integer with no
+                // matching case falls through the statement, and the machine
+                // executing a table slot the object does not have is a fault, not
+                // a ride-through.
+                if targets.is_empty() {
+                    // `verify_ssa` refuses this shape outright, so no verified
+                    // function reaches here. If one ever does, the emitted C traps
+                    // on every index: a body that lost all its case labels is not
+                    // a body, and it must not quietly compile.
+                    let _ = writeln!(
+                        self.body,
+                        "    __builtin_trap(); /* rdec: switch over no target at all (a partially resolved table) */"
+                    );
+                    return Ok(());
+                }
+                let idx = self.use_(*index);
+                let _ = writeln!(self.body, "    switch ({idx}) {{");
+                for (k, &bb) in targets.iter().enumerate() {
+                    let _ = writeln!(self.body, "    case {k}: goto l{bb};");
+                }
+                let _ = writeln!(
+                    self.body,
+                    "    default: __builtin_trap(); /* rdec: index past the end of the jump table */"
+                );
+                let _ = writeln!(self.body, "    }}");
+            }
             Terminator::Return(v) => {
                 if *v == crate::ir::NO_VAL {
                     let _ = writeln!(self.body, "    return;");

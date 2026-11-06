@@ -218,6 +218,12 @@ impl FlagBits {
 /// (§0 equivalence definition: such inputs are outside the claim).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fault {
+    /// A computed jump whose index is at or past the end of the table: the
+    /// machine would have jumped to a slot the object does not have.
+    SwitchOutOfRange {
+        index: u64,
+        len: usize,
+    },
     DivZero,
     /// `INT_MIN / -1`, which traps on x86.
     IntMinDivMinusOne,
@@ -613,6 +619,26 @@ impl<'a> Interp<'a> {
                 } => {
                     let c = self.get(cond).map(|v| v.as_bool()).unwrap_or(false);
                     cur = if c { then_bb } else { else_bb };
+                }
+                Terminator::Switch { index, targets } => {
+                    // The table covers exactly `targets.len()` slots. An index at
+                    // or past the end names no destination this function has, so
+                    // the run ends on a fault: a fault, never a guess. An index
+                    // with no value at all is treated the same way - the run stops
+                    // rather than picking a block.
+                    let i = match self.fetch_val(index) {
+                        Ok(v) => v.bits(),
+                        Err(f) => return Outcome::Fault(f),
+                    };
+                    match targets.get(i as usize) {
+                        Some(&b) => cur = b,
+                        None => {
+                            return Outcome::Fault(Fault::SwitchOutOfRange {
+                                index: i,
+                                len: targets.len(),
+                            })
+                        }
+                    }
                 }
                 Terminator::Return(v) => {
                     let val = if v == NO_VAL {
@@ -1019,9 +1045,23 @@ impl<'a> Interp<'a> {
                 let w = self.width_of(a);
                 let bin = borrow as u64;
                 let res = w.trunc(x.wrapping_sub(y).wrapping_sub(bin), false);
-                d.cf = Some(
-                    ((x as u128).wrapping_sub(y as u128 + bin as u128) & !w.mask() as u128) != 0,
-                );
+                // CF is the borrow out of the width's top bit: for an N-bit
+                // `a - b - bin`, CF = (a as unsigned N bits) < (b + bin). The
+                // operands are truncated FIRST, because a value carried in a
+                // 64-bit cell can hold bits above a 32-bit operation, and only
+                // the N low bits take part in the borrow.
+                //
+                // The old spelling - `(x - y) & !mask != 0` after widening - is
+                // the same test for every width but one: for N = 64 the
+                // complement of the mask is 0, so it answered "no borrow" for
+                // every 64-bit subtraction. `subq $0x7,%rax; ja` - the dense
+                // switch's bounds guard, at 0x10 of
+                // `corpus/obj/switch_dense.O0.obj` - then read "above" for every
+                // index below the table, and only the table's last case was
+                // reachable. Widening to 128 bits and comparing the truncated
+                // operands is exact at all five widths.
+                let (xt, yt) = (w.trunc(x, false), w.trunc(y, false));
+                d.cf = Some((xt as u128) < (yt as u128) + bin as u128);
                 d.pf = Some(parity(res));
                 d.af = Some(((x ^ res ^ y) >> 4) & 1 == 1);
                 d.zf = Some(res == 0);

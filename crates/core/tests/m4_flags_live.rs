@@ -3,6 +3,7 @@
 //! AND leave no `Flags` value behind, because that value is what the C emitter
 //! refuses (37 functions' largest single class).
 use rdec_core::fuse::flag_elimination;
+use rdec_core::interp::{run, Outcome, Val};
 use rdec_core::ir::{Flag, FlagsOp, Function, Op, Terminator};
 use rdec_core::ty::Ty;
 use rdec_core::verify::verify_ssa;
@@ -86,5 +87,61 @@ fn folding_a_jge_preserves_meaning() {
             "flag_elimination changed meaning: {:?}",
             fails.first().map(|x| (&x.pass, &x.inputs, &x.diffs))
         ),
+    }
+}
+
+/// The borrow out of bit 63.
+///
+/// `subq %rb, %ra` with `ra = 0`, `rb = 7` borrows: CF is 1, and `ja`
+/// (`Above` = CF==0 && ZF==0) is NOT taken. The corpus's dense switch guard is
+/// exactly this shape - `subq $0x7,%rax; ja` in
+/// `corpus/obj/switch_dense.O0.obj` at 0x10 - so a CF that reads 0 for a 64-bit
+/// borrow sends every index below the table's first case to the out-of-range
+/// arm, and a jump table whose case bodies answer only for its top index is not
+/// the machine code's function.
+///
+/// Ground truth is the hardware's definition: for an N-bit `a - b`,
+/// CF = borrow out = (`a` as unsigned) < (`b` as unsigned). The 32-bit case has
+/// always been right here; the 64-bit case is the one the mask arithmetic lost,
+/// because a 64-bit mask complemented and widened is 0.
+#[test]
+fn sub_borrow_out_of_bit_63_sets_cf() {
+    let mut f = Function::new("cf", 0);
+    let e = f.entry;
+    let a = f.emit(e, Op::Param, Ty::i64(), 0);
+    let b = f.emit(e, Op::Param, Ty::i64(), 0);
+    let fv = f.emit(
+        e,
+        Op::Flags(FlagsOp::Sub {
+            a,
+            b,
+            borrow: false,
+        }),
+        Ty::Flags,
+        0,
+    );
+    let cf = f.emit(e, Op::GetFlag(Flag::CF, fv), Ty::Bool, 0);
+    f.block_mut(e).term = Terminator::Return(cf);
+    // The params MUST be declared. `Op::Param` with an empty `f.params` binds no
+    // argument, so both operands read as nothing and CF answers "no borrow" for
+    // every case - a test that would pass on a CF that is wrong at width 64. The
+    // `jge` fixture in this file declares them; this one did not.
+    f.params.extend([a, b]);
+    verify_ssa(&f).expect("valid IR");
+    let cases: [(u64, u64, bool); 6] = [
+        (0, 7, true),         // the switch guard's own case
+        (7, 7, false),        // equal: no borrow
+        (8, 7, false),        // above: no borrow
+        (0, 0, false),        // zero: no borrow
+        (1, u64::MAX, true),  // 1 - MAX borrows
+        (u64::MAX, 0, false), // the top of the range
+    ];
+    for (x, y, want) in cases {
+        let ex = run(&f, &[x, y]);
+        assert_eq!(
+            ex.outcome,
+            Outcome::Ret(Val::Bl(want)),
+            "CF of {x:#x} - {y:#x}"
+        );
     }
 }
