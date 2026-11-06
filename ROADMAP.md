@@ -1909,3 +1909,31 @@ memory 288 + ir 288 byte-preserved THROUGH the verifier rewrite (the oracle is
 load-bearing for every leg — lift 136/136, workspace 283/0, fmt/clippy/ratchet/status
 clean). Parent re-measured everything on c5374de + patch; child's environmental
 notes (clang 0xc0000142 under lane load, mid-build file swap) are its own, not tree state.
+
+## M6 first landing: 24 gotos out of the emitted C (123->99 class delta), floors byte-preserved
+
+The readability pass on the census's own two biggest reasons, integrated from the
+isolated lane (base 78f23c7, applied to master untouched-since: structure.rs,
+emit_c.rs, structuring.rs, m4.rs):
+- **early return**: a `goto l_end;` whose target block is a pure `return EXPR;`
+  prints `return EXPR;` at the site, spelling the phi copies on the edge above it
+  (10 sites; 2 return blocks absorbed -> label gone). Guarded by SSA dominance and
+  a pure-tail check; the refusal is a NEW COUNTED REASON, printed by the census:
+  `early return refused: target computes` (29 in this corpus — the returns are
+  `leave; ret` epilogs whose block ends in `add/mov`; peepholing that is a
+  passes/ir question, the next M6 thread, not a print trick).
+- **layout-then-prune**: flat DFS layout absorbs 14 jumps whose target prints next
+  (fall-through 38 -> 24; remainder is back edges + multi-parent joins the layout
+  provably cannot place).
+Readability on the current corpus: 124 -> 100 goto, 217 -> 215 labels, `readability
+exchange:` line reports the ledger (10 + 2 + 14); blocks-left-as-goto 211 -> 195.
+Floors re-measured by the parent on master+patch: t2 1700/1700/0/4 + memory 288 +
+ir leg 288 BYTE-PRESERVED (the compared count is the floor), t2 --cpp 856, c
+136/96/40/0 + clang -Werror OK (no emission flipped), structuring 12 -> 18,
+workspace 289/0, fmt/clippy/ratchet un-piped exit 0, status exit 0.
+Red-first with sabotage: dominance->true, absorb-without-adjacency, print-return-
+over-a-store (that fixture RUNS 5 vectors: the C returns 00 where the graph returns
+99), absorb-a-named-return-block — all witnessed red. NAMED GAP (honest, like
+`aa == ab` was before its witness): the DFS back-edge refusal has no red fixture —
+18/18 stay green when the check is deleted; the back-edge-stays-backward property
+is asserted as a layout THEOREM test over every fixture, not a refusal path.

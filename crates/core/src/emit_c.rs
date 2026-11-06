@@ -202,6 +202,7 @@ pub fn emit_c_sig(f: &Function, protos: &Protos) -> Result<Out, Vec<Refusal>> {
         param_n: 0,
         folded: HashSet::new(),
         copies: HashMap::new(),
+        tails: Vec::new(),
     };
     let structuring = e.run(&ret)?;
     let mut text = String::new();
@@ -258,6 +259,12 @@ struct Emitter<'a> {
     /// in the order the phis appear. A predecessor keeps its copies at its own
     /// end no matter which statement it ends up inside.
     copies: HashMap<BbId, Vec<(u32, u32)>>,
+    /// The current statement's early returns: `(target, value)` for the jump sites
+    /// the structuring walk proved are pure tails with a readable value. Set per
+    /// statement by `stmts`; `term` and `after` print these as `return` where they
+    /// would otherwise print `goto l{target};`, and the walk counted them as
+    /// `Report::early_returns` and NOT as gotos, so census and text agree.
+    tails: Vec<(BbId, u32)>,
 }
 
 /// C type name for an IR type, or a refusal for a type C cannot spell here.
@@ -383,10 +390,16 @@ impl<'a> Emitter<'a> {
     /// What runs when a statement's text ends.
     fn after(&mut self, bb: BbId, c: Cont) -> Result<(), Vec<Refusal>> {
         match c {
-            Cont::Exit | Cont::Next(_) => {}
+            // `Fall` is the flat layout's absorbed jump: the statement printed next
+            // IS the target, so the text ends here and control runs on.
+            Cont::Exit | Cont::Next(_) | Cont::Fall(_) => {}
             Cont::Goto(x) => {
-                let p = self.pad();
-                let _ = writeln!(self.body, "{p}goto l{x};");
+                if let Some((_, v)) = self.tails.iter().find(|(t, _)| *t == x) {
+                    self.ret_line(*v);
+                } else {
+                    let p = self.pad();
+                    let _ = writeln!(self.body, "{p}goto l{x};");
+                }
             }
             Cont::Term => {
                 let t = self.f.blocks[bb as usize].term.clone();
@@ -396,10 +409,53 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
+    /// The `return` statement, spelled once: `return;` for no value, and
+    /// `return (T)x;` casting through the DECLARED return type. The cast is what
+    /// makes the C hand back the bits the machine leaves in RAX (see `term`), so
+    /// the block's own return and an early return at a jump site are the same
+    /// function of the same value - one spelling, never two that can drift. A
+    /// `void` function that returns a value is the IR lying about itself, and
+    /// `(void)x` is not C: keep the int64_t spelling for that shape.
+    fn ret_text(&self, v: u32) -> String {
+        if v == crate::ir::NO_VAL {
+            return "return;".to_string();
+        }
+        let x = self.use_(v);
+        let rc: &str = if self.ret == "void" {
+            "int64_t"
+        } else {
+            &self.ret
+        };
+        format!("return ({rc}){x};")
+    }
+
+    /// The `return` the target block's own text prints, spelled at a jump site the
+    /// walk proved returns the same value on that edge (`structure::An::tail_of` is
+    /// the proof; `Report::early_returns` is the count, and it is counted INSTEAD
+    /// of the `goto` this line replaces).
+    fn ret_line(&mut self, v: u32) {
+        let p = self.pad();
+        let t = self.ret_text(v);
+        let _ = writeln!(self.body, "{p}{t}");
+    }
+
+    /// One jump edge of a flat terminator: the `return` this edge earns, or the
+    /// `goto lN;` the flat form has always printed.
+    fn arm_stmt(&mut self, bb: BbId) -> String {
+        match self.tails.iter().find(|(t, _)| *t == bb) {
+            Some((_, v)) => {
+                let v = *v;
+                self.ret_text(v)
+            }
+            None => format!("goto l{bb};"),
+        }
+    }
+
     /// Print a statement list at nesting level `ind`.
     fn stmts(&mut self, stmts: &[Stmt], ind: usize) -> Result<(), Vec<Refusal>> {
         for s in stmts {
             self.indent = ind;
+            self.tails = s.tails.clone();
             // A `while`'s label line goes on its IN-LOOP header copy (see the
             // rotated-loop comment in this function), so the head prints none:
             // printing it twice is a duplicate label, which clang refuses.
@@ -410,8 +466,12 @@ impl<'a> Emitter<'a> {
             match &s.kind {
                 StmtKind::Goto => {
                     let x = s.bb;
-                    let p = self.pad();
-                    let _ = writeln!(self.body, "{p}goto l{x};");
+                    if let Some((_, v)) = self.tails.iter().find(|(t, _)| *t == x) {
+                        self.ret_line(*v);
+                    } else {
+                        let p = self.pad();
+                        let _ = writeln!(self.body, "{p}goto l{x};");
+                    }
                     continue;
                 }
                 StmtKind::Params => {
@@ -1316,7 +1376,8 @@ impl<'a> Emitter<'a> {
         let p = self.pad();
         match t {
             Terminator::Jump(bb) => {
-                let _ = writeln!(self.body, "{p}goto l{bb};");
+                let a = self.arm_stmt(*bb);
+                let _ = writeln!(self.body, "{p}{a}");
             }
             Terminator::Branch {
                 cond,
@@ -1324,10 +1385,9 @@ impl<'a> Emitter<'a> {
                 else_bb,
             } => {
                 let c = self.use_(*cond);
-                let _ = writeln!(
-                    self.body,
-                    "{p}if ({c}) goto l{then_bb}; else goto l{else_bb};"
-                );
+                let t = self.arm_stmt(*then_bb);
+                let e = self.arm_stmt(*else_bb);
+                let _ = writeln!(self.body, "{p}if ({c}) {t} else {e}");
             }
 
             Terminator::Switch { index, targets } => {
@@ -1357,7 +1417,8 @@ impl<'a> Emitter<'a> {
                 let idx = self.use_(*index);
                 let _ = writeln!(self.body, "{p}switch ({idx}) {{");
                 for (k, &bb) in targets.iter().enumerate() {
-                    let _ = writeln!(self.body, "{p}case {k}: goto l{bb};");
+                    let a = self.arm_stmt(bb);
+                    let _ = writeln!(self.body, "{p}case {k}: {a}");
                 }
                 let _ = writeln!(
                     self.body,
@@ -1366,30 +1427,18 @@ impl<'a> Emitter<'a> {
                 let _ = writeln!(self.body, "{p}}}");
             }
             Terminator::Return(v) => {
-                if *v == crate::ir::NO_VAL {
-                    let _ = writeln!(self.body, "{p}return;");
-                } else {
-                    let x = self.use_(*v);
-                    // The cast is to the DECLARED return type, not to int64_t.
-                    // The declared type is the width the answer reaches `RAX` at
-                    // (the lifter records it from the machine code: a 32-bit
-                    // write zeroes bits 63:32), and `verify` checks the value
-                    // fits it. Casting through it is what makes the emitted C
-                    // return the same bits the machine leaves in RAX: `(uint32_t)`
-                    // keeps the zero-extension the hardware performed, where the
-                    // old unconditional `(int64_t)` sign-extended a 32-bit answer
-                    // into bits that the machine code had already cleared.
-                    //
-                    // A `void` function that returns a value is the IR lying about
-                    // itself, and `(void)x` is not C: keep the old int64_t spelling
-                    // for that shape rather than inventing a cast.
-                    let rc: &str = if self.ret == "void" {
-                        "int64_t"
-                    } else {
-                        &self.ret
-                    };
-                    let _ = writeln!(self.body, "{p}return ({rc}){x};");
-                }
+                // One spelling for every `return` this emitter prints, the block's
+                // own and an early return at a jump site alike: the cast is to the
+                // DECLARED return type, not to int64_t. The declared type is the
+                // width the answer reaches `RAX` at (the lifter records it from the
+                // machine code: a 32-bit write zeroes bits 63:32), and `verify`
+                // checks the value fits it. Casting through it is what makes the
+                // emitted C return the same bits the machine leaves in RAX:
+                // `(uint32_t)` keeps the zero-extension the hardware performed,
+                // where the old unconditional `(int64_t)` sign-extended a 32-bit
+                // answer into bits that the machine code had already cleared.
+                self.ret_line(*v);
+                let _ = &p;
             }
             // `return callee(args);` — the machine code's `jmp` and the C's
             // `return` are one control-flow edge, so the C is one statement: the

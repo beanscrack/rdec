@@ -171,6 +171,23 @@ pub fn readability_line(text: &str, emitted: usize) -> String {
     )
 }
 
+/// The M6 readability exchange, printed beside the readability line: the gotos
+/// that became `return` statements, the return blocks whose text every edge made
+/// dead, and the jumps the flat layout absorbed by printing the target next.
+///
+/// These are the three ways this pass removes a `goto` without touching the CFG,
+/// and each has a proof behind it (a pure tail with a readable value, every edge
+/// spelling the return, an edge that lands on the next line of text). The line
+/// exists so `123 goto statements -> 61` is auditable: the drop is attributed to a
+/// mechanism per edge, not claimed as a total.
+pub fn readability_exchange_line(reports: &[Report]) -> String {
+    let rep = sum_reports(reports);
+    format!(
+        "readability exchange: {} goto sites printed as return | {} return blocks absorbed          (text and label gone) | {} jumps absorbed by the flat layout",
+        rep.early_returns, rep.absorbed, rep.fallthroughs
+    )
+}
+
 /// Where the emitter's structuring census and a scan of the emitted text disagree.
 /// `None` is the healthy case: the census is then exactly what the C contains,
 /// counted by two independent paths.
@@ -702,14 +719,25 @@ pub fn cmd_c(args: &[String]) -> Result<i32, String> {
                 if std::env::var_os("RDEC_C_GOTOFLOW").is_some() {
                     let flat = rdec_core::structure::flat_walk(&s.f).report;
                     let st = &out.structuring;
+                    // The two "before" columns are the M5 numbers: the flat form's
+                    // gotos BEFORE the early return and the layout took any of them
+                    // (`gotos + early + fall`), its labels before an absorbed block took
+                    // one (`labels + absorbed`). The "after" columns are the printed C.
+                    // The `early/absorbed/fall` triple is printed form's, so a reader can
+                    // attribute the drop of a function that the tree also structured.
+                    let _ = &st;
                     println!(
-                        "goto/label {} :: {}  goto {} -> {}  label {} -> {}  {}",
+                        "goto/label {} :: {}  goto {} -> {}  label {} -> {}  early {} absorbed {} \
+                     fall {}  {}",
                         s.obj,
                         s.sym,
-                        flat.gotos,
+                        flat.gotos + flat.early_returns + flat.fallthroughs,
                         st.gotos,
-                        flat.labels,
+                        flat.labels + flat.absorbed,
                         st.labels,
+                        st.early_returns,
+                        st.absorbed,
+                        st.fallthroughs,
                         if (flat.gotos, flat.labels) == (st.gotos, st.labels) {
                             "unchanged"
                         } else {
@@ -749,6 +777,7 @@ pub fn cmd_c(args: &[String]) -> Result<i32, String> {
     println!("emit-c: {seen} lifted functions, {emitted} emitted C, {refused} refused, {pass_broken} invalid after passes");
     println!("{}", control_flow_line(&reports, emitted));
     println!("{}", readability_line(&all, emitted));
+    println!("{}", readability_exchange_line(&reports));
     if let Some(d) = census_drift(&reports, &all) {
         // The census is a claim about the emitted C. When the emitter's own count
         // and a scan of the text are not the same number, the census is broken,

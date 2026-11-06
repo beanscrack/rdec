@@ -24,7 +24,9 @@
 use rdec_core::emit_c::{emit_c, text_census};
 use rdec_core::interp::{run, Outcome, Val};
 use rdec_core::ir::{BinOp, Function, Instr, IntCmp, Op, Terminator};
-use rdec_core::structure::{flat_walk, structure_with_params, sum_reports, Report, StmtKind};
+use rdec_core::structure::{
+    flat_walk, structure_with_params, sum_reports, term_gotos, Cont, Report, StmtKind,
+};
 use rdec_core::ty::Ty;
 use rdec_core::verify::verify_ssa;
 
@@ -53,6 +55,18 @@ fn c(f: &Function) -> String {
             rdec_core::fmt_ir::format_function(f)
         ),
     }
+}
+
+/// Emit for a graph that is NOT valid SSA on purpose (the readability-refusal
+/// fixture). `c` verifies first, and that is the right rule for every fixture the
+/// census suite walks: a hand-built graph the pipeline cannot produce must not
+/// join that family. It is still the graph the readability rule is about, so the
+/// pass runs on it here, and what this test can demand of it is what the pass owes
+/// any graph: a `return` only where the value is readable, a counted refusal, and a
+/// label block for every `goto` it prints.
+fn emit_unverified(f: &Function) -> (String, Report) {
+    let out = emit_c(f).expect("the fixture emits");
+    (out.text.clone(), out.structuring)
 }
 
 /// Assert the emitted C satisfies `pred`, quoting the C when it does not.
@@ -1100,6 +1114,8 @@ fn fixtures() -> Vec<(&'static str, Function)> {
         ("multi_entry_loop", multi_entry_loop()),
         ("two_guards_merge", two_guards(true)),
         ("two_guards_nested", two_guards(false)),
+        ("early_return", early_return_chain(false)),
+        ("early_return_store", early_return_chain(true)),
     ]
 }
 
@@ -1109,9 +1125,18 @@ fn every_fixture_s_census_matches_its_emitted_text() {
     for (name, f) in fixtures() {
         let (text, rep) = emit(&f);
         let tree = structure_with_params(&f, true);
+        // If the tree names a label its text never defines, the emitter must have
+        // printed the flat walk instead - and the way to see that in the census is
+        // the flat walk's OWN numbers, not a proxy that a readability feature can
+        // move (absorption lowers `flat`, which is what the old proxy compared).
+        let flat = flat_walk(&f);
         assert!(
-            tree.labels_defined() || rep.flat > tree.report.flat,
-            "{name}: a tree that names an undefined label must not be the one printed\n---- emitted C ----\n{text}\n------------------"
+            tree.labels_defined() || rep.gotos == flat.report.gotos,
+            "{name}: a tree that names an undefined label must not be the one printed \
+             (printed gotos {}, tree {}, flat {})\n---- emitted C ----\n{text}\n------------------",
+            rep.gotos,
+            tree.report.gotos,
+            flat.report.gotos
         );
         let tc = text_census(&text);
         assert_eq!(
@@ -1202,10 +1227,16 @@ fn the_flat_fallback_structures_nothing_and_defines_every_label() {
             .iter()
             .filter(|st| matches!(st.kind, StmtKind::Block))
             .count();
+        // One plain statement per block - except a pure-return block that EVERY
+        // edge into it spells as a `return`: its text is dead, and the flat form
+        // drops the statement and its label together (no `goto` can name the label,
+        // which is what the absorber proved and the `labels_defined` check above
+        // keeps). The ledger still closes.
         assert_eq!(
-            plain,
+            plain + s.report.absorbed,
             f.blocks.len(),
-            "{name}: one plain statement per block, the entry's params printed separately"
+            "{name}: one plain statement per printed block, the entry's params printed              separately (+{} absorbed return blocks)",
+            s.report.absorbed
         );
     }
     let s = flat_walk(&irreducible());
@@ -1214,4 +1245,721 @@ fn the_flat_fallback_structures_nothing_and_defines_every_label() {
         "and it keeps the gotos, counted: {}",
         s.report.gotos
     );
+}
+
+// ---------------------------------------------------------------------------
+// 7. M6: the early `return` the CFG proves, and the fall-through the LAYOUT proves
+//
+// Two readability features, red before they are implemented:
+//
+// * a `goto lX;` whose target block computes NOTHING and returns a value that is
+//   readable on THIS edge prints `return <that value>;` at the site - the classic
+//   early return. The target's label block keeps its own print for the edges that
+//   are not early-returned; when EVERY edge into it spells the return, the block's
+//   text is dead and its label goes with it.
+// * a `goto lN;` whose target is the very next statement in the printed layout is
+//   a no-op: the flat form lays its blocks out so the chains land adjacent, and
+//   drops those gotos. Backward jumps stay backward.
+//
+// The guard fixtures beside them are the halves that must NOT be given away: a
+// target that computes (a store) keeps its `goto`, and a value that is not
+// readable at the site keeps its `goto`.
+// ---------------------------------------------------------------------------
+
+/// The early-return shape, built so the structuring patterns CANNOT prove a
+/// region (the nested guard's two arms converge on `q`, a block neither arm
+/// owns), so the walk prints the label + `goto` form - the form the census calls
+/// `fall-through` / `unstructured conditional branch` / `return`, and the form 8
+/// corpus functions fall back to.
+///
+/// ```text
+/// e:   c0 = (p0 == 0);  if c0 goto g else L     edge e->L carries `p1`
+/// g:   c1 = (p1 == 0);  if c1 goto t else f     <- stays flat (q is multi-entry)
+/// t:   jmp q
+/// f:   jmp q
+/// q:   c2 = (p0 < p1);  if c2 goto L else k     edge q->L carries `p0`
+/// k:   z = p0 + 1;   jmp L                      edge k->L carries `z`
+/// L:   r = phi(p1@e, p0@q, z@k);  return r
+/// ```
+///
+/// The answer, hand-derived from the graph (never from the emitter): `p0 != 0`
+/// takes the guard's `else` arm straight to `L` and returns `p1`; `p0 == 0 &&
+/// p0 < p1` runs the nested guard, lands on the `q` edge and returns `p0`;
+/// `p0 == 0 && p0 >= p1` runs `k` and returns `p0 + 1`.
+fn early_return_chain(store_in_target: bool) -> Function {
+    let mut f = fn2("early_return_chain");
+    let (e, p0, p1) = (f.entry, f.params[0], f.params[1]);
+    let g = f.new_block(0x1010);
+    let t = f.new_block(0x1020);
+    let ff = f.new_block(0x1030);
+    let q = f.new_block(0x1040);
+    let k = f.new_block(0x1050);
+    let l = f.new_block(0x1060);
+    let zero = f.emit(e, Op::Const(0), u64_(), 0x1008);
+    let c0 = f.emit(e, Op::Cmp(IntCmp::Eq, p0, zero), Ty::Bool, 0x100c);
+    f.block_mut(e).term = Terminator::Branch {
+        cond: c0,
+        then_bb: g,
+        else_bb: l,
+    };
+    let c1 = f.emit(g, Op::Cmp(IntCmp::Eq, p1, zero), Ty::Bool, 0x1010);
+    f.block_mut(g).term = Terminator::Branch {
+        cond: c1,
+        then_bb: t,
+        else_bb: ff,
+    };
+    f.block_mut(t).term = Terminator::Jump(q);
+    f.block_mut(ff).term = Terminator::Jump(q);
+    let c2 = f.emit(q, Op::Cmp(IntCmp::Ult, p0, p1), Ty::Bool, 0x1040);
+    f.block_mut(q).term = Terminator::Branch {
+        cond: c2,
+        then_bb: l,
+        else_bb: k,
+    };
+    let one = f.emit(k, Op::Const(1), u64_(), 0x1050);
+    let z = f.emit(k, Op::Bin(BinOp::Add, p0, one), u64_(), 0x1054);
+    let _ = z;
+    f.block_mut(k).term = Terminator::Jump(l);
+    let r = f.new_value(u64_());
+    f.block_mut(l).instrs.push(Instr::new(
+        r,
+        Op::Phi(vec![(p1, e), (p0, q), (z, k)].into_boxed_slice()),
+        u64_(),
+        0x106c,
+    ));
+    if store_in_target {
+        // The one thing that makes the target NOT a pure tail: a store, AFTER the
+        // phi prefix (a phi after a non-phi is not valid SSA, and `verify_ssa`
+        // says so). The machine runs this store on the edge into `L`; a `return`
+        // spelled at the goto site with no statement for it runs nothing.
+        let a = f.emit(l, Op::Const(0x40), u64_(), 0x1070);
+        let v = f.emit(l, Op::Const(99), u64_(), 0x1074);
+        f.emit_void(l, Op::Store(u64_(), a, v), 0x1078);
+    }
+    f.block_mut(l).term = Terminator::Return(r);
+    // The DECLARED return type the lifter records: the emitted C's `return` casts
+    // through it, and a driver can only read an answer the signature declares.
+    f.ret_ty = u64_();
+    f
+}
+
+/// The return block of [`early_return_chain`]: the last of the seven blocks.
+fn er_target() -> u32 {
+    6
+}
+
+/// The (input, answer) table, derived from the graph by hand: `p0 != 0` takes the
+/// guard's `else` arm straight to `L` on the `e` edge, which carries `p1`;
+/// `p0 == 0 && p0 < p1` arrives on the `q` edge, which carries `p0`; `p0 == 0 &&
+/// p0 >= p1` arrives on the `k` edge, which carries `p0 + 1`.
+fn early_return_table() -> Vec<(u64, u64, u64)> {
+    vec![(0, 0, 1), (0, 5, 0), (3, 7, 7), (7, 2, 2), (1, 1, 1)]
+}
+
+/// Count the `return (T)<name>;` lines that hand back value `v`.
+fn returns_value(text: &str, v: u32) -> usize {
+    // Count every `return (T)xN;`, wherever it sits: an early return also spells
+    // the arm of an `if (c) return (uint64_t)x0; else goto l5;`.
+    let n = nm(v);
+    let tail = format!("{n};");
+    text.split("return (")
+        .skip(1)
+        .filter(|seg| {
+            seg.find(')')
+                .map(|i| seg[i + 1..].starts_with(&tail))
+                .unwrap_or(false)
+        })
+        .count()
+}
+
+#[test]
+fn an_early_return_is_printed_at_the_goto_site_and_the_dead_label_block_goes() {
+    let f = early_return_chain(false);
+    let (text, rep) = emit(&f);
+    assert_binds_arguments(&text);
+    let l = er_target();
+    assert!(matches!(f.blocks[l as usize].term, Terminator::Return(_)));
+
+    // (1) the goto to the pure-return block is gone at every one of its three
+    // incoming edges.
+    wants(
+        &text,
+        |t| !t.contains(&format!("goto l{l};")),
+        "print `return`, never `goto l6;`: all three edges into the pure-return block spell the return they arrive with",
+    );
+    // (2) the label block is dead text once every edge returns: no label, no body.
+    wants(
+        &text,
+        |t| !t.contains(&format!("l{l}:")),
+        "drop the label line of the block every edge returns from",
+    );
+    // (3) each early return spells the value that arrives on ITS edge: the phi
+    // operand of the edge, never the phi at the join.
+    for v in f.params.clone() {
+        wants(
+            &text,
+            move |t| returns_value(t, v) >= 1,
+            "the e and q edges return the parameter value THEY carry, spelled at the site",
+        );
+    }
+    let z = f
+        .blocks
+        .iter()
+        .flat_map(|b| b.instrs.iter())
+        .find(|i| matches!(i.op, Op::Bin(BinOp::Add, _, _)))
+        .expect("the k block adds 1")
+        .dest;
+    wants(
+        &text,
+        move |t| returns_value(t, z) >= 1,
+        "the k edge returns the value it computed, spelled at the site",
+    );
+    // (4) the gotos to blocks that DO compute work survive.
+    wants(
+        &text,
+        |t| t.contains("goto l2;") || t.contains("goto l3;") || t.contains("goto l4;"),
+        "a goto to a block that is not a pure return target stays a goto",
+    );
+
+    // (5) the census is the text, and the text got shorter: this function's flat
+    // form starts at 9 `goto` statements and 7 labels.
+    let tc = text_census(&text);
+    assert_eq!(
+        (tc.gotos, tc.labels),
+        (rep.gotos, rep.labels),
+        "the goto/label census must be what the text shows\n---- emitted C ----\n{text}\n------------------"
+    );
+    assert!(
+        rep.gotos < 9 && rep.labels < 7,
+        "three `goto l6;` and the dead label must be gone from a flat form that \
+         started at 9 gotos and 7 labels: gotos {} labels {}\n---- emitted C ----\n{text}\n------------------",
+        rep.gotos,
+        rep.labels
+    );
+
+    // (6) the graph's answers, hand-computed. The interpreter reads the CFG, so
+    // these are the values the C must reproduce (the next test compiles the C).
+    for (a0, a1, want) in early_return_table() {
+        assert_eq!(answer(&f, &[a0, a1]), want, "f({a0}, {a1})");
+    }
+    let bad = goto_targets_defined(&text);
+    assert!(
+        bad.is_empty(),
+        "the printed C names a label it does not define: {bad:?}\n---- emitted C ----\n{text}\n------------------"
+    );
+}
+
+#[test]
+fn the_early_return_text_compiles_with_werror_and_answers_the_graph_s_values() {
+    // The text-level proof. The interpreter reads the graph, so it cannot see a
+    // mis-spelled return: compile PRELUDE + the emitted C exactly as `rdec c`
+    // composes it, run the same vectors, and require the graph's digits.
+    let f = early_return_chain(false);
+    let text = c(&f);
+    let dir = std::env::temp_dir().join("rdec_early_return");
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("early_return_chain.c");
+    let mut call = String::new();
+    for (a0, a1, _) in early_return_table() {
+        call.push_str(&format!(
+            "  r = r * 100 + (unsigned)early_return_chain({a0}ULL, {a1}ULL);\n"
+        ));
+    }
+    std::fs::write(
+        &src,
+        format!(
+            "{}\n#include <stdio.h>\n{text}\nint main(void){{ unsigned r = 0;\n{call}  \
+             printf(\"%010u\\n\", r); return 0; }}\n",
+            rdec_core::emit_c::PRELUDE
+        ),
+    )
+    .unwrap();
+    let out = std::process::Command::new("clang")
+        .args([
+            "-std=c17",
+            "-Wall",
+            "-Wextra",
+            "-Wno-unused-parameter",
+            "-Werror",
+            "-o",
+        ])
+        .arg(dir.join("early.exe"))
+        .arg(&src)
+        .output()
+        .expect("clang must be on PATH in this repo (CI runs it)");
+    assert!(
+        out.status.success(),
+        "-Werror compile failed:\n{}\n---- emitted C ----\n{text}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let run_c = std::process::Command::new(dir.join("early.exe"))
+        .output()
+        .expect("run");
+    let printed = String::from_utf8_lossy(&run_c.stdout).trim().to_string();
+    let mut want = String::new();
+    for (a0, a1, w) in early_return_table() {
+        assert_eq!(answer(&f, &[a0, a1]), w);
+        want.push_str(&format!("{w:02}"));
+    }
+    assert_eq!(
+        printed,
+        want,
+        "the emitted C and the graph must answer the same digits (vectors {:?})",
+        early_return_table()
+    );
+}
+
+#[test]
+fn a_return_target_that_computes_keeps_its_goto() {
+    // The statement guard: `L` now stores before it returns. The machine runs
+    // that store on the edge into `L`, and a `return` spelled at the goto site
+    // with no statement for it runs nothing - so the guard is the difference
+    // between a decompiler and a miscompiler. This is the sabotage needle: print
+    // the return for a target that computes, and this goes red.
+    let f = early_return_chain(true);
+    let (text, rep) = emit(&f);
+    let l = er_target();
+    assert_eq!(
+        count(&text, &format!("goto l{l};")),
+        3,
+        "all three edges into a target that stores keep their goto\n---- emitted C ----\n{text}\n------------------"
+    );
+    wants(
+        &text,
+        |t| t.contains(&format!("l{l}:")),
+        "and the label block stays, because a goto lands on it",
+    );
+    let tc = text_census(&text);
+    assert_eq!(
+        (tc.gotos, tc.labels),
+        (rep.gotos, rep.labels),
+        "the census must be the text\n---- emitted C ----\n{text}\n------------------"
+    );
+
+    // The semantic half, which the census cannot see: the target's store is loaded
+    // straight back, so it IS the answer. Compile the emitted C and run the graph's
+    // vectors. An early return printed over a target that computes returns 0 from
+    // zeroed memory where the machine returns 99 - and this line is where that
+    // shows up, in digits, not in a goto count.
+    let answers = compile_answers(&c(&f), "early_return_store", "early_return_chain");
+    let want: String = early_return_table()
+        .iter()
+        .map(|(a0, a1, w)| {
+            assert_eq!(answer(&f, &[*a0, *a1]), *w, "graph f({a0}, {a1})");
+            format!("{w:02}")
+        })
+        .collect();
+    assert_eq!(
+        answers, want,
+        "the emitted C of the STORE variant must run the store: the graph's digits are \
+         {want}\n---- emitted C ----\n{text}\n------------------"
+    );
+}
+
+/// Compile `text` with the same flags `rdec c` uses, call `fn_name` on the
+/// [`early_return_table`] vectors, and return the digits the C printed.
+fn compile_answers(text: &str, stem: &str, fn_name: &str) -> String {
+    let dir = std::env::temp_dir().join(format!("rdec_{stem}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join(format!("{stem}.c"));
+    let mut call = String::new();
+    for (a0, a1, _) in early_return_table() {
+        call.push_str(&format!(
+            "  r = r * 100 + (unsigned){fn_name}({a0}ULL, {a1}ULL);\n"
+        ));
+    }
+    std::fs::write(
+        &src,
+        format!(
+            "{}\n#include <stdio.h>\n{text}\nint main(void){{ unsigned r = 0;\n{call}               printf(\"%010u\\n\", r); return 0; }}\n",
+            rdec_core::emit_c::PRELUDE
+        ),
+    )
+    .unwrap();
+    let out = std::process::Command::new("clang")
+        .args([
+            "-std=c17",
+            "-Wall",
+            "-Wextra",
+            "-Wno-unused-parameter",
+            "-Werror",
+            "-o",
+        ])
+        .arg(dir.join(format!("{stem}.exe")))
+        .arg(&src)
+        .output()
+        .expect("clang must be on PATH in this repo (CI runs it)");
+    assert!(
+        out.status.success(),
+        "-Werror compile failed:\n{}\n---- emitted C ----\n{text}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let run_c = std::process::Command::new(dir.join(format!("{stem}.exe")))
+        .output()
+        .expect("run");
+    String::from_utf8_lossy(&run_c.stdout).trim().to_string()
+}
+
+/// The readability check's own witness, on a graph `verify_ssa` REJECTS.
+///
+/// ```text
+/// e:  c0 = (p0 == 0);  if c0 goto g else L   edge e->L: x is NOT written on this path
+/// g:  c1 = (p1 == 0);  if c1 goto t else f   <- stays flat (q is multi-entry)
+/// t:  jmp q
+/// f:  jmp q
+/// q:  x = p0 + p1;     if (p0 < p1) goto L else k    edge q->L: x IS written here
+/// k:                  jmp L                 edge k->L: every path to k ran q
+/// L:  return x                   x's def (q) does not dominate L: the e edge skips q
+/// ```
+///
+/// The shape is [`early_return_chain`]'s on purpose: the nested guard's two arms
+/// converge on `q`, a block neither arm owns, so no region is provable and the
+/// label + `goto` form runs. That is the only form where a jump to a return block is
+/// a `goto` the pass has to spell - a provable region reaches its exit as the text's
+/// own fall-through, and there is nothing there to convert.
+///
+/// `q` does not dominate `L` (the `e -> L` edge reaches `L` without it), so
+/// `verify_ssa`'s def-dominates-use rule rejects the function: no lifted corpus
+/// function can look like this, which is exactly why the check is defensive on the
+/// corpus. Built by hand it is the graph the rule is about - the `q` and `k` edges
+/// may print `return (uint64_t)x;` because that path ran `q`; the `e` edge may not,
+/// because on that path the local was never written. A `return` printed at the `e`
+/// site reads an unwritten local, and the graph's answer is not a C answer.
+fn er_unreadable() -> Function {
+    let mut f = fn2("er_unreadable");
+    let (e, p0, p1) = (f.entry, f.params[0], f.params[1]);
+    let g = f.new_block(0x1010);
+    let t = f.new_block(0x1020);
+    let ff = f.new_block(0x1030);
+    let q = f.new_block(0x1040);
+    let k = f.new_block(0x1050);
+    let l = f.new_block(0x1060);
+    let zero = f.emit(e, Op::Const(0), u64_(), 0x1008);
+    let c0 = f.emit(e, Op::Cmp(IntCmp::Eq, p0, zero), Ty::Bool, 0x100c);
+    f.block_mut(e).term = Terminator::Branch {
+        cond: c0,
+        then_bb: g,
+        else_bb: l,
+    };
+    let c1 = f.emit(g, Op::Cmp(IntCmp::Eq, p1, zero), Ty::Bool, 0x1010);
+    f.block_mut(g).term = Terminator::Branch {
+        cond: c1,
+        then_bb: t,
+        else_bb: ff,
+    };
+    f.block_mut(t).term = Terminator::Jump(q);
+    f.block_mut(ff).term = Terminator::Jump(q);
+    let x = f.emit(q, Op::Bin(BinOp::Add, p0, p1), u64_(), 0x1040);
+    let c2 = f.emit(q, Op::Cmp(IntCmp::Ult, p0, p1), Ty::Bool, 0x1044);
+    f.block_mut(q).term = Terminator::Branch {
+        cond: c2,
+        then_bb: l,
+        else_bb: k,
+    };
+    f.block_mut(k).term = Terminator::Jump(l);
+    f.block_mut(l).term = Terminator::Return(x);
+    f.ret_ty = u64_();
+    f
+}
+
+/// The return block of [`er_unreadable`]: the last of the seven blocks.
+fn er_only_target() -> u32 {
+    6
+}
+
+/// The dominance/readability refusal: counted, with the goto kept, on the edge the
+/// value is not readable on. `verify_ssa` rejects this graph (the fixture says so),
+/// so this is the rule proven on the only graph that can show it - the named gap is
+/// that no emitted corpus C can.
+#[test]
+fn an_early_return_is_refused_when_the_value_is_not_readable_at_the_site() {
+    // The graph is invalid SSA on purpose (the fixture says so), so this walks
+    // past `c`'s verify: the rule being tested is the pass's own, and the pass is
+    // what must not invent a `return` on the edge that cannot read the value.
+    let f = er_unreadable();
+    assert!(
+        verify_ssa(&f).is_err(),
+        "this fixture is not valid SSA on purpose: x's def (block 4, `q`) does not \
+         dominate its use in `L`, which is the shape the check guards"
+    );
+    let (text, rep) = emit_unverified(&f);
+    let t = er_only_target();
+    assert_eq!(
+        rep.early_returns, 2,
+        "the `q` edge (its own block wrote x) and the `k` edge (q dominates k) print the \
+         return; the `e` edge may not\n---- emitted C ----\n{text}\n------------------"
+    );
+    assert_eq!(
+        rep.reasons
+            .get("early return refused: value not readable at the site"),
+        Some(&1),
+        "the refused edge is counted, loud, not silent: {:?}",
+        rep.reasons
+    );
+    assert_eq!(
+        count(&text, &format!("goto l{t};")),
+        1,
+        "the edge that cannot read the value keeps its goto\n---- emitted C ----\n{text}\n------------------"
+    );
+    assert_eq!(
+        text_census(&text).gotos,
+        rep.gotos,
+        "the census is the text\n---- emitted C ----\n{text}\n------------------"
+    );
+    let bad = goto_targets_defined(&text);
+    assert!(
+        bad.is_empty(),
+        "the printed C names a label it does not define: {bad:?}\n---- emitted C ----\n{text}\n------------------"
+    );
+    assert!(
+        text.contains(&format!("l{t}:")),
+        "the return block a `goto` still names must keep its label block\n---- emitted C ----\n{text}\n------------------"
+    );
+    assert_eq!(
+        text_census(&text).labels,
+        rep.labels,
+        "the label census is the text\n---- emitted C ----\n{text}\n------------------"
+    );
+}
+
+/// The blocks the flat form prints, in the order its text runs.
+fn printed_order(s: &rdec_core::structure::Structured) -> Vec<u32> {
+    s.stmts
+        .iter()
+        .filter(|st| matches!(st.kind, StmtKind::Block))
+        .map(|st| st.bb)
+        .collect()
+}
+
+/// The flat form absorbs every `goto` that points at the NEXT printed statement,
+/// prints every reachable block exactly once, and keeps every back edge a
+/// backward jump.
+#[test]
+fn the_flat_layout_absorbs_fall_through_gotos_and_keeps_back_edges_backward() {
+    let f = count_up();
+    let s = flat_walk(&f);
+    // The flat form of this function spells 4 gotos: e->h, h's two branch arms,
+    // and the latch l->h. `e: jmp h` is the one that the layout can absorb by
+    // printing h next.
+    assert!(
+        s.report.gotos <= 3,
+        "`e: jmp h` must print no goto once the layout puts h next: {} gotos, stmts {:#?}",
+        s.report.gotos,
+        s.stmts
+    );
+    // No PRINTED goto may point at the statement printed next to it: that jump is a
+    // no-op. A statement whose terminator the layout absorbed (`Cont::Fall`) prints
+    // nothing, so adjacency is legal there.
+    let printed = printed_order(&s);
+    let mut j = 0usize;
+    for st in &s.stmts {
+        if matches!(st.kind, StmtKind::Block) {
+            if let Cont::Term = st.cont {
+                if let Terminator::Jump(x) = f.blocks[st.bb as usize].term {
+                    assert!(
+                        printed.get(j + 1) != Some(&x),
+                        "block {} jumps to {}, which is the very next printed statement: that goto is a no-op and must be gone\nstmts {:#?}",
+                        st.bb,
+                        x,
+                        s.stmts
+                    );
+                }
+            }
+            j += 1;
+        }
+    }
+    // The loop's back edge keeps its `goto`: the layout absorbs the jumps that land
+    // on the next line of text, and a backward jump is not one of them - dropping it
+    // would run the loop body one extra time. This is the assertion that makes the
+    // adjacency requirement load-bearing: absorb every jump without checking
+    // adjacency, and the latch's jump disappears right here.
+    let latch = s
+        .stmts
+        .iter()
+        .find(|st| st.bb == 2)
+        .expect("the latch block is printed");
+    assert!(
+        matches!(latch.cont, Cont::Term),
+        "the latch's backward jump to the header must stay a printed terminator: {:?}",
+        latch.cont
+    );
+    // And the ledger is exact, not "at least one". This layout - `e`, the header,
+    // the latch - puts the header on the entry's next line, so exactly ONE jump
+    // lands on the text's own fall-through; and the pure-return block `x`, whose
+    // every edge the text now spells `return`, is exactly ONE absorbed block.
+    assert_eq!(
+        s.report.fallthroughs, 1,
+        "exactly the one fall-through this layout earns, stmts {:#?}",
+        s.stmts
+    );
+    assert_eq!(
+        s.report.absorbed, 1,
+        "the pure-return block is absorbed, stmts {:#?}",
+        s.stmts
+    );
+    assert_eq!(
+        s.report.early_returns, 1,
+        "the header's `then` arm into the pure-return block prints the return it \
+         arrives with, stmts {:#?}",
+        s.stmts
+    );
+    // Layout, not loss: every reachable block is printed at most once, and the only
+    // blocks that print NO statement are absorbed return blocks - a block whose
+    // every edge the text spells `return`, so nothing is left for it to run. The
+    // ledger closes: printed + absorbed = reachable.
+    let cfg = rdec_core::cfg::Cfg::build(&f);
+    for b in &cfg.rpo {
+        let n = printed.iter().filter(|p| **p == *b).count();
+        assert!(
+            n <= 1,
+            "block {b} must be printed at most once, printed {printed:?}"
+        );
+        if n == 0 {
+            let blk = &f.blocks[*b as usize];
+            assert!(
+                matches!(blk.term, Terminator::Return(_))
+                    && blk
+                        .instrs
+                        .iter()
+                        .all(|i| matches!(i.op, rdec_core::ir::Op::Phi(_))),
+                "block {b} printed no statement and is not a pure-return block: {:?}",
+                blk.term
+            );
+        }
+    }
+    assert_eq!(
+        printed.len() + s.report.absorbed,
+        cfg.rpo.len(),
+        "the printed blocks plus the absorbed ones must be the reachable blocks"
+    );
+    // A back edge stays a backward jump in the text: the layout may not turn a
+    // loop inside out.
+    for b in &cfg.rpo {
+        for s2 in &cfg.succs[*b as usize] {
+            if cfg.dominates(*s2, *b) {
+                let from = printed.iter().position(|p| *p == *b).unwrap();
+                let to = printed.iter().position(|p| *p == *s2).unwrap();
+                assert!(
+                    to < from,
+                    "the back edge {b} -> {s2} must print backward: {from} -> {to}, printed {printed:?}"
+                );
+            }
+        }
+    }
+}
+
+/// The same layout invariant over every fixture, so the DFS layout cannot buy a
+/// pruned goto by losing a block or flipping a loop.
+///
+/// **The named gap, on `layout_order`'s back-edge guard.** The guard refuses a
+/// layout that puts a back edge forward and prints RPO instead, and no fixture can
+/// watch it refuse: the sabotage "delete the guard" leaves all 18 tests green. It is
+/// a theorem of the walk, not a property the fixtures happen to satisfy. The layout
+/// is a DFS preorder, and in a DFS of a flow graph every edge whose head dominates
+/// its tail is an edge to a DFS ANCESTOR - the path the walk took from the entry to
+/// the tail runs through the head, because every path does - and an ancestor has the
+/// smaller preorder index. So the order the walk produces already prints every back
+/// edge backward, and the check can only fire on a layout that is not a DFS preorder.
+/// That is the shape of this file's `aa == ab` precedent: a live guard on a property
+/// the pass cannot violate by construction, witnessed by the two sentences above
+/// where no fixture can witness it, and recorded as un-witnessable rather than as
+/// tested. The RPO order it falls back to is the order this pass printed before M6,
+/// so the fallback is the shape the corpus tests have always covered.
+#[test]
+fn every_fixture_s_flat_layout_prints_each_block_once_and_back_edges_backward() {
+    for (name, f) in fixtures() {
+        let s = flat_walk(&f);
+        let cfg = rdec_core::cfg::Cfg::build(&f);
+        let printed = printed_order(&s);
+        for b in &cfg.rpo {
+            let n = printed.iter().filter(|p| **p == *b).count();
+            assert!(
+                n <= 1,
+                "{name}: block {b} printed {n} times, must be at most once: {printed:?}"
+            );
+            if n == 0 {
+                let blk = &f.blocks[*b as usize];
+                assert!(
+                    matches!(blk.term, Terminator::Return(_))
+                        && blk
+                            .instrs
+                            .iter()
+                            .all(|i| matches!(i.op, rdec_core::ir::Op::Phi(_))),
+                    "{name}: block {b} printed no statement and is not a pure-return block: {:?}",
+                    blk.term
+                );
+            }
+        }
+        // The fall-through ledger, counted independently of the pass: a `jmp` is
+        // absorbed when - and only when - its target is the statement printed next.
+        // Absorb one without checking adjacency and this number stops matching.
+        let adjacent = printed
+            .iter()
+            .enumerate()
+            .filter(|(i, bb)| {
+                matches!(
+                    f.blocks[**bb as usize].term,
+                    Terminator::Jump(x) if printed.get(i + 1) == Some(&x)
+                )
+            })
+            .count();
+        assert_eq!(
+            s.report.fallthroughs, adjacent,
+            "{name}: the layout absorbed {} jumps, and {} of the printed statements              jump to the statement printed next: {printed:?}",
+            s.report.fallthroughs, adjacent,
+        );
+        assert_eq!(
+            printed.len() + s.report.absorbed,
+            cfg.rpo.len(),
+            "{name}: {} printed statements + {} absorbed return blocks != {} reachable blocks",
+            printed.len(),
+            s.report.absorbed,
+            cfg.rpo.len()
+        );
+        let mut j = 0usize;
+        for st in &s.stmts {
+            let bb = st.bb;
+            if matches!(st.kind, StmtKind::Block) {
+                if let Cont::Term = st.cont {
+                    if let Terminator::Jump(x) = f.blocks[bb as usize].term {
+                        assert!(
+                            printed.get(j + 1) != Some(&x),
+                            "{name}: block {bb} jumps to the statement printed next to it: that goto is a no-op\nstmts {:#?}",
+                            s.stmts
+                        );
+                    }
+                }
+                j += 1;
+            }
+            for s2 in &cfg.succs[bb as usize] {
+                if cfg.dominates(*s2, bb) {
+                    let from = printed.iter().position(|p| *p == bb).unwrap();
+                    let to = printed.iter().position(|p| *p == *s2).unwrap();
+                    assert!(
+                        to < from,
+                        "{name}: the back edge {bb} -> {s2} prints forward ({from} -> {to}): {printed:?}"
+                    );
+                }
+            }
+        }
+        // And the census is the text, absorption and early return included: every
+        // `goto` the report counts belongs to a statement that is printed, and every
+        // early return is a `return` in the text, not a `goto`.
+        let text_gotos = s
+            .stmts
+            .iter()
+            .map(|st| {
+                let g = match st.cont {
+                    Cont::Term => term_gotos(&f.blocks[st.bb as usize].term, &st.tails),
+                    _ => 0,
+                };
+                g + usize::from(matches!(st.kind, StmtKind::Goto))
+            })
+            .sum::<usize>();
+        assert_eq!(
+            s.report.gotos, text_gotos,
+            "{name}: the goto census must be the printed gotos ({} vs {})",
+            s.report.gotos, text_gotos
+        );
+    }
 }

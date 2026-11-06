@@ -72,6 +72,12 @@ pub enum Cont {
     /// Control falls into the next statement, which the analysis guarantees
     /// starts at this block. Only legal when the walk really continues there.
     Next(BbId),
+    /// The block's own terminator, EXCEPT that the one edge `x` names lands on
+    /// the statement printed immediately after this one: the text prints nothing
+    /// and the machine's jump is the text's fall-through. The flat layout earns
+    /// this by printing `x` next; a statement list that does not print `x` next
+    /// must never carry it, which is why only the flat layout builds it.
+    Fall(BbId),
 }
 
 /// What a statement is.
@@ -105,6 +111,11 @@ pub struct Stmt {
     pub cont: Cont,
     /// Emit `l{bb}:` before this statement (a `goto` lands here).
     pub label: bool,
+    /// The successors of this statement's block whose `goto` the emitter prints as
+    /// `return`: `(target, the value that edge carries)`. A target is listed only
+    /// when [`An::tail_of`] proved it a pure tail AND that the value is readable
+    /// at this site, and the walk did not count the goto it replaced.
+    pub tails: Vec<(BbId, VId)>,
     /// Why this is a flat region, when it is one. Printed in the census, never in
     /// the C: the C gets a `goto`, not a comment.
     pub reason: Option<String>,
@@ -129,6 +140,19 @@ pub struct Report {
     pub gotos: usize,
     /// `lN:` labels in the emitted C.
     pub labels: usize,
+    /// `goto lX;` sites the emitter prints as `return` (M6 early return): the
+    /// target block computes nothing, returns, and the value that edge carries is
+    /// readable here. Counted INSTEAD of a goto, never in addition to one, which
+    /// is why the `gotos` total goes down by exactly this number.
+    pub early_returns: usize,
+    /// Return blocks whose text the early returns made dead: every edge into them
+    /// spells the return, so no `goto` names their label and the block prints
+    /// nothing. Their `lN:` label is gone from the text, counted here.
+    pub absorbed: usize,
+    /// `goto lN;` edges the flat layout absorbed by printing `N` next (M6
+    /// fall-through): the jump is the text's fall-through, so the text prints
+    /// nothing. The block's `lN:` label stays: others may jump to it.
+    pub fallthroughs: usize,
 }
 
 impl Report {
@@ -155,6 +179,9 @@ pub fn sum_reports(v: &[Report]) -> Report {
         out.flat += r.flat;
         out.gotos += r.gotos;
         out.labels += r.labels;
+        out.early_returns += r.early_returns;
+        out.absorbed += r.absorbed;
+        out.fallthroughs += r.fallthroughs;
         for (k, n) in &r.reasons {
             *out.reasons.entry(k.clone()).or_insert(0) += *n;
         }
@@ -200,15 +227,136 @@ pub fn flat_walk(f: &Function) -> Structured {
     let mut an = An::new(f);
     let mut top: Vec<Stmt> = Vec::new();
     top.push(an.param_stmt());
-    let cfg = crate::cfg::Cfg::build(f);
-    for b in &cfg.rpo {
-        if !an.in_bounds(*b) || an.claimed(*b) {
+    for b in layout_order(f) {
+        if !an.in_bounds(b) || an.claimed(b) {
             continue;
         }
-        let r = term_reason(&f.blocks[*b as usize].term);
-        top.push(an.flat_stmt(*b, &r));
+        let r = term_reason(&f.blocks[b as usize].term);
+        top.push(an.flat_stmt(b, &r));
+    }
+
+    // 2. Absorb and prune, to a fixed point: dropping a block makes its
+    //    predecessors and its successor adjacent, which can earn a fall-through,
+    //    which can in turn make another return block dead. Each round removes at
+    //    least one statement, so this terminates.
+    loop {
+        let mut round = false;
+
+        // Fall-through: a `jmp` whose target is the statement printed next is a jump
+        // to the next line of text. The text prints nothing; the target's label
+        // stays, because other edges may jump to it. A jump that goes BACKWARD is
+        // never absorbed - dropping it would run the loop body one extra time - and
+        // a layout that puts a back edge forward is not used at all.
+        let mut i = 0usize;
+        while i + 1 < top.len() {
+            if let Cont::Term = top[i].cont {
+                if let Terminator::Jump(x) = f.blocks[top[i].bb as usize].term {
+                    // Not an edge the early return already spells: that statement
+                    // prints `return`, and a fall-through would print nothing and
+                    // lose the return.
+                    let spelled_as_return = top[i].tails.iter().any(|(t, _)| *t == x);
+                    if top[i + 1].bb == x
+                        && matches!(top[i].kind, StmtKind::Block)
+                        && !spelled_as_return
+                    {
+                        top[i].cont = Cont::Fall(x);
+                        an.rep.gotos -= 1;
+                        an.rep.fallthroughs += 1;
+                        // The block's text stays (body and label: others may jump
+                        // here); only its census entry as "a block left as a goto"
+                        // goes away.
+                        an.uncount("fall-through");
+                        round = true;
+                    }
+                }
+            }
+            i += 1;
+        }
+
+        // Absorption, and never of a fall-through's target: that edge is spelled by
+        // the layout ("the statement printed next IS the target"), so it relies on
+        // the target's text being there.
+        let fall_target: Vec<BbId> = top
+            .iter()
+            .filter_map(|st| match st.cont {
+                Cont::Fall(x) => Some(x),
+                _ => None,
+            })
+            .collect();
+        let dead: Vec<BbId> = top
+            .iter()
+            .filter(|st| matches!(st.kind, StmtKind::Block))
+            .map(|st| st.bb)
+            .filter(|b| an.absorbable(*b) && !fall_target.contains(b))
+            .collect();
+        for b in dead {
+            top.retain(|st| !(matches!(st.kind, StmtKind::Block) && st.bb == b));
+            an.rep.absorbed += 1;
+            an.unprint(b, "return");
+            round = true;
+        }
+        if !round {
+            break;
+        }
     }
     an.finish(top)
+}
+
+/// The order the flat form prints its blocks: a depth-first walk from the entry
+/// that follows each block's own successors, so a `jmp` chain lands on adjacent
+/// text and the `goto` that ends it becomes the text's fall-through.
+///
+/// DFS preorder is not a cosmetic choice; it buys the two properties the layout
+/// test in `crates/core/tests/structuring.rs` pins for every fixture:
+///
+/// * every path the DFS takes from the entry to `b` passes through `b`'s
+///   dominators, so a dominator prints BEFORE the block it dominates. That is what
+///   keeps [`value_readable`] true of the TEXT and not only of the graph, which is
+///   what the early return's `return x7;` depends on;
+/// * a back edge (its head dominates its tail) is an edge to a DFS ancestor, so it
+///   prints BACKWARD: a loop still reads as a loop, and the flat form's backward
+///   jumps stay visible as what they are.
+///
+/// A layout that fails either property is not used, and RPO is printed instead.
+fn layout_order(f: &Function) -> Vec<BbId> {
+    let cfg = crate::cfg::Cfg::build(f);
+    let mut seen = vec![false; f.blocks.len()];
+    let mut out: Vec<BbId> = Vec::new();
+    let mut stack: Vec<BbId> = vec![f.entry];
+    while let Some(b) = stack.pop() {
+        if (b as usize) >= f.blocks.len() || seen[b as usize] {
+            continue;
+        }
+        seen[b as usize] = true;
+        out.push(b);
+        // Natural order on the stack, so the LAST successor is popped first: for a
+        // conditional jump the lifter records the taken target first and the
+        // fall-through second, and the fall-through is the edge the text can absorb.
+        // Preferring it is what makes a `jcc` chain print as straight-line text.
+        for s in cfg.succs[b as usize].iter() {
+            if !seen[*s as usize] {
+                stack.push(*s);
+            }
+        }
+    }
+    let rpo = cfg.rpo.clone();
+    if out.len() != rpo.len() || !out.iter().all(|b| rpo.contains(b)) {
+        // The DFS reached a different set than the CFG's own reachability: print
+        // the order the fallback has always printed.
+        return rpo;
+    }
+    for b in &out {
+        for s in &cfg.succs[*b as usize] {
+            if cfg.dominates(*s, *b) {
+                let from = out.iter().position(|x| x == b).unwrap_or(0);
+                let to = out.iter().position(|x| x == s).unwrap_or(usize::MAX);
+                if to > from {
+                    return rpo;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// The statement tree plus the census.
@@ -267,6 +415,13 @@ struct An<'a> {
     /// text is in, and the order a join is found in (the FIRST block two arms
     /// share is their join). `usize::MAX` for a block the entry cannot reach.
     rpo: Vec<usize>,
+    /// Dominators: what the early return checks before it spells a `return` at a
+    /// jump site (the value must be readable on the edge the text takes).
+    cfg: crate::cfg::Cfg,
+    /// `(from, to)` for every jump site the text spells as `return`. The flat
+    /// layout reads this set to decide which return blocks no `goto` names any
+    /// more, and drops their text.
+    tail_edges: Vec<(BbId, BbId)>,
     rep: Report,
     /// The entry's leading `Op::Param` instructions, already emitted as their own
     /// statement, so a walk through the entry prints the instructions after them.
@@ -280,6 +435,8 @@ impl<'a> An<'a> {
             taken: vec![false; f.blocks.len()],
             rpo: rpo_index(f),
             marked: vec![false; f.blocks.len() + 1],
+            cfg: crate::cfg::Cfg::build(f),
+            tail_edges: Vec::new(),
             rep: Report::default(),
             params: 0,
         }
@@ -390,6 +547,7 @@ impl<'a> An<'a> {
             kind: StmtKind::Params,
             cont: Cont::Next(NO_BB),
             label: false,
+            tails: Vec::new(),
             reason: None,
         }
     }
@@ -894,17 +1052,19 @@ impl<'a> An<'a> {
     /// left its marks, claims and counters behind would inflate the census with
     /// shapes it only considered.
     fn probe<T>(&mut self, run: impl FnOnce(&mut Self) -> T) -> T {
-        let (taken, marked, rep, params) = (
+        let (taken, marked, rep, params, tails) = (
             self.taken.clone(),
             self.marked.clone(),
             self.rep.clone(),
             self.params,
+            self.tail_edges.clone(),
         );
         let out = run(self);
         self.taken = taken;
         self.marked = marked;
         self.rep = rep;
         self.params = params;
+        self.tail_edges = tails;
         out
     }
 
@@ -977,6 +1137,7 @@ impl<'a> An<'a> {
         match st.cont {
             Cont::Exit => true,
             Cont::Next(x) => inside(x),
+            Cont::Fall(x) => inside(x),
             Cont::Goto(x) => inside(x),
             Cont::Term => successors_of(&self.f.blocks[st.bb as usize].term)
                 .iter()
@@ -987,10 +1148,11 @@ impl<'a> An<'a> {
     /// Where a statement's text hands control to `x`. `Cont::Next` is the
     /// fall-through, which is only legal because the walk then emits `x`'s
     /// statement next; a claimed, out-of-bounds, or entry `x` becomes a `goto`
-    /// here and nowhere else.
-    fn cont_to(&mut self, x: BbId, exit: BbId) -> (Cont, Option<String>) {
+    /// here and nowhere else. `from` is the block whose text this is: the early
+    /// return needs the edge, not just the target.
+    fn cont_to(&mut self, from: BbId, x: BbId, exit: BbId) -> (Cont, Option<String>, Option<VId>) {
         if x == exit {
-            return (Cont::Exit, None);
+            return (Cont::Exit, None, None);
         }
         if x == self.f.entry {
             self.mark(x);
@@ -998,17 +1160,93 @@ impl<'a> An<'a> {
             let r = "back edge to the function entry";
             self.reason(r);
             self.rep.flat += 1;
-            return (Cont::Goto(x), Some(r.to_string()));
+            return (Cont::Goto(x), Some(r.to_string()), None);
         }
         if self.in_bounds(x) && !self.claimed(x) {
-            return (Cont::Next(x), None);
+            return (Cont::Next(x), None, None);
+        }
+        // The jump is real (the target is claimed, out of the region, or already
+        // emitted). Its text is a `return` when the target is a pure tail and the
+        // value is readable here: the block then ends the function on this edge, so
+        // it is not a block "left as goto" - no reason, no `flat`, and no label
+        // marked, because no `goto` names it from here.
+        if let Some(v) = self.tail_of(from, x) {
+            self.tail_edges.push((from, x));
+            self.rep.early_returns += 1;
+            return (Cont::Goto(x), None, Some(v));
         }
         self.mark(x);
         self.rep.gotos += 1;
         let r = "join is not this region's exit (fall-through kept as goto)";
         self.reason(r);
         self.rep.flat += 1;
-        (Cont::Goto(x), Some(r.to_string()))
+        (Cont::Goto(x), Some(r.to_string()), None)
+    }
+
+    /// The `return` a jump site `from -> to` may print instead of `goto l{to};`,
+    /// as the value that edge carries (`NO_VAL` for a `return;`).
+    ///
+    /// Two proofs, both of which the C text needs and the CFG alone does not give:
+    ///
+    /// * **the target is a pure tail.** Its block computes NOTHING: every
+    ///   instruction is a phi (whose value arrives by the edge copy the emitter
+    ///   already prints at the end of `from`'s text), and its terminator is a
+    ///   `return`. A block with a store, a call, or an arithmetic instruction needs
+    ///   a STATEMENT, and a `return` spelling has no room for one: the machine
+    ///   would run that work on the edge into the target and the C would run
+    ///   nothing. That case is refused and counted out loud
+    ///   (`early return refused: target computes`).
+    /// * **the value is readable HERE.** The emitted text runs statements, not the
+    ///   graph, so a `return x7;` is only the same program if `x7` was written on
+    ///   the path that got here. Where the target returns a phi, the text spells
+    ///   the phi operand that arrives on THIS edge (the edge copy is the value the
+    ///   machine returns on this edge, and the emitter prints it as the last
+    ///   statement of `from`), never the phi itself. Where the target returns a
+    ///   value defined elsewhere, [`value_readable`] is the dominance check.
+    fn tail_of(&mut self, from: BbId, to: BbId) -> Option<VId> {
+        if !self.in_bounds(to) || to == self.f.entry {
+            return None;
+        }
+        let b = &self.f.blocks[to as usize];
+        let v = match b.term {
+            Terminator::Return(v) => v,
+            _ => return None,
+        };
+        if b.instrs.iter().any(|i| !matches!(i.op, Op::Phi(_))) {
+            // Loud, not silent: this is a goto the pass chose not to spell.
+            self.reason("early return refused: target computes");
+            return None;
+        }
+        let mut val = v;
+        for i in &b.instrs {
+            if let Op::Phi(pairs) = &i.op {
+                if i.dest == v {
+                    // The value this edge hands the phi. No pair for `from` means
+                    // the graph and the edge disagree; keep the goto.
+                    val = pairs.iter().find(|(_, p)| *p == from)?.0;
+                }
+            }
+        }
+        if val != NO_VAL && !value_readable(self.f, &self.cfg, val, from) {
+            self.reason("early return refused: value not readable at the site");
+            return None;
+        }
+        Some(val)
+    }
+
+    /// The tail spellings for every successor of `from`, recorded as this
+    /// statement's `tails` and as `(from, to)` edges for the layout's absorption
+    /// check. Each accepted tail is counted in `early_returns` where the caller
+    /// would otherwise count a `goto`, so the census and the text stay one number.
+    fn tails_for(&mut self, from: BbId, succs: &[BbId]) -> Vec<(BbId, VId)> {
+        let mut out: Vec<(BbId, VId)> = Vec::new();
+        for s in succs {
+            if let Some(v) = self.tail_of(from, *s) {
+                self.tail_edges.push((from, *s));
+                out.push((*s, v));
+            }
+        }
+        out
     }
 
     /// The statements of the region entered at `entry`, whose fall-out is `exit`.
@@ -1017,11 +1255,13 @@ impl<'a> An<'a> {
         let mut cur = entry;
         while cur != exit {
             if depth >= MAX_DEPTH {
-                out.push(self.goto_stmt(cur, "region nesting deeper than the ceiling"));
+                let from = out.last().map(|st| st.bb).unwrap_or(NO_BB);
+                out.push(self.goto_stmt(from, cur, "region nesting deeper than the ceiling"));
                 break;
             }
             if !self.in_bounds(cur) || self.claimed(cur) {
-                out.push(self.goto_stmt(cur, "join already emitted by an enclosing region"));
+                let from = out.last().map(|st| st.bb).unwrap_or(NO_BB);
+                out.push(self.goto_stmt(from, cur, "join already emitted by an enclosing region"));
                 break;
             }
             // 1. Pre-test loop: the guard lives in this block, so `while` is the
@@ -1034,7 +1274,8 @@ impl<'a> An<'a> {
                 self.rep.whiles += 1;
                 self.taken[cur as usize] = true;
                 let body = self.seq(a, cur, depth + 1);
-                let (cont, why) = self.cont_to(x, exit);
+                let (cont, why, tail) = self.cont_to(cur, x, exit);
+                let tails = tail.map(|v| vec![(x, v)]).unwrap_or_default();
                 out.push(Stmt {
                     bb: cur,
                     kind: StmtKind::While {
@@ -1043,6 +1284,7 @@ impl<'a> An<'a> {
                     },
                     cont,
                     label: false,
+                    tails,
                     reason: why,
                 });
                 match cont {
@@ -1063,7 +1305,8 @@ impl<'a> An<'a> {
                     }
                     self.rep.ifs += 1;
                     let then = self.seq(body_entry, stop, depth + 1);
-                    let (cont, why) = self.cont_to(stop, exit);
+                    let (cont, why, tail) = self.cont_to(cur, stop, exit);
+                    let tails = tail.map(|v| vec![(stop, v)]).unwrap_or_default();
                     out.push(Stmt {
                         bb: cur,
                         kind: StmtKind::If {
@@ -1073,6 +1316,7 @@ impl<'a> An<'a> {
                         },
                         cont,
                         label: false,
+                        tails,
                         reason: why,
                     });
                     match cont {
@@ -1090,7 +1334,8 @@ impl<'a> An<'a> {
                     self.taken[cur as usize] = true;
                     let then = self.seq(t, stop, depth + 1);
                     let els = self.seq(e, stop, depth + 1);
-                    let (cont, why) = self.cont_to(stop, exit);
+                    let (cont, why, tail) = self.cont_to(cur, stop, exit);
+                    let tails = tail.map(|v| vec![(stop, v)]).unwrap_or_default();
                     out.push(Stmt {
                         bb: cur,
                         kind: StmtKind::If {
@@ -1103,6 +1348,7 @@ impl<'a> An<'a> {
                         },
                         cont,
                         label: false,
+                        tails,
                         reason: why,
                     });
                     match cont {
@@ -1122,7 +1368,8 @@ impl<'a> An<'a> {
                 self.rep.ifs += 1;
                 self.taken[cur as usize] = true;
                 let then = self.seq(arm, EXIT, depth + 1);
-                let (cont, why) = self.cont_to(next_arm, exit);
+                let (cont, why, tail) = self.cont_to(cur, next_arm, exit);
+                let tails = tail.map(|v| vec![(next_arm, v)]).unwrap_or_default();
                 out.push(Stmt {
                     bb: cur,
                     kind: StmtKind::If {
@@ -1132,6 +1379,7 @@ impl<'a> An<'a> {
                     },
                     cont,
                     label: false,
+                    tails,
                     reason: why,
                 });
                 match cont {
@@ -1145,8 +1393,9 @@ impl<'a> An<'a> {
             self.taken[cur as usize] = true;
             match term {
                 Terminator::Jump(s) => {
-                    let (cont, why) = self.cont_to(s, exit);
-                    out.push(self.plain(cur, cont, why));
+                    let (cont, why, tail) = self.cont_to(cur, s, exit);
+                    let tails = tail.map(|v| vec![(s, v)]).unwrap_or_default();
+                    out.push(self.plain(cur, cont, why, tails));
                     match cont {
                         Cont::Next(y) => cur = y,
                         _ => break,
@@ -1162,7 +1411,23 @@ impl<'a> An<'a> {
         out
     }
 
-    fn goto_stmt(&mut self, to: BbId, reason: &str) -> Stmt {
+    fn goto_stmt(&mut self, from: BbId, to: BbId, reason: &str) -> Stmt {
+        // The same two proofs as `cont_to`: a `goto` at this site becomes a
+        // `return` when the target computes nothing and the value is readable HERE
+        // (`from` is the block whose text ends with this jump). NO_BB from a region
+        // with no printed site block names no edge, so it earns no tail.
+        if let Some(v) = self.tail_of(from, to) {
+            self.tail_edges.push((from, to));
+            self.rep.early_returns += 1;
+            return Stmt {
+                bb: to,
+                kind: StmtKind::Goto,
+                cont: Cont::Exit,
+                label: false,
+                tails: vec![(to, v)],
+                reason: None,
+            };
+        }
         self.reason(reason);
         self.rep.flat += 1;
         self.mark(to);
@@ -1172,11 +1437,18 @@ impl<'a> An<'a> {
             kind: StmtKind::Goto,
             cont: Cont::Exit,
             label: false,
+            tails: Vec::new(),
             reason: Some(reason.to_string()),
         }
     }
 
-    fn plain(&mut self, bb: BbId, cont: Cont, reason: Option<String>) -> Stmt {
+    fn plain(
+        &mut self,
+        bb: BbId,
+        cont: Cont,
+        reason: Option<String>,
+        tails: Vec<(BbId, VId)>,
+    ) -> Stmt {
         if let Some(r) = &reason {
             self.reason(r);
             self.rep.flat += 1;
@@ -1186,6 +1458,7 @@ impl<'a> An<'a> {
             kind: StmtKind::Block,
             cont,
             label: false,
+            tails,
             reason,
         }
     }
@@ -1197,18 +1470,74 @@ impl<'a> An<'a> {
         self.rep.flat += 1;
         self.mark(bb);
         self.taken[bb as usize] = true;
-        let mut succ = Vec::new();
-        self.f.blocks[bb as usize].term.successors(&mut succ);
-        for s in succ {
-            self.mark(s);
+        let succ = successors_of(&self.f.blocks[bb as usize].term);
+        // The edges this block's text may print as `return` instead of `goto`.
+        let tails = self.tails_for(bb, &succ);
+        self.rep.gotos += term_gotos(&self.f.blocks[bb as usize].term, &tails);
+        self.rep.early_returns += tails.len();
+        for s in &succ {
+            // A `return` names no label, so a tail edge marks nothing: that is how
+            // a pure-return block ends up with no label to drop when every edge
+            // into it returns.
+            if !tails.iter().any(|(t, _)| t == s) {
+                self.mark(*s);
+            }
         }
-        self.rep.gotos += term_gotos(&self.f.blocks[bb as usize].term);
         Stmt {
             bb,
             kind: StmtKind::Block,
             cont: Cont::Term,
             label: false,
+            tails,
             reason: Some(reason.to_string()),
+        }
+    }
+
+    /// May the flat form print nothing for this block? A pure-return block whose
+    /// every incoming edge the text spells `return` has no work left to run: its
+    /// phis are written by the predecessors' edge copies, and its `return` by each
+    /// of those edges. The phi destinations must not be read outside the block:
+    /// their values are the last edge copy that ran in TEXT order, which is a
+    /// claim about the block's own `return` only.
+    fn absorbable(&self, b: BbId) -> bool {
+        if !self.in_bounds(b) || b == self.f.entry {
+            return false;
+        }
+        let blk = &self.f.blocks[b as usize];
+        if !matches!(blk.term, Terminator::Return(_)) {
+            return false;
+        }
+        if blk.instrs.iter().any(|i| !matches!(i.op, Op::Phi(_))) {
+            return false;
+        }
+        for i in &blk.instrs {
+            if self.f.uses_of(i.dest).iter().any(|u| u.bb != b) {
+                return false;
+            }
+        }
+        self.cfg.preds[b as usize]
+            .iter()
+            .all(|p| self.tail_edges.contains(&(*p, b)))
+    }
+
+    /// Take back the census of a block the flat text no longer prints: its label,
+    /// its `flat` count and the reason line that named it. The block's work is in
+    /// the text - spelled on the edges that replaced it - and the census must say
+    /// so, not keep a count of a statement that is gone.
+    fn unprint(&mut self, b: BbId, reason: &str) {
+        self.marked[b as usize] = false;
+        self.uncount(reason);
+    }
+
+    /// The census of a block that no longer ends in a `goto` leaves the "blocks
+    /// left as goto" total and the reason histogram that named it.
+    fn uncount(&mut self, reason: &str) {
+        self.rep.flat = self.rep.flat.saturating_sub(1);
+        if let Some(n) = self.rep.reasons.get_mut(reason) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                self.rep.reasons.remove(reason);
+            }
         }
     }
 }
@@ -1233,22 +1562,69 @@ fn reaches(f: &Function, from: BbId, to: BbId) -> bool {
     seen.contains(&to)
 }
 
-/// The gotos a terminator spells in the flat form: one per edge, minus the one
-/// edge that falls through to the next block in the emitted order.
-/// The `goto` statements the flat spelling of this terminator prints. There is no
-/// fall-through to discount: `Emitter::term` prints `goto lN;` for a `Jump` and
-/// `if (c) goto lA; else goto lB;` for a `Branch` whatever the next line of text
-/// is, because the emitted block order is the RPO, not a layout that can absorb
-/// an edge. The census that does not match that spelling is the one that failed
-/// the first corpus run: 51 gotos in the text against 30 in the report.
-fn term_gotos(t: &Terminator) -> usize {
+/// The `goto` statements the flat spelling of this terminator prints: one per
+/// edge, minus the edges the early return spells as `return` (`tails`, which the
+/// emitter prints from this same list). The census that does not match the
+/// emitter's spelling is the one that failed the first corpus run: 51 gotos in the
+/// text against 30 in the report.
+///
+/// The other discount - the `goto` the LAYOUT absorbs by printing the target next
+/// - is not a property of the terminator, so it is not taken here. `flat_walk`
+///   turns that statement's `Cont::Term` into `Cont::Fall` and decrements its own
+///   count where it makes the change.
+pub fn term_gotos(t: &Terminator, tails: &[(BbId, VId)]) -> usize {
+    let named = |b: BbId| tails.iter().any(|(x, _)| *x == b);
     match t {
-        Terminator::Jump(_) => 1,
-        Terminator::Branch { .. } => 2,
+        Terminator::Jump(b) => usize::from(!named(*b)),
+        Terminator::Branch {
+            then_bb, else_bb, ..
+        } => usize::from(!named(*then_bb)) + usize::from(!named(*else_bb)),
         // A `switch` spells one `goto` per table slot and traps past the end.
-        Terminator::Switch { targets, .. } => targets.len(),
+        Terminator::Switch { targets, .. } => targets.iter().filter(|b| !named(**b)).count(),
         _ => 0,
     }
+}
+
+/// Is `v` readable in the printed text at the END of block `at`'s statement - the
+/// point where its terminator runs, which is where an early `return` is spelled?
+///
+/// The emitter declares a local for every value at the top of the function, so
+/// scope is never the question; the question is whether the WRITE has run. `v` is
+/// readable when the block that defines it is `at` itself (the emitter prints a
+/// block's instructions, and its phi edge copies, before its terminator), or when
+/// it dominates `at`: every path to `at` runs that block's text first, and the flat
+/// layout prints a dominator before the block it dominates.
+///
+/// **This check is defensive on valid IR, and the named gap is that no emitted C
+/// can witness it failing.** For a target that returns a phi, SSA validity is
+/// stronger than this check: `verify_ssa` requires a phi operand's def to dominate
+/// the predecessor of the phi's block (`crates/core/src/verify.rs`), which is
+/// exactly "readable on the edge". For a target that returns a plain value, if the
+/// def dominates the target's block then it dominates every predecessor of the
+/// target (every path through a predecessor continues into the target, and the def
+/// is on it), so the check cannot fire on a function `verify_ssa` accepted. It
+/// guards the pass against the graph it was handed, not against a shape the
+/// pipeline produces: `crates/core/tests/structuring.rs` witnesses it on a
+/// hand-built graph that `verify_ssa` rejects, so the rule is proven live, and the
+/// gap - "no corpus function can show it refusing" - stays on the record.
+pub fn value_readable(f: &Function, cfg: &crate::cfg::Cfg, v: VId, at: BbId) -> bool {
+    if (at as usize) >= f.blocks.len() {
+        return false;
+    }
+    let (d, _) = match f.def(v) {
+        Some(x) => x,
+        None => return false,
+    };
+    if d == at {
+        return true;
+    }
+    if (d as usize) >= f.blocks.len() {
+        return false;
+    }
+    if !cfg.reachable[d as usize] || !cfg.reachable[at as usize] {
+        return false;
+    }
+    cfg.dominates(d, at)
 }
 
 /// Why a terminator is a flat region in the emitted C. These keys are the census
