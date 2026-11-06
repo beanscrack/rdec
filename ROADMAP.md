@@ -1667,3 +1667,41 @@ recorded so the next audit does not re-litigate them, and so nobody "fixes" a no
 `scripts/unwrap_ratchet.sh` + `.gate/unwrap-baseline` pins the per-crate count, fails on a
 rise, fails on a fall (with an instruction to lower the baseline), fails on a missing
 baseline, and runs in both CI jobs.
+
+### Named gap: the middle end runs out of pass budget on ordinary functions, and said "converged"
+
+Found by `crates/core/tests/pipeline_scaling.rs`, which exists to ask the questions the
+corpus cannot ask (its biggest function is ~40 blocks).
+
+`run_pipeline` loops to a fixpoint capped at 32 rounds, and `merge_blocks` / `dedup_blocks`
+collapse **one** thing per call. A phi-free carry chain of 250 blocks therefore needs far
+more rounds than the pipeline has, hit the cap, and the report the gates print said:
+
+    ladder(250): converged after 33 rounds
+
+That is a false claim about the work: it stopped, it did not converge. Fixed: the report now
+distinguishes the two, with `PipelineReport::not_converged` and the line
+`stopped: pass budget (32 rounds) exhausted, passes still changing`. Red direction proven on
+the final tree: restoring `if !changed || iter > 32` reproduces `converged after 33 rounds |
+not_converged=false` and the test fails; the fix passes. A converging shape (`pairs(8)`,
+`ladder(5)`) is asserted NOT to be flagged, so "always report non-convergence" cannot pass.
+
+Two things this exposes, both open, both measured here, neither papered over:
+
+1. **Super-linear middle end.** Printed scaling census (debug, this box):
+   50 blocks 23.7 ms, 100 blocks 63.3 ms, 200 blocks 219.4 ms — 2x the blocks costs ~3.5x,
+   and a 20k-block function did not finish in 60 seconds (kept as
+   `a_20k_block_function_finishes_and_answers_the_right_number`, `#[ignore]`d with that
+   measurement in the reason, run it with `cargo test --release -- --ignored`).
+   The scaling test's own bound (200/50 blocks ratio < 25) is a regression net for the growth
+   getting WORSE, not a claim that today's growth is acceptable.
+2. **The budget is the reason, and the fix is not a bigger number.** Raising 32 makes the
+   pipeline slower (rounds x passes is where the quadratic lives). The right fix is in
+   `passes.rs`: apply all merges/dedups in one call so rounds become a small constant —
+   which touches the same file M5's structuring pass lands in, so it is sequenced after.
+
+Also named: `rdec_core::emit_c` refuses `Op::Cmp` whose operand is an `Op::Const`
+(`comparison Ult on a  operand` — IR constants are width-agnostic, `Op::Const`'s `ty()` is
+`None`, and the emitter's comparison path needs a width from the operand). No corpus function
+shows it because the lifter's comparisons go through flags + `GetFlag`. Fixture cost: three
+iterations to route around it.

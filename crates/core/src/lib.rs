@@ -20,6 +20,7 @@ pub mod fuse;
 pub mod interp;
 pub mod ir;
 pub mod passes;
+pub mod structure;
 pub mod tv;
 pub mod ty;
 pub mod verify;
@@ -33,6 +34,11 @@ pub use ty::{Sx, Ty, Width};
 pub struct PipelineReport {
     pub passes_run: Vec<String>,
     pub notes: Vec<String>,
+    /// True when the round budget ran out with passes still changing - i.e. the
+    /// pipeline STOPPED without converging. Stub for the red-first witness in
+    /// `tests/pipeline_scaling.rs`: the field exists and is false here, which is
+    /// exactly the bug the test is written to catch.
+    pub not_converged: bool,
 }
 
 /// Run every middle-end pass to fixpoint. `flag_elim` must run before DCE so
@@ -51,9 +57,19 @@ pub fn run_pipeline(f: &mut Function) -> PipelineReport {
         changed |= passes::simplify_branches(f);
         changed |= passes::merge_blocks(f);
         changed |= passes::dedup_blocks(f);
-        if !changed || iter > 32 {
+        if !changed {
             rep.passes_run
                 .push(format!("converged after {iter} rounds"));
+            break;
+        }
+        if iter >= 32 {
+            // Running out of budget is NOT convergence. `dedup_blocks` collapses one
+            // duplicate per call, so a function with more duplicates than rounds gets
+            // here with work outstanding - and this report is what the gates print.
+            rep.not_converged = true;
+            rep.passes_run.push(format!(
+                "stopped: pass budget ({iter} rounds) exhausted, passes still changing"
+            ));
             break;
         }
     }
