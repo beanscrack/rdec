@@ -1151,7 +1151,20 @@ impl<'a> Emitter<'a> {
                 })
             }
             Op::Cmp(c, a, b) => {
-                let (x, y) = (self.use_(*a), self.use_(*b));
+                let ta = self.ty_of(*a);
+                let tb = self.ty_of(*b);
+                // `Cmp` is the INTEGER comparison; `FCmp` is the float one and
+                // carries C's unordered predicate. An integer predicate on
+                // float operands is not a thing the machine does - the IR is
+                // malformed - and the old code emitted an ORDERED C `<` there,
+                // silently turning NaN comparisons into total-order answers.
+                if matches!(ta, Ty::Float { .. }) || matches!(tb, Ty::Float { .. }) {
+                    self.refuse(
+                        at,
+                        format!("integer comparison {c:?} on a float operand (FCmp is the float predicate)"),
+                    );
+                    return Err(self.refusals.clone());
+                }
                 let op = match c {
                     IntCmp::Eq => "==",
                     IntCmp::Ne => "!=",
@@ -1164,17 +1177,50 @@ impl<'a> Emitter<'a> {
                     IntCmp::Gt => ">",
                     IntCmp::Ge => ">=",
                 };
-                // Unsigned comparisons must not be eaten by a signed type: cast
-                // both sides to the unsigned type of the same width.
-                let signed = matches!(self.ty_of(*a), Ty::Int { sx: Sx::Signed, .. });
-                match (signed, c) {
-                    (false, IntCmp::Lt | IntCmp::Le | IntCmp::Gt | IntCmp::Ge)
-                    | (true, IntCmp::Ult | IntCmp::Ule | IntCmp::Ugt | IntCmp::Uge) => {
-                        self.refuse(at, format!("comparison {c:?} on a {:+} operand", ""));
+                // The ground truth is the interpreter (see its `Op::Cmp` arm):
+                // signedness is a property of the PREDICATE, the width is
+                // `width_of(a)`, and the operand type's signedness is a
+                // display concern (§1.3). C's comparison follows the OPERANDS'
+                // types, so where the two disagree, cast BOTH sides to the
+                // predicate's signedness at the IR width - then C's answer is
+                // the model's answer at the machine's width. The old code
+                // refused every disagreement with a reason that interpolated a
+                // literal empty string (`comparison Ult on a  operand`).
+                let (x, y) = (self.use_(*a), self.use_(*b));
+                let want_signed = matches!(c, IntCmp::Lt | IntCmp::Le | IntCmp::Gt | IntCmp::Ge);
+                let (x, y) = if matches!(c, IntCmp::Eq | IntCmp::Ne)
+                    || want_signed == matches!(ta, Ty::Int { sx: Sx::Signed, .. })
+                {
+                    (x, y)
+                } else {
+                    let w = match ta {
+                        Ty::Int { w, .. } => w,
+                        Ty::Bool => Width::W1,
+                        other => {
+                            self.refuse(
+                                at,
+                                format!("comparison {c:?} on a {other:?}-typed operand"),
+                            );
+                            return Err(self.refusals.clone());
+                        }
+                    };
+                    let tt = Ty::Int {
+                        w,
+                        sx: if want_signed {
+                            Sx::Signed
+                        } else {
+                            Sx::Unsigned
+                        },
+                    };
+                    let Some(t) = c_ty(&tt) else {
+                        self.refuse(
+                            at,
+                            format!("comparison {c:?} cast to {tt:?} has no C spelling"),
+                        );
                         return Err(self.refusals.clone());
-                    }
-                    _ => {}
-                }
+                    };
+                    (format!("({t}){x}"), format!("({t}){y}"))
+                };
                 Some(format!("({x} {op} {y}) ? 1 : 0"))
             }
             Op::Flags(o) => {
