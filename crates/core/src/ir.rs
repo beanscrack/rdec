@@ -571,6 +571,28 @@ pub enum Terminator {
     /// We ran out of modeled control flow (indirect jump, syscall, ...).
     /// Emits a `goto`/`exit()`-style escape so output stays compilable.
     Exit,
+    /// `return callee(args);` — the machine code left the function through a
+    /// `jmp` whose relocation named the callee (the `e9 rel32` +
+    /// `IMAGE_REL_AMD64_REL32 -> g` shape). The call's value IS this function's
+    /// answer; control never returns to the caller's code.
+    ///
+    /// `value` is defined by an `Op::Call` in the SAME block, and `verify_ssa`
+    /// requires it with a named callee: a `jmp` computes nothing, so a
+    /// `TailReturn` of anything else means the IR invented a tail call, and an
+    /// unnamed callee means nobody's answer is being returned.
+    ///
+    /// NO successor, which is the reason the terminator exists: a tail call has
+    /// no fall-through edge, so the bytes after it are unreachable from it.
+    /// Ending the block with `Return` on a fall-through edge would be the lie —
+    /// it claims the block ran to its end.
+    TailReturn(VId),
+    /// The block ended in a call to a callee that never returns (`abort`, the
+    /// CRT exit family, a C++ throw). The call defines nothing, the caller-saved
+    /// registers are destroyed as at any call, and nothing executes after it —
+    /// so, like a tail call, NO successor: the code after the call is
+    /// unreachable and the function has no fall-through answer. Falling through
+    /// to an `Exit` would invent an edge the machine code does not have.
+    NoReturn,
 }
 
 impl Terminator {
@@ -585,7 +607,11 @@ impl Terminator {
                 out.push(else_bb);
             }
             Terminator::Switch { targets: ref t, .. } => out.extend(t.iter().copied()),
-            Terminator::Return(_) | Terminator::Unreachable | Terminator::Exit => {}
+            Terminator::Exit
+            | Terminator::Unreachable
+            | Terminator::Return(_)
+            | Terminator::TailReturn(_)
+            | Terminator::NoReturn => {}
         }
     }
 }
@@ -760,7 +786,7 @@ impl Function {
             // how DCE came to delete the expression a function returns (B1).
             let top: Option<VId> = match b.term {
                 Terminator::Branch { cond, .. } => Some(cond),
-                Terminator::Return(x) if x != NO_VAL => Some(x),
+                Terminator::Return(x) | Terminator::TailReturn(x) if x != NO_VAL => Some(x),
                 // The switch's selector is a use: a pass that deletes its
                 // definition leaves a jump on a value that does not exist.
                 Terminator::Switch { index, .. } => Some(index),
@@ -793,7 +819,7 @@ impl Function {
             // Match with a guard so the rewrite is one arm per terminator.
             match &mut b.term {
                 Terminator::Branch { cond, .. } if *cond == old => *cond = new,
-                Terminator::Return(x) if *x == old => *x = new,
+                Terminator::Return(x) | Terminator::TailReturn(x) if *x == old => *x = new,
                 Terminator::Switch { index, .. } if *index == old => *index = new,
                 _ => {}
             }

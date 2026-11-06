@@ -291,7 +291,14 @@ pub fn lift_all_named_shapes(
         let tables = rdec_arch_x86::discover::jump_tables(&obj, &|sec: usize| {
             idx_of.get(&sec).copied().map(|r| base_of[r])
         });
-        let plan = rdec_arch_x86::discover::discover_all_with_tables(&ranges, &seeds, &tables);
+        // The relocations this object carries on its displacement fields: the
+        // evidence that a direct `call`'s target is the named symbol, not the
+        // unrelocated immediate the bytes hold.
+        let disp = rdec_arch_x86::discover::displacements(&obj, &|sec: usize| {
+            idx_of.get(&sec).copied().map(|r| base_of[r])
+        });
+        let plan =
+            rdec_arch_x86::discover::discover_all_with_container(&ranges, &seeds, &tables, &disp);
         // Say it out loud: the tables this object's relocations name, and how
         // many slots resolved. A table with a hole in it is visible here, not
         // only as a refusal of the one function that dispatches through it.
@@ -332,6 +339,12 @@ pub fn lift_all_named_shapes(
                     cname: name_of(oi, raw),
                     abi: sh.abi,
                     typed: sh.typed,
+                    // The C++ demangler knows which of these never come back; the
+                    // C corpus declares none, and a name the front end does not
+                    // declare is modelled as returning (the code after the call
+                    // stays reachable) - the model never invents a noreturn from a
+                    // guess about a name.
+                    noreturn: rdec_arch_x86::lift::noreturn_symbol(raw),
                 },
             );
         }
@@ -429,6 +442,41 @@ pub fn calls_line(subjects: &[Subject]) -> String {
     format!("calls: {m} modelled | indirect {ind} | no symbol {nosym} | >4 args {over} | untypable {unty}")
 }
 
+/// The tail-call and noreturn census, on the same footing as `calls_line`:
+/// the `jmp`s whose relocation named a defined function symbol (modelled as
+/// `return callee(args);`), the `jmp`s whose relocation named a symbol with no
+/// callable callee, the calls the front end DECLARED noreturn (BY NAME: a
+/// function whose IR ends in a noreturn exit has no fall-through answer, so the
+/// sites are the work list), and the instructions the lifter did not lift
+/// because their block's own terminator had already left the function.
+///
+/// All four are 0 over the C and C++ corpora, and that is the measurement, not
+/// an assumption: `llvm-objdump -d -r` over the corpus finds 65 `jmp` sites, none
+/// carrying a relocation that names a defined function (the relocated ones name
+/// `__guard_x86` and `_tail_call_i386`), and 31 call sites, none to the
+/// termination family. The model is therefore pinned by
+/// `crates/arch-x86/tests/tail_calls.rs`, whose fixtures quote their own
+/// `llvm-objdump -d -r`, and a non-zero number here is the day a corpus witness
+/// appears.
+pub fn tail_line(subjects: &[Subject]) -> String {
+    let (mut t, mut un, mut nr, mut past) = (0usize, 0usize, 0usize, 0usize);
+    let mut sites: Vec<(u64, String)> = Vec::new();
+    for s in subjects {
+        t += s.rep.tail_calls;
+        un += s.rep.tail_calls_unnamed;
+        nr += s.rep.noreturn_calls;
+        past += s.rep.bytes_past_ended_block;
+        sites.extend(s.rep.noreturn_sites.iter().cloned());
+    }
+    let mut line = format!(
+        "tail calls: {t} modelled | {un} with no callable callee | noreturn calls: {nr} | {past} instructions not lifted (their block's terminator left the function)"
+    );
+    for (a, sym) in sites {
+        line.push_str(&format!(" | {a:#x} -> {sym}"));
+    }
+    line
+}
+
 /// The relocation census, on the same footing as `calls_line`: N is what the
 /// loader parsed across the objects (counted once per object, not once per
 /// function), K is direct-call displacements whose relocation resolved to a
@@ -504,6 +552,7 @@ pub fn cmd_c(args: &[String]) -> Result<i32, String> {
 
     let subjects = lift_all(&files)?;
     println!("{}", calls_line(&subjects));
+    println!("{}", tail_line(&subjects));
     println!("{}", relocs_line(&subjects));
     // The callee shapes of the whole translation unit, built once, before the
     // first function is emitted: a call to a sibling needs a prototype that

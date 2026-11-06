@@ -872,6 +872,15 @@ pub fn cmd_t2(args: &[String]) -> Result<i32, String> {
             continue;
         }
         if has_exit(&s.f) {
+            if std::env::var_os("RDEC_T2_NAMES").is_some() {
+                println!(
+                    "\n===== EXIT IR {} :: {} (start {:#x})\n{}",
+                    s.obj,
+                    s.sym,
+                    s.start,
+                    rdec_core::fmt_ir::format_function(&s.f)
+                );
+            }
             skip("unmodelled control flow (Exit)", &mut skipped);
             continue;
         }
@@ -1266,8 +1275,17 @@ pub fn cmd_t2(args: &[String]) -> Result<i32, String> {
             fault_jobs.len()
         );
     }
+    // The cap is 3 by default so the gate stays readable; `RDEC_T2_NAMES=1`
+    // names every excluded function, which is what you need when an exclusion
+    // bucket is the work item (an uncounted, unnamed gap is a gap that gets
+    // quietly believed).
+    let name_cap = if std::env::var_os("RDEC_T2_NAMES").is_some() {
+        usize::MAX
+    } else {
+        3
+    };
     for (why, names) in &skipped {
-        for n in names.iter().take(3) {
+        for n in names.iter().take(name_cap) {
             println!("  not run [{why}] {n}");
         }
     }

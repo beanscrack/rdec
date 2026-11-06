@@ -266,6 +266,79 @@ pub fn verify(f: &Function) -> Verdict {
                     }
                 }
             }
+            // A TAIL CALL IS A CLAIM ABOUT THE MACHINE CODE: the block left the
+            // function through a `jmp` whose relocation named a function symbol.
+            // So the returned value must be defined by a CALL in this block with a
+            // NAMED callee. A `jmp` computes nothing, so a `TailReturn` of any other
+            // value means the IR invented a tail call; an unnamed callee (`Addr`,
+            // `Indirect`, an empty name) means the function's whole answer belongs
+            // to nobody, which is the hole the C would paper over with a prototype.
+            Terminator::TailReturn(v) => {
+                if *v == NO_VAL || !defined(f, *v) {
+                    e.hard(format!("bb{}: tail return of undefined %{}", b.id, v));
+                    continue;
+                }
+                let Some((dbb, di)) = f.def(*v) else {
+                    e.hard(format!(
+                        "bb{}: tail return of %{} has no definition",
+                        b.id, v
+                    ));
+                    continue;
+                };
+                match &f.block(dbb).instrs[di].op {
+                    Op::Call { callee, .. } => match callee {
+                        Callee::Symbol(n) if !n.is_empty() => {}
+                        _ => e.hard(format!(
+                            "bb{}: tail call's callee has no name ({}), so whose answer is bb{}'s return?",
+                            b.id,
+                            match callee {
+                                Callee::Addr(a) => format!("an address, {a:#x}"),
+                                Callee::Indirect(_) => "a register".to_string(),
+                                _ => "an empty symbol name".to_string(),
+                            },
+                            b.id
+                        )),
+                    },
+                    other => e.hard(format!(
+                        "bb{}: tail return of %{} is defined by {other:?}, not a call: a jmp computes no value",
+                        b.id, v
+                    )),
+                }
+                if dbb != b.id {
+                    e.hard(format!(
+                        "bb{}: tail return of %{} defined in bb{dbb}: the call and the jmp that leaves with it are one instruction",
+                        b.id, v
+                    ));
+                }
+                // The same width claim `Return` makes: the callee answers in RAX
+                // and the caller's declared return type is the width of that cell.
+                if let Some(w) = f.ret_ty.width() {
+                    let bits = w.bits();
+                    if bits < 64 {
+                        let need = crate::width::bits_needed(f, *v);
+                        if need > bits {
+                            e.hard(format!(
+                                "bb{}: tail return %{} needs {need} bits, more than the declared {} return type holds",
+                                b.id, v, f.ret_ty
+                            ));
+                        }
+                    }
+                }
+            }
+            // A noreturn exit is a claim that the block's last act was a call to a
+            // callee that never returns. If the block's last instruction is not a
+            // call, the terminator invented the shape: refuse to certify it.
+            Terminator::NoReturn => match b.instrs.last() {
+                Some(i) if matches!(i.op, Op::Call { .. }) => {}
+                Some(i) => e.hard(format!(
+                    "bb{}: noreturn exit after {:?}, not after a call",
+                    b.id, i.op
+                )),
+                None => e.hard(format!(
+                    "bb{}: noreturn exit with no instruction at all",
+                    b.id
+                )),
+            },
             Terminator::Switch { index, targets } => {
                 // The index is read by the dispatch, so it must be a value this
                 // function defines (or a parameter): an undefined selector means

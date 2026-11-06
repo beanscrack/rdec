@@ -344,7 +344,9 @@ pub fn cmd_objdump_check(args: &[String]) -> Result<i32, String> {
 /// starts are the failure mode, because a function we never reach is a function
 /// we cannot decompile.
 pub fn cmd_discover(args: &[String]) -> Result<i32, String> {
-    use rdec_arch_x86::discover::{discover_all_with_tables, jump_tables, overlap_free, Code, Gap};
+    use rdec_arch_x86::discover::{
+        discover_all_with_container, jump_tables, overlap_free, Code, Gap,
+    };
     use std::collections::HashMap;
 
     const TAKES_VALUE: [&str; 2] = ["--limit", "--syntax"];
@@ -468,7 +470,14 @@ pub fn cmd_discover(args: &[String]) -> Result<i32, String> {
         let tables = jump_tables(&obj, &|sec: usize| {
             idx_of.get(&sec).copied().map(|r| base_of[r])
         });
-        let plan = discover_all_with_tables(&ranges, &seeds, &tables);
+        // A direct call's target is the relocation at its displacement, not the
+        // immediate the bytes hold: the same evidence the jump tables above are
+        // built from, and the reason a call site seeds the CALLEE's address and
+        // not an invented start in the middle of the caller.
+        let disp = rdec_arch_x86::discover::displacements(&obj, &|sec: usize| {
+            idx_of.get(&sec).copied().map(|r| base_of[r])
+        });
+        let plan = discover_all_with_container(&ranges, &seeds, &tables, &disp);
         let truth_n = truth.len();
         let missing: Vec<u64> = truth
             .iter()
@@ -579,6 +588,9 @@ pub fn cmd_discover(args: &[String]) -> Result<i32, String> {
                 Gap::IndirectBranch => "indirect branch",
                 Gap::PartialTable => "indirect jump over a partially-resolved table",
                 Gap::IndirectCall => "indirect call",
+                Gap::ExternalCall => {
+                    "call to a symbol this object does not define (an import: the name is known, the code is not)"
+                }
                 Gap::Undecodable => "undecodable",
                 Gap::OutsideCode => "outside code",
             };
@@ -651,7 +663,7 @@ pub fn cmd_discover(args: &[String]) -> Result<i32, String> {
 }
 
 pub fn cmd_lift(args: &[String]) -> Result<i32, String> {
-    use rdec_arch_x86::discover::{discover_all, Code};
+    use rdec_arch_x86::discover::Code;
     use rdec_arch_x86::lift::lift_one;
     use rdec_core::fmt_ir::format_function;
     use rdec_core::verify::verify_ssa;
@@ -728,6 +740,14 @@ pub fn cmd_lift(args: &[String]) -> Result<i32, String> {
     let mut call_reloc_unresolved = 0usize;
     let mut rip_named = 0usize;
     let mut unreach_total = 0usize;
+    // The tail-call / noreturn census (see `m4::tail_line`). This gate lifts with
+    // `lift_one`, which has no relocation map, so a `jmp`'s target is its
+    // immediate and every one of these is 0 by construction here — the census
+    // with the map in hand is `rdec c --corpus`'s.
+    let mut tail_total = 0usize;
+    let mut tail_unnamed_total = 0usize;
+    let mut noreturn_total = 0usize;
+    let mut past_ended_total = 0usize;
     let mut undef_live = 0usize;
     let mut scaffolding = 0usize;
     let mut ret_w32 = 0usize;
@@ -793,7 +813,17 @@ pub fn cmd_lift(args: &[String]) -> Result<i32, String> {
                 }
             }
         }
-        let plan = discover_all(&ranges, &seeds);
+        // See `cmd_discover`: a direct call seeds the symbol its displacement
+        // names, which is the callee, not the address its immediate spells.
+        let disp = rdec_arch_x86::discover::displacements(&obj, &|sec: usize| {
+            idx_of.get(&sec).copied().map(|r| base_of[r])
+        });
+        let plan = rdec_arch_x86::discover::discover_all_with_container(
+            &ranges,
+            &seeds,
+            &rdec_arch_x86::discover::Tables::default(),
+            &disp,
+        );
 
         // Addresses we can name: defined symbols, and relocation targets (the
         // callee of a call, which is what a call target needs to compile).
@@ -850,6 +880,10 @@ pub fn cmd_lift(args: &[String]) -> Result<i32, String> {
             call_reloc_unresolved += rep.calls_reloc_external + rep.calls_reloc_absent;
             rip_named += rep.rip_named;
             unreach_total += rep.unreachable_blocks;
+            tail_total += rep.tail_calls;
+            tail_unnamed_total += rep.tail_calls_unnamed;
+            noreturn_total += rep.noreturn_calls;
+            past_ended_total += rep.bytes_past_ended_block;
             undef_live += rep.undef_live_ins;
             scaffolding += rep.scaffolding_removed;
             ret_w32 += rep.ret_w32;
@@ -930,6 +964,9 @@ pub fn cmd_lift(args: &[String]) -> Result<i32, String> {
     );
     println!(
         "relocs: {relocs_parsed} parsed | call targets resolved {call_reloc_resolved} | unresolved {call_reloc_unresolved} | rip-relative addresses named {rip_named}  (this gate lifts with `lift_one`: no relocation map, so resolution is 0 by construction - `rdec c`/`rdec cpp` run the same pipeline with the map)"
+    );
+    println!(
+        "tail calls: {tail_total} modelled | {tail_unnamed_total} with no callable callee | noreturn calls: {noreturn_total} | {past_ended_total} instructions not lifted (their block's terminator left the function)  (same reason: no relocation map here, so 0 by construction)"
     );
     println!(
         "evidence: {gap_total} loud gaps, {exit_total} Exit terminators, {unnamed_total} unnamed call targets, {clobber_total} modelled register clobbers, {unreach_total} unreachable blocks dropped, {scaffolding} live-in placeholders resolved, {undef_live} of them `undef` (the ABI question), {self_idioms} register self-idioms translated as machine-code facts (`xor/sub r,r` write 0 without reading the register; `and/or r,r` write it back)"

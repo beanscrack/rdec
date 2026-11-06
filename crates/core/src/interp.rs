@@ -19,7 +19,7 @@
 
 use crate::ir::*;
 use crate::ty::{FWidth, Sx, Ty, Width};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// A runtime value. `Int` always holds the value truncated/extended to the
 /// width its IR type says it has.
@@ -244,6 +244,11 @@ pub enum Fault {
     /// A real recursion is a fact about the program; a runaway is a bug in the
     /// model, and both answer the same way: stop, say which.
     CallDepth,
+    /// The function ended in a call to a callee that never returns
+    /// (`Terminator::NoReturn`). There is no answer to give: the machine code
+    /// killed the process (or unwound) at that call. A fault naming the cause,
+    /// never a value conjured out of a register the call destroyed.
+    NoReturn,
     /// A read of a caller-saved register the call destroyed (`Op::Clobber`).
     /// The value is not "0", and a decompiler that answers 0 here turns a
     /// destroyed register into a plausible one.
@@ -399,6 +404,10 @@ pub struct Interp<'a> {
     /// call to a named target then faults (`Fault::UnknownCallee`) instead of
     /// answering a hash.
     program: &'a [Function],
+    /// The `Op::Call` that closes a `Terminator::NoReturn` block (see
+    /// `noreturn_dests`). One question is asked of it: when its callee is not in
+    /// `program`, the run ends at the call itself.
+    noret: HashSet<VId>,
     /// How deep the call graph has been followed in this run.
     depth: usize,
     vals: Vec<Option<Val>>,
@@ -428,6 +437,27 @@ pub fn run(f: &Function, inputs: &[u64]) -> Exec {
     run_budget(f, inputs, DEFAULT_BUDGET)
 }
 
+/// The values defined by the `Op::Call` that closes a `Terminator::NoReturn`
+/// block: the call the front end DECLARED never returns.
+///
+/// One question is asked of this set. `Op::Call` with a callee that is not in
+/// `program` is a hole (`Fault::UnknownCallee`) because the call's ANSWER would
+/// have to be invented. A noreturn call defines no answer — its type is
+/// `Ty::Void`, and control never comes back to read anything it left behind —
+/// so the callee's body cannot change this run's outcome: the run ends at the
+/// call either way. Answering `Fault::NoReturn` there names the cause the IR
+/// already states, where `UnknownCallee` would report a missing function that
+/// the model never needed.
+fn noreturn_dests(f: &Function) -> HashSet<VId> {
+    f.blocks
+        .iter()
+        .filter(|b| matches!(b.term, Terminator::NoReturn))
+        .filter_map(|b| b.instrs.last())
+        .filter(|i| matches!(i.op, Op::Call { .. }))
+        .map(|i| i.dest)
+        .collect()
+}
+
 pub fn run_budget(f: &Function, inputs: &[u64], budget: usize) -> Exec {
     run_program_budget(f, inputs, &[], budget)
 }
@@ -448,6 +478,7 @@ pub fn run_program_budget(
     let mut it = Interp {
         f,
         program,
+        noret: noreturn_dests(f),
         depth: 0,
         vals: vec![None; f.values.len().max(f.next_value as usize) + 16],
         mem: Mem::default(),
@@ -560,9 +591,13 @@ impl<'a> Interp<'a> {
             vec![None; callee.values.len().max(callee.next_value as usize) + 16],
         );
         let saved_prev = self.prev_bb.take();
+        // The callee's own noreturn call sites, not the caller's: the set is a
+        // fact about `self.f`, and `self.f` is about to be the callee.
+        let saved_noret = std::mem::replace(&mut self.noret, noreturn_dests(callee));
         let out = self.exec_entry(args);
         self.f = saved_f;
         self.vals = saved_vals;
+        self.noret = saved_noret;
         self.prev_bb = saved_prev;
         self.depth -= 1;
         match out {
@@ -650,6 +685,26 @@ impl<'a> Interp<'a> {
                         }
                     };
                     return Outcome::Ret(val);
+                }
+                // The machine code left this function through the call that
+                // produced `v`, so the callee's answer IS this function's answer.
+                // The callee ran in this run, executed by the `Op::Call` that
+                // defines `v`: present, its own body ran; absent, that op already
+                // raised `Fault::UnknownCallee` and no value was invented.
+                Terminator::TailReturn(v) => {
+                    let val = match self.fetch_val(v) {
+                        Ok(x) => x,
+                        Err(f) => return Outcome::Fault(f),
+                    };
+                    return Outcome::Ret(val);
+                }
+                // A call that never returns: there is no answer, and the run says
+                // so with a fault naming the cause. Not `Outcome::NoReturn`, which
+                // is the shape "ran out of modelled control flow", and never a
+                // value read out of the register the call destroyed.
+                Terminator::NoReturn => {
+                    self.effects.push(Effect::Exited);
+                    return Outcome::Fault(Fault::NoReturn);
                 }
                 Terminator::Unreachable | Terminator::Exit => {
                     self.effects.push(Effect::Exited);
@@ -907,7 +962,18 @@ impl<'a> Interp<'a> {
                                 }
                             }
                             // Named, and not in the model: a hole, said out loud.
-                            None => return Err(Fault::UnknownCallee),
+                            // The one exception is the call that closes a
+                            // `NoReturn` block: it defines nothing and control
+                            // never comes back, so the callee's absence cannot
+                            // change the answer — there is no answer. The run
+                            // ends at the call, naming that as the cause.
+                            None => {
+                                if self.noret.contains(&dest) {
+                                    self.effects.push(Effect::Exited);
+                                    return Err(Fault::NoReturn);
+                                }
+                                return Err(Fault::UnknownCallee);
+                            }
                         }
                     }
                     // A target outside the object (an import) or through a

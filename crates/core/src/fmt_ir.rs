@@ -126,6 +126,10 @@ pub fn format_term(f: &Function, t: &Terminator) -> String {
         }
         Terminator::Return(v) if *v == NO_VAL => "ret".into(),
         Terminator::Return(v) => format!("ret {}", vname(f, *v)),
+        // The value a tail call answered with, and the call that never returned:
+        // both leave the function through the call, and the IR text says so.
+        Terminator::TailReturn(v) => format!("tail return {}", vname(f, *v)),
+        Terminator::NoReturn => "noreturn".into(),
         Terminator::Unreachable => "unreachable".into(),
         Terminator::Exit => "exit".into(),
     }

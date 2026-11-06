@@ -35,6 +35,12 @@ pub enum Gap {
     /// half-recovered table is reported as half-recovered and not as success.
     PartialTable,
     IndirectCall,
+    /// A direct `call` (or a tail `jmp`) whose displacement carries a relocation
+    /// naming a symbol this object does NOT define: an import. The name is
+    /// evidence and the code is not here, so no bytes are claimed for it. Loud
+    /// and counted, because "the callee is `abort`" is a fact the report should
+    /// state, not a hole the sweep walks past.
+    ExternalCall,
     /// The decoder refused here.
     Undecodable,
     /// A direct branch to an address outside every code range we were given.
@@ -256,6 +262,79 @@ pub fn jump_tables(obj: &Object, base_of: &dyn Fn(usize) -> Option<u64>) -> Tabl
     out
 }
 
+/// One branch site's target, as the container and the bytes together state it.
+enum BranchTarget {
+    /// A relocation on the instruction names a symbol the container defines.
+    Resolved(u64),
+    /// No relocation on the instruction: the immediate is the evidence (an
+    /// intra-section branch the compiler already linked, which is every `jmp` in
+    /// the C and C++ corpora — 65 sites, 0 of them relocated).
+    Immediate(u64),
+    /// A relocation names a symbol the container does not define: an import.
+    External,
+    /// No target at all: an indirect branch.
+    None,
+}
+
+fn container_target(disp: &Displacements, va: u64, len: u64, imm: Option<u64>) -> BranchTarget {
+    // The relocation the INSTRUCTION carries, not "a relocation near the
+    // displacement": the key is the field's address, which the container states
+    // absolutely, so the lookup spans the instruction's own bytes.
+    match disp.range(va..va.saturating_add(len)).next() {
+        Some((_, Some(t))) => BranchTarget::Resolved(*t),
+        Some((_, None)) => BranchTarget::External,
+        None => match imm {
+            Some(t) => BranchTarget::Immediate(t),
+            None => BranchTarget::None,
+        },
+    }
+}
+
+/// What the container's relocations say about each DISPLACEMENT FIELD, keyed by
+/// the field's address in the caller's flat per-object space: the symbol's
+/// address when the object DEFINES the symbol it names, `None` when it names a
+/// symbol it does not (an import).
+pub type Displacements = BTreeMap<u64, Option<u64>>;
+
+/// Every relocation in every code section of `obj`, keyed by the address of the
+/// field it patches. A direct `call`/`jmp` carries exactly one relocation, on its
+/// displacement, so the sweep asks one question of an instruction: *what does the
+/// relocation on this instruction say?* — `disp.range(va..va + len).next()`.
+pub fn displacements(obj: &Object, base_of: &dyn Fn(usize) -> Option<u64>) -> Displacements {
+    let mut out = Displacements::new();
+    for (csi, sec) in obj.sections.iter().enumerate() {
+        if !obj.is_code(csi) {
+            continue;
+        }
+        let Some(cb) = base_of(csi) else { continue };
+        for rl in &sec.relocations {
+            // A displacement's target is named by the REL32 family (the AMD64
+            // `Addr64` relocation is an absolute 8-byte pointer, not a
+            // displacement target - counting it here would seed a function from
+            // a data pointer).
+            if !rl.kind().is_rel32() {
+                continue;
+            }
+            // The target is the NAMED symbol's address, not the immediate: an
+            // unlinked object leaves the next-IP in the displacement, so the
+            // bytes themselves are not evidence of a target.
+            let target = obj.symbol_of(rl.symbol).and_then(|s| {
+                let dsi = s.section?;
+                let b = base_of(dsi)?;
+                Some(b + s.offset)
+            });
+            out.insert(cb + rl.address, target);
+        }
+    }
+    out
+}
+
+/// An empty displacement table: every direct branch is read from its immediate,
+/// which is `discover` exactly. A container with relocations is never empty.
+pub fn no_displacements() -> Displacements {
+    Displacements::new()
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Plan {
     /// Addresses proven to be function entry points (sorted, deduped).
@@ -264,6 +343,11 @@ pub struct Plan {
     pub blocks: Vec<u64>,
     /// Bytes proven to be instructions: (address, length), sorted.
     pub insns: Vec<(u64, usize)>,
+    /// Direct calls and tail jumps whose target came from the CONTAINER'S
+    /// RELOCATIONS rather than from the immediate. The audit number: it is the
+    /// count of branches the object's symbol table resolved, checkable against
+    /// `llvm-objdump -d -r` over the same ranges.
+    pub calls_resolved: usize,
     /// Every direct branch destination inside the code, sorted - including ones
     /// that land *inside* a block the sweep already built, which is why this is
     /// not the same set as `blocks`. A backward `jmp` to the middle of a decoded
@@ -318,18 +402,34 @@ pub fn discover_with_tables(
     call_targets: &[u64],
     tables: &Tables,
 ) -> Plan {
+    discover_with_container(code, entries, call_targets, tables, &no_displacements())
+}
+
+/// The same descent with the CONTAINER'S RELOCATIONS in hand as well, so a
+/// direct `call`/`jmp` is seeded from the symbol its displacement names instead
+/// of from the unrelocated immediate. An empty table is `discover_with_tables`
+/// exactly; every gate that reads a container passes `displacements(obj, ..)`.
+pub fn discover_with_container(
+    code: Code<'_>,
+    entries: &[u64],
+    call_targets: &[u64],
+    tables: &Tables,
+    disp: &Displacements,
+) -> Plan {
     let mut decoded: Decoded = HashMap::new();
-    discover_into(code, entries, call_targets, &mut decoded, tables)
+    discover_into(code, entries, call_targets, &mut decoded, tables, disp)
 }
 
 /// The same descent, claiming into a caller-owned `decoded` map so several
 /// ranges can share one claim set.
+#[allow(clippy::too_many_arguments)]
 pub fn discover_into(
     code: Code<'_>,
     entries: &[u64],
     call_targets: &[u64],
     decoded: &mut Decoded,
     tables: &Tables,
+    disp: &Displacements,
 ) -> Plan {
     let mut plan = Plan::default();
     let mut functions: HashSet<u64> = entries
@@ -421,18 +521,42 @@ pub fn discover_into(
                 break; // the target set is not in the bytes
             }
             if i.is_call {
-                match i.target {
-                    Some(t) if code.contains(t) => {
+                // THE TARGET OF A DIRECT CALL IS THE RELOCATION AT ITS
+                // DISPLACEMENT, NOT THE IMMEDIATE. clang's COFF objects leave the
+                // UNRELOCATED next-IP in a `call`'s rel32 — `call_helper.O0.obj`
+                // has `callq 0x15` at 0x10 with `IMAGE_REL_AMD64_REL32 h` at 0x11,
+                // and `h` is at 0x50 — so seeding a function at `i.target` invents
+                // a start in the middle of the CALLER's body. That phantom start
+                // truncates the caller's extent, and a caller whose extent ends at
+                // its own call has no fall-through successor: it lifts to
+                // `Terminator::Exit`, an unmodelled hole in a function the object
+                // states completely. `82c285f` fixed exactly this for the lifter's
+                // call targets; the same evidence resolves it here. An indirect
+                // call has no displacement, so the table is silent and the
+                // immediate is `None`, which is the `IndirectCall` gap it reported.
+                match container_target(disp, i.va, i.len as u64, i.target) {
+                    BranchTarget::Resolved(t) => {
+                        plan.calls_resolved += 1;
                         functions.insert(t);
                         if known.insert(t) {
                             queue.push_back(t);
                         }
                     }
-                    Some(_) => plan.gaps.push(Site {
+                    BranchTarget::Immediate(t) if code.contains(t) => {
+                        functions.insert(t);
+                        if known.insert(t) {
+                            queue.push_back(t);
+                        }
+                    }
+                    BranchTarget::Immediate(_) => plan.gaps.push(Site {
                         va: i.va,
                         gap: Gap::OutsideCode,
                     }),
-                    None => plan.gaps.push(Site {
+                    BranchTarget::External => plan.gaps.push(Site {
+                        va: i.va,
+                        gap: Gap::ExternalCall,
+                    }),
+                    BranchTarget::None => plan.gaps.push(Site {
                         va: i.va,
                         gap: Gap::IndirectCall,
                     }),
@@ -444,18 +568,37 @@ pub fn discover_into(
                 continue; // a call returns: keep sweeping this block
             }
             if i.is_jmp {
-                match i.target {
-                    Some(t) if code.contains(t) => {
+                // A `jmp` with a relocation is a TAIL CALL: the target is the
+                // named symbol's function, not a block of this one, so it is
+                // seeded as a function start and deliberately NOT recorded as a
+                // target of this function — the CFG's successor list is the edges
+                // this function's own code can take, and a tail call's edge leaves
+                // the program's translation unit. The sweep `break`s below: a tail
+                // call has no fall-through, so the bytes after it are unreachable
+                // from it and stay unclaimed (alignment padding, counted as such).
+                match container_target(disp, i.va, i.len as u64, i.target) {
+                    BranchTarget::Resolved(t) => {
+                        plan.calls_resolved += 1;
+                        functions.insert(t);
+                        if known.insert(t) {
+                            queue.push_back(t);
+                        }
+                    }
+                    BranchTarget::Immediate(t) if code.contains(t) => {
                         targets.insert(t);
                         if known.insert(t) {
                             queue.push_back(t);
                         }
                     }
-                    Some(_) => plan.gaps.push(Site {
+                    BranchTarget::Immediate(_) => plan.gaps.push(Site {
                         va: i.va,
                         gap: Gap::OutsideCode,
                     }),
-                    None => plan.gaps.push(Site {
+                    BranchTarget::External => plan.gaps.push(Site {
+                        va: i.va,
+                        gap: Gap::ExternalCall,
+                    }),
+                    BranchTarget::None => plan.gaps.push(Site {
                         va: i.va,
                         gap: Gap::IndirectBranch,
                     }),
@@ -518,10 +661,22 @@ pub fn discover_all_with_tables(
     seeds: &HashMap<usize, (Vec<u64>, Vec<u64>)>,
     tables: &Tables,
 ) -> Plan {
+    discover_all_with_container(ranges, seeds, tables, &no_displacements())
+}
+
+/// The same merge with the container's relocations, keyed per range. One object's
+/// displacements cover all its ranges (they are keyed by flat address), so this
+/// takes the map for the whole object.
+pub fn discover_all_with_container(
+    ranges: &[Code<'_>],
+    seeds: &HashMap<usize, (Vec<u64>, Vec<u64>)>,
+    tables: &Tables,
+    disp: &Displacements,
+) -> Plan {
     let mut acc = Plan::default();
     for (idx, r) in ranges.iter().enumerate() {
         let (entries, calls) = seeds.get(&idx).cloned().unwrap_or_default();
-        let p = discover_with_tables(*r, &entries, &calls, tables);
+        let p = discover_with_container(*r, &entries, &calls, tables, disp);
         acc.functions.extend(p.functions);
         acc.targets.extend(p.targets);
         acc.blocks.extend(p.blocks);

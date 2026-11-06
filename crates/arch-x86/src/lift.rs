@@ -391,15 +391,69 @@ pub struct FnShape {
 
 /// What a call site knows about one callee: its identity in the generated
 /// translation unit, and its declared shape.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct CalleeSig {
-    /// The C name the pipeline gives this function — the identity `Op::Call`
+    /// The C name the pipeline gives this function - the identity `Op::Call`
     /// records and the emitter declares. Not the COFF name: one C file holds
     /// every function of every object, and `o7_f` is who `f` is there.
     pub cname: String,
     pub abi: FnAbi,
     /// The declared shape is a shape (see `FnShape`).
     pub typed: bool,
+    /// The callee NEVER RETURNS: declared by the front end, from a `noreturn`
+    /// declaration in the source it read, from `lift::noreturn_symbol` for the
+    /// CRT/C++ termination family, or not at all. Nothing in a `call`'s encoding
+    /// says the callee stays away, so this is a claim the front end owns, and the
+    /// lifter models the noreturn shape ONLY when it is set. Marking a returning
+    /// callee noreturn deletes its caller's answer; leaving a noreturn callee
+    /// undeclared leaves the caller's `Exit`, which is loud.
+    pub noreturn: bool,
+}
+
+/// The termination family: symbols whose calls do not return. A NAME TABLE, kept
+/// in one place and auditable, because `noreturn` is a declaration and the table
+/// is the front end's declaration for the C runtime. MSVC decorates (`_abort`,
+/// `_exit`) and decorates C++ (`?terminate@std@@YAXXZ`), so the check strips a
+/// leading `_` and also accepts a decorated name containing one of the stems.
+///
+/// Deliberately NOT in here: `_alloca`/`__chkstk` (they return), `_purecall`
+/// (it calls the terminator; its own contract is not `noreturn`), and
+/// `_longjmp`/`setjmp` (control leaves, but not through the call's own return -
+/// the model has no longjmp, and a block that ends in one is a loud `Exit`).
+pub fn noreturn_symbol(name: &str) -> bool {
+    const PLAIN: &[&str] = &[
+        "abort",
+        "exit",
+        "_exit",
+        "_Exit",
+        "quick_exit",
+        "_c_exit",
+        "_cexit",
+        "__fastfail",
+        "_fastfail",
+        "_CxxThrowException",
+        "__CxxThrowException",
+        "__crt_debugger_hook",
+        "__report_gsfailure",
+        "__report_rangecheckfailure",
+        "_invalid_parameter_noinfo",
+        "_invalid_parameter_noinfo_noreturn",
+        "terminate",
+    ];
+    const STEMS: &[&str] = &[
+        "?terminate@std@@",
+        "?_Xbad_alloc@std@@",
+        "?_Xbad_function_call@std@@",
+        "?_Xlength_error@std@@",
+        "?_Xout_of_range@std@@",
+        "?_Xrange@std@@",
+        "?_Xruntime_error@std@@",
+    ];
+    if STEMS.iter().any(|s| name.contains(s)) {
+        return true;
+    }
+    let bare = name.strip_prefix('_').unwrap_or(name);
+    PLAIN.contains(&bare) || PLAIN.contains(&name)
 }
 
 /// The callees of one object, keyed by the COFF symbol the discovery plan found
@@ -552,12 +606,32 @@ enum Pending {
     Jump(u64),
     Jcc(u64, Cond),
     Ret,
+    /// A TAIL CALL answered: the block's last instruction is the `Op::Call` the
+    /// `jmp` became, and the block ends by leaving the function with THAT call's
+    /// value (`Terminator::TailReturn`). It carries the call's own value, not the
+    /// register read `Pending::Ret` performs: the verifier's rule is that a
+    /// `TailReturn` is defined by a call in the same block, and the bitcast view
+    /// that rule rejects is the one that exists to model a partial write of RAX -
+    /// a tail call writes no register the caller can read, so there is nothing to
+    /// view. The bits are the same cell.
+    TailCall(VId),
+    /// A call to a callee that never returns ended the block: no value, no
+    /// successor (`Terminator::NoReturn`).
+    NoReturn,
     /// An indirect jump/call, or a terminator we do not model.
     OpaqueTerm,
     /// A terminator built on the spot: the switch over a jump table's resolved
     /// targets. `close` installs it as it installs any other, so a block's
     /// terminator is still set in exactly one place.
     Switch(Terminator),
+}
+
+/// Which instruction made this call site: a `call`, which returns, or a `jmp`
+/// whose relocation named the callee, which does not.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Site {
+    Call,
+    Tail,
 }
 
 /// A block: its start, and the (address, length) of each instruction in it.
@@ -721,6 +795,35 @@ pub struct Report {
     /// Table slots whose target is not a block of this function: a counted gap,
     /// because an edge that goes nowhere is worse than a refusal that says so.
     pub jump_table_missing: usize,
+    /// TAIL CALLS modelled: a `jmp` whose relocation names a defined function
+    /// symbol, lifted as `return callee(args);` - a `Call` that defines the
+    /// answer and a `Terminator::TailReturn` that leaves with it. Counted at the
+    /// `jmp`, where the evidence is, beside the call census it belongs to.
+    pub tail_calls: usize,
+    /// A `jmp` that looks like a tail call (a relocation names a symbol) but has
+    /// no callee the pipeline can call: the symbol is not defined here, or the
+    /// front end declared no shape for it. Counted, and the block keeps its
+    /// `Exit` - the verifier refuses the same shape in the IR, so a silent one
+    /// must not be creatable here either.
+    pub tail_calls_unnamed: usize,
+    /// Calls to a callee the front end DECLARED noreturn (`CalleeSig::noreturn`).
+    /// The call defines nothing, the caller-saved registers are destroyed, and
+    /// the block ends in `Terminator::NoReturn`.
+    pub noreturn_calls: usize,
+    /// Those calls BY NAME: the site address and the callee's COFF symbol. A
+    /// function whose IR ends in a noreturn exit has no fall-through answer, so
+    /// the list is the work item; "2 noreturn calls" is not.
+    pub noreturn_sites: Vec<(u64, String)>,
+    /// Instructions the lifter did NOT lift, because the block that holds them
+    /// already ended: after a tail call, after a call the front end declared
+    /// noreturn, and after a call whose callee the object does not define. The
+    /// bytes are inside the function's range — `nr.O0.obj` leaves `int3` + `nop`
+    /// after `callq abort`, and clang leaves `nopw` after a tail `jmp` — so they
+    /// are real bytes the object owns, and the count is the audit that the model
+    /// said "these are not this function's code" out loud. Lifting them is the
+    /// failure mode: `mov eax,0x190; ret` after `call abort` would give the
+    /// function an answer the machine code never produces.
+    pub bytes_past_ended_block: usize,
 }
 
 /// `op reg, reg` where both operands name the SAME register group. Each variant
@@ -788,6 +891,13 @@ pub struct Lifter<'a> {
     /// unattributable.
     at: u64,
     pending: Pending,
+    /// This block's own terminator has ALREADY ended it — a tail call, a call the
+    /// front end declared noreturn, a call to a symbol the object does not define.
+    /// The bytes the block table puts after that instruction are inside the
+    /// function's range (clang leaves `int3` + padding, a tail `jmp` leaves `nopw`)
+    /// and are not this function's code: the lifting loop counts them
+    /// (`Report::bytes_past_ended_block`) and does not lift them. Reset per block.
+    ended_block: bool,
     /// The declared shape this function was lifted under: which parameter
     /// arrives in which register class, and what `ret` answers from. Seeded
     /// from the caller's evidence (a demangled signature), never inferred from
@@ -983,6 +1093,7 @@ impl<'a> Lifter<'a> {
             cur: entry,
             at: addr,
             pending: Pending::Fall,
+            ended_block: false,
             abi: abi.clone(),
             seeded,
             live_in: Vec::new(),
@@ -1422,6 +1533,19 @@ impl<'a> Lifter<'a> {
             }
             Some(v)
         }
+    }
+
+    /// The relocation THIS INSTRUCTION carries, by scanning its own bytes: a
+    /// direct branch has exactly one, on its displacement, and the address of
+    /// that field is what the container records. Scanning the instruction's span
+    /// (instead of guessing the encoding width) is what keeps a `jmp rel8` and a
+    /// `jmp rel32` the same question, and returns a copy so the caller can mutate
+    /// `self` while holding it.
+    fn reloc_on(&self, ins: &Instruction) -> Option<RelocTarget> {
+        let a = self.addr();
+        (0..ins.len() as u64)
+            .find_map(|k| self.relocs.get(&(a + k)))
+            .cloned()
     }
 
     /// The symbol named by the RIP-relative relocation on this instruction,
@@ -2638,6 +2762,56 @@ impl<'a> Lifter<'a> {
                     self.pending = Pending::OpaqueTerm;
                     return;
                 }
+                // A DIRECT `jmp`. In an unlinked object its target is the
+                // relocation at the displacement, not the immediate the bytes
+                // hold: `tc.O2.obj` has `jmp 0x17` at 0x12 - 0x17 is the
+                // unrelocated next-IP - with `IMAGE_REL_AMD64_REL32 g` at 0x13,
+                // and `llvm-nm` says `T g` at 0x0. A relocation naming a DEFINED
+                // function symbol is a TAIL CALL: the callee gets the argument
+                // registers the caller already filled per the pair rule, its
+                // answer is the caller's answer, and control never comes back -
+                // `return callee(args);`. A `jmp` with NO relocation keeps its
+                // immediate as the evidence, which is every `jmp` in the corpus:
+                // 65 sites, 0 of them relocated, every one a loop back edge or an
+                // if/else join inside the function that holds it.
+                if let Some(rt) = self.reloc_on(ins) {
+                    let callee = rt.addr.and_then(|a| match self.names.get(&a) {
+                        Some(raw) => self.sigs.get(raw).map(|s| (a, raw.clone(), s.noreturn)),
+                        None => None,
+                    });
+                    match callee {
+                        Some((_, _, true)) => {
+                            // `jmp abort`: control leaves the function through a
+                            // callee that never returns. No value, no fall-through.
+                            let sym = rt.sym;
+                            self.noreturn_site(ins, &sym);
+                        }
+                        Some((a, _, false)) => {
+                            if self.bb_of.contains_key(&a) {
+                                // The named address is a block of THIS function:
+                                // control flow inside it, not a call.
+                                self.pending = Pending::Jump(a);
+                            } else {
+                                self.emit_call_site(ins, a, Site::Tail);
+                            }
+                        }
+                        // A `jmp` whose relocation names a symbol with no address
+                        // (an import) or no declared shape: the name is evidence,
+                        // the callee is not callable, and the `Exit` stays.
+                        None => {
+                            self.rep.tail_calls_unnamed += 1;
+                            self.gap(
+                                &format!(
+                                    "tail call to '{}': the object gives no callable callee for the symbol the relocation named",
+                                    rt.sym
+                                ),
+                                Ty::Void,
+                            );
+                            self.pending = Pending::OpaqueTerm;
+                        }
+                    }
+                    return;
+                }
                 match self.target(ins) {
                     Some(t) => self.pending = Pending::Jump(t),
                     None => {
@@ -2689,113 +2863,39 @@ impl<'a> Lifter<'a> {
                     }
                     _ => t,
                 };
-                // More register arguments than the model has pairs (Windows x64
-                // has four): the 5th+ argument lives on the stack, unmodelled.
-                let over_args = ins.op_count() > 1;
-                if over_args {
-                    self.gap("call with more than four register arguments", Ty::i64());
-                    self.rep.calls_over_args += 1;
+                // A call to a callee the front end DECLARED noreturn ends the
+                // block. `nr.O0.obj` is the ground truth: `callq` at 0x49 with
+                // `IMAGE_REL_AMD64_REL32 abort` at 0x4a, and 0x4e is `int3` - not
+                // the caller's code. The name comes from the RELOCATION, which is
+                // also the only name an import has.
+                if let Some(rt) = self.reloc_on(ins) {
+                    if self.sigs.get(rt.sym.as_str()).is_some_and(|s| s.noreturn) {
+                        let sym = rt.sym;
+                        self.noreturn_site(ins, &sym);
+                        return;
+                    }
+                    // The relocation names a symbol this object does NOT define
+                    // (`U abort` in `llvm-nm`): an import. There is no address for
+                    // the callee, so the address-keyed lookup that gives a call its
+                    // declared shape is silent, and the call defines no answer -
+                    // the model does not answer a value whose callee it cannot see.
+                    // The block then ENDS: the pipeline has no body for the callee,
+                    // so it cannot certify that control comes back to the next
+                    // instruction at all (the same bytes can be `printf` or `abort`,
+                    // and the object does not say which). The `Exit` is the loud
+                    // shape - the same shape the tail-call arm gives a `jmp` whose
+                    // symbol has no callable callee, and for the same reason: the
+                    // relocation is a name, not a callee. What is NOT done here is
+                    // a noreturn model: `noreturn` is a declaration
+                    // (`CalleeSig::noreturn`), and an undeclared callee keeps the
+                    // gap and the `Exit` rather than an invented end-of-function.
+                    if rt.addr.is_none() {
+                        let sym = rt.sym;
+                        self.import_site(ins, &sym);
+                        return;
+                    }
                 }
-                let sig = self.names.get(&t).and_then(|r| self.sigs.get(r));
-                // The callee's declared return type decides what the call defines.
-                let typed_call = sig.is_some() && sig.unwrap().typed && !over_args;
-                let ret_ty = if typed_call {
-                    match sig.unwrap().abi.ret {
-                        RetKind::Int => Ty::i64(),
-                        RetKind::F32 => Ty::f32(),
-                        RetKind::F64 => Ty::f64(),
-                    }
-                } else {
-                    Ty::i64()
-                };
-                // The arguments are the CALLER's cells for the pairs the CALLEE's
-                // declared shape occupies — the same `seeded_pairs` rule that seeds
-                // the callee's parameters, so a declared float argument goes in the
-                // XMM cell the callee reads, not the integer register. A call we
-                // cannot type keeps the integer model's four-integer-register
-                // spelling, because that is the shape it has always had.
-                let pairs: Vec<Grp> = match sig {
-                    Some(s) if s.typed && !over_args => {
-                        s.abi.seeded_pairs().into_iter().map(|(g, _)| g).collect()
-                    }
-                    _ => ARG_REGS.to_vec(),
-                };
-                let mut args: Vec<VId> = Vec::with_capacity(pairs.len());
-                for g in pairs {
-                    let a = self.read64(g);
-                    args.push(a);
-                }
-                let callee = match sig {
-                    Some(s) => Callee::Symbol(s.cname.clone()),
-                    None => {
-                        self.rep.unnamed_calls += 1;
-                        self.rep.calls_no_symbol += 1;
-                        Callee::Addr(t)
-                    }
-                };
-                if sig.is_some() && !typed_call {
-                    // Identity known, signature not: the answer is not known, so
-                    // the call defines nothing (RAX stays clobbered below) and the
-                    // caller that uses the answer is refused, as it always was.
-                    self.rep.calls_untypable += 1;
-                }
-                let v = self.f.new_value(ret_ty.clone());
-                let a = self.addr();
-                self.f.block_mut(self.cur).push(Instr::new(
-                    v,
-                    Op::Call {
-                        callee,
-                        ret_ty: ret_ty.clone(),
-                        args: args.into_boxed_slice(),
-                        pure: false,
-                    },
-                    ret_ty.clone(),
-                    a,
-                ));
-                // The callee's answer lands where its declared return type says:
-                // RAX for an integer, XMM0's cell for a float. The W64 view of a
-                // float answer is a BITCAST (the cell holds the bits — converting
-                // here would answer a different number), and the `float` case zexts
-                // the low 32 bits, which is the Windows x64 rule that the upper
-                // half of XMM0 is zeroed after a `float` return — the same rule the
-                // `cvtsi2ss` / `movss` paths follow.
-                if typed_call {
-                    match sig.unwrap().abi.ret {
-                        RetKind::Int => {
-                            let view = self.cast(CastKind::Bitcast, v, Width::W64);
-                            self.set_reg(Grp::Rax, view);
-                        }
-                        RetKind::F64 => {
-                            let view = self.cast(CastKind::Bitcast, v, Width::W64);
-                            self.set_reg(Grp::Xmm(0), view);
-                        }
-                        RetKind::F32 => {
-                            let low = self.cast(CastKind::Bitcast, v, Width::W32);
-                            let wide = self.cast(CastKind::ZExt, low, Width::W64);
-                            self.set_reg(Grp::Xmm(0), wide);
-                        }
-                    }
-                    self.rep.calls_modelled += 1;
-                } else {
-                    // RAX is an unsigned W64 register value; `Op::Call`'s type is
-                    // its own declared return type, so the register reads the same
-                    // bits as unsigned. Without the view, any later partial write
-                    // of RAX reports the signed/unsigned mismatch the verifier
-                    // flags for a param.
-                    let view = self.cast(CastKind::Bitcast, v, Width::W64);
-                    self.set_reg(Grp::Rax, view);
-                }
-                // Caller-saved registers are gone. Modelled, loudly, per register
-                // — except the one this call DEFINES, whose value the call wrote.
-                self.clobber_all(if typed_call {
-                    match sig.unwrap().abi.ret {
-                        RetKind::Int => Some(Grp::Rax),
-                        RetKind::F32 | RetKind::F64 => Some(Grp::Xmm(0)),
-                    }
-                } else {
-                    None
-                });
-                self.clear_flags();
+                self.emit_call_site(ins, t, Site::Call);
             }
             Mnemonic::Ret => {
                 // A float/double answer leaves in XMM0. Counted at the `ret`,
@@ -2936,6 +3036,7 @@ impl<'a> Lifter<'a> {
             };
             self.cur = id;
             self.pending = Pending::Fall;
+            self.ended_block = false;
             if i > 0 {
                 // Each block starts with an EMPTY register map. Carrying the map
                 // over in address order (the first version) is what produced
@@ -2962,6 +3063,21 @@ impl<'a> Lifter<'a> {
                 }
             }
             for (va, len) in b.insns.iter() {
+                if self.ended_block {
+                    // This block's terminator already left the function (tail
+                    // call, noreturn call, call to a symbol the object does not
+                    // define). The bytes the block table put after it are padding
+                    // or the next codelet, not this function's code: count them,
+                    // say so, and do not lift them. Lifting `mov eax,0x190; ret`
+                    // after `call abort` is the silent half-truth this guard
+                    // exists to refuse.
+                    self.rep.bytes_past_ended_block += 1;
+                    eprintln!(
+                        "bytes past the end of bb{id} in {}: instruction at {va:#x} not lifted (the block's terminator left the function)",
+                        self.f.name
+                    );
+                    continue;
+                }
                 self.at = *va;
                 let off = (*va).saturating_sub(base) as usize;
                 if off + *len > bytes.len() {
@@ -3401,7 +3517,282 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// A block's terminator, from what its last instruction said.
+    /// Emit one call SITE. `Site::Call` is a `call`: the callee's answer is
+    /// defined, the caller-saved registers are destroyed, and the NEXT
+    /// instruction runs. `Site::Tail` is a `jmp` whose relocation named this
+    /// callee: the same arguments, the same destroyed registers, the same answer,
+    /// and no next instruction - the block ends by leaving the function with that
+    /// answer. One body for both, because the machine gives a tail call the same
+    /// registers a call gets; only the successor differs, and that difference is
+    /// the `site` at the end.
+    fn emit_call_site(&mut self, ins: &Instruction, t: u64, site: Site) {
+        // More register arguments than the model has pairs (Windows x64
+        // has four): the 5th+ argument lives on the stack, unmodelled.
+        let over_args = ins.op_count() > 1;
+        if over_args {
+            self.gap("call with more than four register arguments", Ty::i64());
+            self.rep.calls_over_args += 1;
+        }
+        let sig = self.names.get(&t).and_then(|r| self.sigs.get(r));
+        // The callee's declared return type decides what the call defines.
+        let typed_call = sig.is_some() && sig.unwrap().typed && !over_args;
+        // A TAIL CALL must name a callee the pipeline can call: the `jmp` leaves the
+        // function with the call's value, so an unnamed or untyped callee has no
+        // answer to leave with. Refuse at the `jmp`, keep the `Exit`, and COUNT it
+        // - the verifier refuses the same shape in the IR, so a silent one must
+        // not be creatable here either.
+        if site == Site::Tail && !(sig.is_some() && typed_call) {
+            self.rep.tail_calls_unnamed += 1;
+            let nm = self.reloc_on(ins).map(|rt| rt.sym).unwrap_or_default();
+            self.gap(
+                &format!("tail call to '{nm}': no callee the pipeline can call and return through"),
+                Ty::Void,
+            );
+            self.pending = Pending::OpaqueTerm;
+            self.ended_block = true;
+            return;
+        }
+        let ret_ty = if typed_call {
+            match sig.unwrap().abi.ret {
+                RetKind::Int => Ty::i64(),
+                RetKind::F32 => Ty::f32(),
+                RetKind::F64 => Ty::f64(),
+            }
+        } else {
+            Ty::i64()
+        };
+        // The arguments are the CALLER's cells for the pairs the CALLEE's
+        // declared shape occupies — the same `seeded_pairs` rule that seeds
+        // the callee's parameters, so a declared float argument goes in the
+        // XMM cell the callee reads, not the integer register. A call we
+        // cannot type keeps the integer model's four-integer-register
+        // spelling, because that is the shape it has always had.
+        let pairs: Vec<Grp> = match sig {
+            Some(s) if s.typed && !over_args => {
+                s.abi.seeded_pairs().into_iter().map(|(g, _)| g).collect()
+            }
+            _ => ARG_REGS.to_vec(),
+        };
+        let mut args: Vec<VId> = Vec::with_capacity(pairs.len());
+        for g in pairs {
+            let a = self.read64(g);
+            args.push(a);
+        }
+        let callee = match sig {
+            Some(s) => Callee::Symbol(s.cname.clone()),
+            None => {
+                self.rep.unnamed_calls += 1;
+                self.rep.calls_no_symbol += 1;
+                Callee::Addr(t)
+            }
+        };
+        if sig.is_some() && !typed_call {
+            // Identity known, signature not: the answer is not known, so
+            // the call defines nothing (RAX stays clobbered below) and the
+            // caller that uses the answer is refused, as it always was.
+            self.rep.calls_untypable += 1;
+        }
+        let v = self.f.new_value(ret_ty.clone());
+        let a = self.addr();
+        self.f.block_mut(self.cur).push(Instr::new(
+            v,
+            Op::Call {
+                callee,
+                ret_ty: ret_ty.clone(),
+                args: args.into_boxed_slice(),
+                pure: false,
+            },
+            ret_ty.clone(),
+            a,
+        ));
+        // The callee's answer lands where its declared return type says:
+        // RAX for an integer, XMM0's cell for a float. The W64 view of a
+        // float answer is a BITCAST (the cell holds the bits — converting
+        // here would answer a different number), and the `float` case zexts
+        // the low 32 bits, which is the Windows x64 rule that the upper
+        // half of XMM0 is zeroed after a `float` return — the same rule the
+        // `cvtsi2ss` / `movss` paths follow.
+        if typed_call {
+            match sig.unwrap().abi.ret {
+                RetKind::Int => {
+                    let view = self.cast(CastKind::Bitcast, v, Width::W64);
+                    self.set_reg(Grp::Rax, view);
+                }
+                RetKind::F64 => {
+                    let view = self.cast(CastKind::Bitcast, v, Width::W64);
+                    self.set_reg(Grp::Xmm(0), view);
+                }
+                RetKind::F32 => {
+                    let low = self.cast(CastKind::Bitcast, v, Width::W32);
+                    let wide = self.cast(CastKind::ZExt, low, Width::W64);
+                    self.set_reg(Grp::Xmm(0), wide);
+                }
+            }
+            match site {
+                Site::Call => self.rep.calls_modelled += 1,
+                Site::Tail => self.rep.tail_calls += 1,
+            }
+        } else {
+            // RAX is an unsigned W64 register value; `Op::Call`'s type is
+            // its own declared return type, so the register reads the same
+            // bits as unsigned. Without the view, any later partial write
+            // of RAX reports the signed/unsigned mismatch the verifier
+            // flags for a param.
+            let view = self.cast(CastKind::Bitcast, v, Width::W64);
+            self.set_reg(Grp::Rax, view);
+        }
+        // Caller-saved registers are gone. Modelled, loudly, per register
+        // — except the one this call DEFINES, whose value the call wrote.
+        self.clobber_all(if typed_call {
+            match sig.unwrap().abi.ret {
+                RetKind::Int => Some(Grp::Rax),
+                RetKind::F32 | RetKind::F64 => Some(Grp::Xmm(0)),
+            }
+        } else {
+            None
+        });
+        // The tail call's own ending: the block leaves the function with the
+        // value this call defined, and there is NO fall-through successor.
+        self.clear_flags();
+        if site == Site::Tail {
+            self.pending = Pending::TailCall(v);
+            // `return callee(args);` — the function left through this call, so
+            // the bytes after the `jmp` (clang's `nopw` padding) are not its code.
+            self.ended_block = true;
+        }
+    }
+
+    /// A call to a callee the front end DECLARED noreturn
+    /// (`CalleeSig::noreturn`). The call DEFINES NOTHING - there is no answer,
+    /// because control does not come back - the caller's scratch registers are
+    /// destroyed as at any call, and the block ENDS: the code after the call is
+    /// unreachable from it, and the function has no fall-through return.
+    ///
+    /// The callee's identity is the symbol the RELOCATION named. An import is
+    /// `U` in `llvm-nm`: the object has no address for it, so the address table
+    /// is silent and the relocation is the only name there is.
+    fn noreturn_site(&mut self, ins: &Instruction, sym: &str) {
+        let cname = self
+            .sigs
+            .get(sym)
+            .map(|s| s.cname.clone())
+            .unwrap_or_else(|| sym.to_string());
+        if ins.op_count() > 1 {
+            self.gap("call with more than four register arguments", Ty::i64());
+            self.rep.calls_over_args += 1;
+        }
+        let pairs: Vec<Grp> = match self.sigs.get(sym) {
+            Some(s) if s.typed && ins.op_count() <= 1 => {
+                s.abi.seeded_pairs().into_iter().map(|(g, _)| g).collect()
+            }
+            _ => ARG_REGS.to_vec(),
+        };
+        let mut args: Vec<VId> = Vec::with_capacity(pairs.len());
+        for g in pairs {
+            let a = self.read64(g);
+            args.push(a);
+        }
+        let at = self.addr();
+        let v = self.f.new_value(Ty::Void);
+        self.f.block_mut(self.cur).push(Instr::new(
+            v,
+            Op::Call {
+                callee: Callee::Symbol(cname),
+                ret_ty: Ty::Void,
+                args: args.into_boxed_slice(),
+                pure: false,
+            },
+            Ty::Void,
+            at,
+        ));
+        // Every caller-saved register is destroyed and NOTHING is defined:
+        // `clobber_all(None)` is the shape of a call that answers nothing.
+        self.clobber_all(None);
+        self.clear_flags();
+        self.rep.noreturn_calls += 1;
+        self.rep.noreturn_sites.push((at, sym.to_string()));
+        self.pending = Pending::NoReturn;
+        // The call IS the end of the block: what follows it in the function's
+        // range (`int3` + padding in `nr.O0.obj`) is not this function's code.
+        self.ended_block = true;
+    }
+
+    /// A call whose RELOCATION names a symbol this object does not define: an
+    /// import, `U` in `llvm-nm`. The name is the object's evidence and it is all
+    /// the object gives, so this is the loud call shape and nothing more:
+    ///
+    /// * the callee is the NAMED symbol (`Callee::Symbol`), because the
+    ///   relocation states the identity — the address-keyed shape lookup that
+    ///   gives a call its declared signature is silent for a callee with no
+    ///   address here, so there is no declared return kind and the call
+    ///   DEFINES NOTHING (`Ty::Void`). A model that answered `int64_t` here
+    ///   would be answering for a function body it has never seen.
+    /// * the caller-saved registers are destroyed as at any call
+    ///   (`clobber_all(None)`) and the flags with them;
+    /// * the counted gap says which symbol, in the report and in the IR
+    ///   (`Op::Opaque`), so the refusal class is `rdec c`'s census, not a
+    ///   comment;
+    /// * the block ENDS in `Terminator::Exit`: the model cannot certify that
+    ///   control comes back from a callee it cannot see. This is the shape the
+    ///   corpus has always given an unmodellable terminator — counted in
+    ///   `rep.exits`, refused by the emitter as `unmodelled control flow
+    ///   (Exit)`, excluded from T2's runnable set.
+    ///
+    /// The census `calls_reloc_external` already counted this site at
+    /// `resolve_reloc_target`, which is where the container's answer is read.
+    fn import_site(&mut self, ins: &Instruction, sym: &str) {
+        let cname = self
+            .sigs
+            .get(sym)
+            .map(|s| s.cname.clone())
+            .unwrap_or_else(|| sym.to_string());
+        if ins.op_count() > 1 {
+            self.gap("call with more than four register arguments", Ty::i64());
+            self.rep.calls_over_args += 1;
+        }
+        let pairs: Vec<Grp> = match self.sigs.get(sym) {
+            Some(s) if s.typed && ins.op_count() <= 1 => {
+                s.abi.seeded_pairs().into_iter().map(|(g, _)| g).collect()
+            }
+            _ => ARG_REGS.to_vec(),
+        };
+        let mut args: Vec<VId> = Vec::with_capacity(pairs.len());
+        for g in pairs {
+            let a = self.read64(g);
+            args.push(a);
+        }
+        let at = self.addr();
+        let v = self.f.new_value(Ty::Void);
+        self.f.block_mut(self.cur).push(Instr::new(
+            v,
+            Op::Call {
+                callee: Callee::Symbol(cname),
+                ret_ty: Ty::Void,
+                args: args.into_boxed_slice(),
+                pure: false,
+            },
+            Ty::Void,
+            at,
+        ));
+        self.rep.calls_untypable += 1;
+        self.gap(
+            &format!(
+                "call to '{sym}': the relocation names a symbol this object does not define, so there is no callee to call and no answer to define"
+            ),
+            Ty::Void,
+        );
+        self.clobber_all(None);
+        self.clear_flags();
+        self.pending = Pending::OpaqueTerm;
+        // The block ends at the call: the model cannot name what comes after a
+        // callee it cannot see, and the bytes are not this function's to run.
+        self.ended_block = true;
+    }
+
+    /// A block's terminator, from what its last instruction said: the `Pending`
+    /// its final instruction left behind says which exit the block takes, and a
+    /// block whose pending is `Fall` falls through to the next block in the table
+    /// or, when there is none, ends the function with an `Exit`.
     fn close(&mut self, i: usize) {
         let fall = self
             .order
@@ -3415,6 +3806,29 @@ impl<'a> Lifter<'a> {
                     Terminator::Exit
                 }
             },
+            // The value the function answers with, in the register its declared
+            // return kind says carries it. Shared with `Pending::TailCall`: the
+            // callee put its answer in RAX (or XMM0) FOR THE CALLER, which is what
+            // makes `return callee(args);` the same control flow the `jmp` is.
+            // A TAIL CALL answers the function with the CALL's own value and
+            // leaves no fall-through edge: `return callee(args);`. The value is
+            // the `Op::Call` result, not the register read - the verifier's rule
+            // is that a `TailReturn` is defined by a call in the same block, and
+            // the bitcast view `Pending::Ret` reads is not a call. The bits are
+            // the same: the view exists to model a partial write of the register,
+            // and a tail call writes none.
+            Pending::TailCall(v) => {
+                match self.abi.ret {
+                    RetKind::F32 => self.rep.ret_f32 += 1,
+                    RetKind::F64 => self.rep.ret_f64 += 1,
+                    RetKind::Int => {}
+                }
+                Terminator::TailReturn(v)
+            }
+            // The call never returned, so nothing after it runs and the function
+            // has no fall-through answer. `rep.noreturn_calls` counted it and
+            // `rep.noreturn_sites` names the callee.
+            Pending::NoReturn => Terminator::NoReturn,
             Pending::Ret => match self.abi.ret {
                 RetKind::Int => {
                     let r = self.read64(Grp::Rax);
@@ -3643,11 +4057,12 @@ fn rewrite_flags(f: &mut FlagsOp, old: VId, new: VId) {
 
 fn rewrite_term(t: &mut Terminator, old: VId, new: VId) {
     match t {
-        Terminator::Return(v) => *v = map(*v, old, new),
+        Terminator::Return(v) | Terminator::TailReturn(v) => *v = map(*v, old, new),
         Terminator::Branch { cond, .. } => *cond = map(*cond, old, new),
         // A switch's index is a value like any other, and SSA rewriting rewrites
         // it: the destinations are blocks, not values, so they are untouched.
         Terminator::Switch { index, .. } => *index = map(*index, old, new),
-        Terminator::Jump(_) | Terminator::Unreachable | Terminator::Exit => {}
+        Terminator::Jump(_) | Terminator::Unreachable | Terminator::Exit | Terminator::NoReturn => {
+        }
     }
 }

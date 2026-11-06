@@ -125,6 +125,8 @@ pub fn emit_c_sig(f: &Function, protos: &Protos) -> Result<Out, Vec<Refusal>> {
     let mut e = Emitter {
         f,
         protos,
+        tail: crate::ir::NO_VAL,
+        noret: false,
         ret: ret.clone(),
         body: String::new(),
         externs: Vec::new(),
@@ -151,6 +153,18 @@ struct Emitter<'a> {
     f: &'a Function,
     /// The declared shape of every callee this pipeline can name.
     protos: &'a Protos,
+    /// The value this block's `TailReturn` returns, when the block ends in a
+    /// tail call. Its defining `Op::Call` is then folded INTO the return
+    /// (`return callee(args);`) instead of getting an assignment of its own, so
+    /// the C says the one thing the machine code did. Set per block by the block
+    /// loop; `NO_VAL` in every block that does not end in a tail call.
+    tail: u32,
+    /// This block ends in `Terminator::NoReturn`, so the call that closes it is
+    /// the function's last statement: its site address goes on the line above
+    /// (`Emitter::instr`), which leaves `abort(...);` standing as the statement
+    /// the machine code executed. `false` in every other block, so no ordinary
+    /// statement changes its spelling.
+    noret: bool,
     /// The C spelling of `f.ret_ty`: the function's declared return type, which
     /// the `return` statement casts through (see `term`).
     ret: String,
@@ -284,10 +298,28 @@ impl<'a> Emitter<'a> {
         }
         let _ = writeln!(self.body);
 
+        // A tail call's `Op::Call` is folded into the `return` that ends its
+        // block (see `Emitter::tail`): no declaration, no assignment statement.
+        // `x12 = g(...); return (int64_t)x12;` is two statements where the machine
+        // code has one, and the local it declares is `set but not used` under
+        // `-Werror`.
+        let folded: std::collections::HashSet<u32> = self
+            .f
+            .blocks
+            .iter()
+            .filter_map(|b| match b.term {
+                Terminator::TailReturn(v) if self.tail_foldable(b.id, v) => Some(v),
+                _ => None,
+            })
+            .collect();
+
         // Locals for every value, in definition order, so the text reads like the
         // machine code it came from.
         for b in &self.f.blocks {
             for i in &b.instrs {
+                if folded.contains(&i.dest) {
+                    continue;
+                }
                 let ty = i.op.ty(self.f).unwrap_or(i.ty.clone());
                 // A store has a destination in the IR (so the verifier can track
                 // it) and no value in C: declaring `void x12;` is a clang error,
@@ -315,7 +347,18 @@ impl<'a> Emitter<'a> {
 
         for b in &self.f.blocks {
             let _ = writeln!(self.body, "l{}: /* at {:#x} */", b.id, b.addr);
+            self.tail = match b.term {
+                Terminator::TailReturn(v) if folded.contains(&v) => v,
+                _ => crate::ir::NO_VAL,
+            };
+            // The block's last act is a call that never returns: its statement is
+            // the function's final C statement, so it is spelled alone (see
+            // `Emitter::noret`).
+            self.noret = matches!(b.term, Terminator::NoReturn);
             for ins in &b.instrs {
+                if folded.contains(&ins.dest) {
+                    continue;
+                }
                 // A phi's value arrives by the edge-copy at the end of its
                 // predecessor, so the phi op has no C statement: emitting one
                 // (`dest = 0`, the initialiser's "no incoming edge" case) runs on
@@ -336,7 +379,7 @@ impl<'a> Emitter<'a> {
             for (dest, src) in copies.get(&b.id).cloned().unwrap_or_default() {
                 let _ = writeln!(self.body, "    {} = {};", self.name(dest), self.use_(src));
             }
-            self.term(&b.term)?;
+            self.term(b.id, &b.term)?;
             self.bail()?;
         }
         let _ = writeln!(self.body, "}}");
@@ -532,6 +575,196 @@ impl<'a> Emitter<'a> {
         Some(s)
     }
 
+    /// The C expression for a call: the callee spelled from its DECLARED shape,
+    /// with the prototype declared in the same step. `instr` uses this for a call
+    /// statement and `term` uses it for the one case where the call IS the
+    /// statement a tail call's `return` needs (see `Emitter::tail`), so the two
+    /// spellings of a call can never drift apart.
+    ///
+    /// `None` means a refusal was pushed. The callers stop at the first refusal
+    /// (`bail`), so a refusal does not need to travel as an `Err` through here.
+    fn call_expr(&mut self, ins: &crate::ir::Instr) -> Option<String> {
+        let at = ins.addr;
+        let (callee, args, ret_ty) = match &ins.op {
+            Op::Call {
+                callee,
+                args,
+                ret_ty,
+                ..
+            } => (callee, args.as_ref(), ret_ty),
+            _ => {
+                self.refuse(at, "call_expr on a non-call".to_string());
+                return None;
+            }
+        };
+
+        let name = match callee {
+            Callee::Symbol(s) => c_name(s),
+            Callee::Addr(a) => format!("rdec_fn_{a:x}"),
+            Callee::Indirect(_) => {
+                self.refuse(at, "indirect call: no signature model".to_string());
+                return None;
+            }
+        };
+        // A callee the pipeline named: call it as its DECLARED shape says,
+        // and declare that shape before the call. The prototype is spelled
+        // from the same `CalleeDecl` the callee's own definition is spelled
+        // from, so the two cannot drift into `conflicting types`.
+        if let Callee::Symbol(sym) = callee {
+            let decl = self
+                .protos
+                .get(sym.as_str())
+                .or_else(|| self.protos.get(&name))
+                .cloned();
+            let Some(d) = decl else {
+                // A call that DEFINES NOTHING - the noreturn shape - can be
+                // declared where a value call cannot: the declaration cannot
+                // corrupt an answer, because there is no answer, and the
+                // argument list we spell is the one this call uses. Windows
+                // x64 is caller-clean, so the CRT's `abort(void)` reading
+                // registers it ignores is the same call. The name is the front
+                // end's declaration (`lift::noreturn_symbol`), the `noreturn`
+                // attribute says out loud what the IR's `NoReturn` terminator
+                // means, and clang then accepts a function that ends with
+                // `__builtin_unreachable()` after this call.
+                if *ret_ty == Ty::Void {
+                    if args.len() != 4 {
+                        // The four-register spelling below is the only thing
+                        // this branch can declare; a call that passes a
+                        // different count has no signature to spell.
+                        self.refuse(
+                                    at,
+                                    format!(
+                                        "noreturn call to {name} passes {} args; no declared shape to spell",
+                                        args.len()
+                                    ),
+                                );
+                        return None;
+                    }
+                    // The attribute goes AFTER the declarator, the way libc spells
+                    // it (`void abort(void) __attribute__((noreturn));`): the line
+                    // reads as the declaration of a VOID function first and the
+                    // never-returns claim second, which is the order the model
+                    // earns them in - `extern void abort(...)` is what makes the
+                    // call a statement with no value, and the attribute is the
+                    // claim that lets the body end without a `return`.
+                    let proto = format!(
+                                "extern void {name}(int64_t, int64_t, int64_t, int64_t) __attribute__((noreturn));"
+                            );
+                    if !self.externs.contains(&proto) {
+                        self.externs.push(proto);
+                    }
+                    let a: Vec<String> = args
+                        .iter()
+                        .map(|v| format!("(int64_t){}", self.use_(*v)))
+                        .collect();
+                    return Some(format!("{name}({})", a.join(", ")));
+                }
+                // Named, and no declared shape: the identity is known and
+                // the signature is not, which is the emitter's own kind of
+                // gap. An `extern int64_t name(int64_t,int64_t,int64_t,
+                // int64_t)` guess would COMPILE, and clash with the real
+                // definition the moment both are in this file.
+                self.refuse(
+                    at,
+                    format!("call to a sibling with no declared shape: {name}"),
+                );
+                return None;
+            };
+            let f_class = |t: &Ty| matches!(t, Ty::Float { .. });
+            if f_class(&d.ret) != f_class(ret_ty) {
+                self.refuse(
+                    at,
+                    format!(
+                        "call to {name} answers {} but its declared shape returns {}",
+                        c_ty(ret_ty).unwrap_or_else(|| "int64_t".into()),
+                        c_ty(&d.ret).unwrap_or_else(|| "int64_t".into())
+                    ),
+                );
+                return None;
+            }
+            if args.len() != d.params.len() {
+                self.refuse(
+                    at,
+                    format!(
+                        "call to {name} passes {} args; its declared shape has {}",
+                        args.len(),
+                        d.params.len()
+                    ),
+                );
+                return None;
+            }
+            let proto = proto_text(&name, &d);
+            if !self.externs.contains(&proto) {
+                self.externs.push(proto);
+            }
+            let a: Vec<String> = args
+                .iter()
+                .zip(d.params.iter())
+                .map(|(v, t)| match t {
+                    // A W64 register cell feeding a float parameter moves
+                    // BITS through the memcpy helper. A `(float)x` cast
+                    // CONVERTS the integer and answers a different number,
+                    // and `(int64_t)x` truncates: the same rule the
+                    // parameter, load and store paths follow.
+                    Ty::Float { w: FWidth::F32 } => {
+                        format!("rdec_bits_f32((uint64_t){})", self.use_(*v))
+                    }
+                    Ty::Float { w: FWidth::F64 } => {
+                        format!("rdec_bits_f64((uint64_t){})", self.use_(*v))
+                    }
+                    other => format!(
+                        "({}){}",
+                        c_ty(other).unwrap_or("int64_t".into()),
+                        self.use_(*v)
+                    ),
+                })
+                .collect();
+            Some(format!("{name}({})", a.join(", ")))
+        } else {
+            // A target with no symbol: no identity, no declared shape, so
+            // no prototype to write. The old spelling stays, loudly named by
+            // the `rdec_fn_` prefix, and the gate's `externs` census counts it.
+            if args.len() > 4 {
+                self.refuse(
+                            at,
+                            format!("call to {name} with {} args: the 4-register signature model cannot express it", args.len()),
+                        );
+                return None;
+            }
+            let mut a: Vec<String> = args
+                .iter()
+                .map(|v| format!("(int64_t){}", self.use_(*v)))
+                .collect();
+            while a.len() < 4 {
+                a.push("0".into());
+            }
+            let sig = format!(
+                "extern {} {name}(int64_t, int64_t, int64_t, int64_t);",
+                c_ty(ret_ty).unwrap_or("int64_t".into())
+            );
+            if !self.externs.contains(&sig) {
+                self.externs.push(sig);
+            }
+            Some(format!("{name}({})", a.join(", ")))
+        }
+    }
+
+    /// Can this block's `TailReturn(v)` fold its call into the `return`? Exactly
+    /// when `v` is defined by a call IN THIS BLOCK and the terminator is that
+    /// value's only use: then the C has one statement for the machine's one
+    /// `jmp`, and the local the call would have needed is never declared.
+    fn tail_foldable(&self, bb: crate::ir::BbId, v: crate::ir::VId) -> bool {
+        match self.f.def(v) {
+            Some((d, i)) => {
+                d == bb
+                    && matches!(self.f.block(d).instrs[i].op, Op::Call { .. })
+                    && self.f.use_count(v) == 1
+            }
+            None => false,
+        }
+    }
+
     fn instr(&mut self, ins: &crate::ir::Instr) -> Result<(), Vec<Refusal>> {
         let at = ins.addr;
         let v = ins.dest;
@@ -716,129 +949,8 @@ impl<'a> Emitter<'a> {
                 Some(format!("({cc} ? {tt} : {ff})"))
             }
             Op::Phi(_) => Some("/* phi: assigned by edge copy */ 0".into()),
-            Op::Call {
-                callee,
-                args,
-                ret_ty,
-                ..
-            } => {
-                let name = match callee {
-                    Callee::Symbol(s) => c_name(s),
-                    Callee::Addr(a) => format!("rdec_fn_{a:x}"),
-                    Callee::Indirect(_) => {
-                        self.refuse(at, "indirect call: no signature model".to_string());
-                        return Err(self.refusals.clone());
-                    }
-                };
-                // A callee the pipeline named: call it as its DECLARED shape says,
-                // and declare that shape before the call. The prototype is spelled
-                // from the same `CalleeDecl` the callee's own definition is spelled
-                // from, so the two cannot drift into `conflicting types`.
-                if let Callee::Symbol(sym) = callee {
-                    let Some(d) = self
-                        .protos
-                        .get(sym.as_str())
-                        .or_else(|| self.protos.get(&name))
-                    else {
-                        // Named, and no declared shape: the identity is known and
-                        // the signature is not, which is the emitter's own kind of
-                        // gap. An `extern int64_t name(int64_t,int64_t,int64_t,
-                        // int64_t)` guess would COMPILE, and clash with the real
-                        // definition the moment both are in this file.
-                        self.refuse(
-                            at,
-                            format!("call to a sibling with no declared shape: {name}"),
-                        );
-                        return Err(self.refusals.clone());
-                    };
-                    // The two must agree about the CLASS of the answer: an
-                    // integer-returning call cannot target a function whose
-                    // definition answers `double` (that is a call through the
-                    // wrong ABI, and the answer would be a bit pattern read as a
-                    // number). Within a class the widths differ legitimately -
-                    // the definition of `g` says `uint32_t` because the lifter
-                    // narrowed its return, and the call site's declared shape
-                    // says `int64_t` because RAX is a W64 cell; the assignment
-                    // cast carries the value across, and it is a widening of the
-                    // exact bits the machine's `ret` left in EAX/RAX.
-                    let f_class = |t: &Ty| matches!(t, Ty::Float { .. });
-                    if f_class(&d.ret) != f_class(ret_ty) {
-                        self.refuse(
-                            at,
-                            format!(
-                                "call to {name} answers {} but its declared shape returns {}",
-                                c_ty(ret_ty).unwrap_or_else(|| "int64_t".into()),
-                                c_ty(&d.ret).unwrap_or_else(|| "int64_t".into())
-                            ),
-                        );
-                        return Err(self.refusals.clone());
-                    }
-                    if args.len() != d.params.len() {
-                        self.refuse(
-                            at,
-                            format!(
-                                "call to {name} passes {} args; its declared shape has {}",
-                                args.len(),
-                                d.params.len()
-                            ),
-                        );
-                        return Err(self.refusals.clone());
-                    }
-                    let proto = proto_text(&name, d);
-                    if !self.externs.contains(&proto) {
-                        self.externs.push(proto);
-                    }
-                    let a: Vec<String> = args
-                        .iter()
-                        .zip(d.params.iter())
-                        .map(|(v, t)| match t {
-                            // A W64 register cell feeding a float parameter moves
-                            // BITS through the memcpy helper. A `(float)x` cast
-                            // CONVERTS the integer and answers a different number,
-                            // and `(int64_t)x` truncates: the same rule the
-                            // parameter, load and store paths follow.
-                            Ty::Float { w: FWidth::F32 } => {
-                                format!("rdec_bits_f32((uint64_t){})", self.use_(*v))
-                            }
-                            Ty::Float { w: FWidth::F64 } => {
-                                format!("rdec_bits_f64((uint64_t){})", self.use_(*v))
-                            }
-                            other => format!(
-                                "({}){}",
-                                c_ty(other).unwrap_or("int64_t".into()),
-                                self.use_(*v)
-                            ),
-                        })
-                        .collect();
-                    Some(format!("{name}({})", a.join(", ")))
-                } else {
-                    // A target with no symbol: no identity, no declared shape, so
-                    // no prototype to write. The old spelling stays, loudly named by
-                    // the `rdec_fn_` prefix, and the gate's `externs` census counts it.
-                    if args.len() > 4 {
-                        self.refuse(
-                            at,
-                            format!("call to {name} with {} args: the 4-register signature model cannot express it", args.len()),
-                        );
-                        return Err(self.refusals.clone());
-                    }
-                    let mut a: Vec<String> = args
-                        .iter()
-                        .map(|v| format!("(int64_t){}", self.use_(*v)))
-                        .collect();
-                    while a.len() < 4 {
-                        a.push("0".into());
-                    }
-                    let sig = format!(
-                        "extern {} {name}(int64_t, int64_t, int64_t, int64_t);",
-                        c_ty(ret_ty).unwrap_or("int64_t".into())
-                    );
-                    if !self.externs.contains(&sig) {
-                        self.externs.push(sig);
-                    }
-                    Some(format!("{name}({})", a.join(", ")))
-                }
-            }
+            Op::Call { .. } => self.call_expr(ins),
+
             // A caller-saved register the call destroyed, READ after the call: the
             // answer depends on a value the model says is gone. This is the refusal
             // class the corpus has always reported, under the same name.
@@ -855,7 +967,15 @@ impl<'a> Emitter<'a> {
             Some(e) if ty == Ty::Void => {
                 // A call that returns nothing is a *statement*: `(void)f(x);` is
                 // fine C, `void x = ...;` is not.
-                let _ = writeln!(self.body, "    {e}; /* {at:#x} */");
+                if self.noret && matches!(ins.op, Op::Call { .. }) {
+                    // The call that ends a `NoReturn` block: its address on the
+                    // line above, so the statement itself stands alone and reads
+                    // as the function's last act.
+                    let _ = writeln!(self.body, "    /* {at:#x} */");
+                    let _ = writeln!(self.body, "    {e};");
+                } else {
+                    let _ = writeln!(self.body, "    {e}; /* {at:#x} */");
+                }
             }
             Some(e) => {
                 let t = c_ty(&ty).unwrap_or("uint64_t".into());
@@ -868,7 +988,7 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
-    fn term(&mut self, t: &Terminator) -> Result<(), Vec<Refusal>> {
+    fn term(&mut self, bb: crate::ir::BbId, t: &Terminator) -> Result<(), Vec<Refusal>> {
         match t {
             Terminator::Jump(bb) => {
                 let _ = writeln!(self.body, "    goto l{bb};");
@@ -946,6 +1066,59 @@ impl<'a> Emitter<'a> {
                     let _ = writeln!(self.body, "    return ({rc}){x};");
                 }
             }
+            // `return callee(args);` — the machine code's `jmp` and the C's
+            // `return` are one control-flow edge, so the C is one statement: the
+            // call expression is spelled by `call_expr`, the same function a call
+            // STATEMENT uses, and the local it would have assigned is never
+            // declared (`Emitter::tail`). The address in the comment is the
+            // `jmp`'s, so the line points at the instruction that earned it.
+            Terminator::TailReturn(v) => {
+                if !self.tail_foldable(bb, *v) {
+                    self.refuse(
+                        0,
+                        format!(
+                            "tail call returns v{v}, which this block cannot fold into a return"
+                        ),
+                    );
+                    return Err(self.refusals.clone());
+                }
+                let Some((dbb, i)) = self.f.def(*v) else {
+                    self.refuse(0, format!("tail call returns an undefined value v{v}"));
+                    return Err(self.refusals.clone());
+                };
+                let ins = self.f.block(dbb).instrs[i].clone();
+                let at = ins.addr;
+                let Some(e) = self.call_expr(&ins) else {
+                    return Err(self.refusals.clone());
+                };
+                // Cast through the DECLARED return type, exactly as `Return` does:
+                // the callee answers in RAX and the caller's answer is the same
+                // bits, at the width the caller's own machine code declares.
+                let rc: &str = if self.ret == "void" {
+                    "int64_t"
+                } else {
+                    &self.ret
+                };
+                // The `jmp`'s address on the line ABOVE, not after the `;`: this
+                // line is the function's return statement, and the one piece of C
+                // the whole file must say plainly is `return callee(args);`. A
+                // trailing comment makes the statement a line that ends in `*/`,
+                // which is how a reader grepping the output for the tail call
+                // loses it.
+                let _ = writeln!(self.body, "    /* {at:#x} tail call */");
+                let _ = writeln!(self.body, "    return ({rc}){e};");
+            }
+            // A call that never returns. The call itself is an ordinary statement
+            // (it defines nothing), and this is the end of the function: C needs a
+            // value from a path that has none, and `__builtin_unreachable` is the
+            // honest spelling of "control never gets here" — a fall-through to a
+            // `return` would invent an answer the machine code never produces.
+            Terminator::NoReturn => {
+                let _ = writeln!(
+                    self.body,
+                    "    __builtin_unreachable(); /* rdec: the call never returns */"
+                );
+            }
             Terminator::Unreachable => {
                 let _ = writeln!(self.body, "    __builtin_unreachable();");
             }
@@ -1011,6 +1184,18 @@ fn c_name(s: &str) -> String {
 pub const PRELUDE: &str = "\
 #include <stdint.h>
 #include <string.h>
+
+/* rdec declares every callee it names with the shape the model has for it - the
+four Windows x64 register arguments, and the return kind the front end declared.
+When such a name is ALSO a C library builtin (`abort`, `exit`), clang's
+builtin-aware -Wincompatible-library-redeclaration calls that a conflict: it is
+not one. The declaration states the CALL SITE's shape, which is what the file
+being compiled is a record of; on Windows x64 the argument registers are
+caller-clean, so a callee that reads none of them is called the same way, and a
+callee that reads them is called with exactly the values the machine code put
+there. Silencing it here, and only this, is what lets the emitted C name
+`abort` and keep the arguments it was called with. */
+#pragma clang diagnostic ignored \"-Wincompatible-library-redeclaration\"
 
 static uint8_t rdec_mem[1 << 20];
 #define RDEC_ADDR(a) ((uint64_t)(a) & ((1 << 20) - 1))

@@ -97,6 +97,10 @@ fn g_table() -> std::collections::HashMap<String, CalleeSig> {
             cname: "g".to_string(),
             abi: FnAbi::integer(),
             typed: true,
+            // `g` RETURNS: its caller reads the answer. A callee wrongly marked
+            // noreturn loses its caller's answer, so the flag is spelled out at
+            // every declaration site rather than defaulted.
+            noreturn: false,
         },
     )]
     .into_iter()
@@ -400,6 +404,7 @@ fn a_double_returning_call_passes_bits_and_declares_double() {
         cname: "g".to_string(),
         abi: abi_g.clone(),
         typed: true,
+        noreturn: false, // a float-returning sibling: the caller reads XMM0
     };
     let sigs: std::collections::HashMap<String, CalleeSig> =
         [("g".to_string(), sig_g)].into_iter().collect();
