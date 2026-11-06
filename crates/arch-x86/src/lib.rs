@@ -10,3 +10,4 @@ pub mod flags;
 pub mod fuzz;
 pub mod lift;
 pub mod loader;
+pub mod pe;

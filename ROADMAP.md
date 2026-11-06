@@ -1964,3 +1964,27 @@ java is 27 (Ghidra 11.x supports 17/21). Headless Ghidra = ~500 MB download + a 
 JDK: a heavyweight install that needs the user's go-ahead, not a silent autonomous
 step. When approved: run headless analyzeHeadless over corpus/c/all.c objects, emit
 its C, and diff against `rdec c` per function as a readability/type-recovery baseline.
+
+## M7 first slice landed: PE32+ image loader (`pe.rs`) + `rdec pe-info` — 26 new tests, floors unmoved
+
+The object loader's refusal on m7.exe is no longer the last word: `crates/arch-x86/src/pe.rs`
+reads MZ -> e_lfanew -> PE sig -> COFF header -> optional magic 0x20b (PE32 `0x10b`
+refused BY NAME with the reason: 4-byte ImageBase), image base, entry RVA, subsystem,
+data directories bounded by NumberOfRvaAndSizes, section table; API `va_to_off`,
+`read_at`, `section_named`, `entry_va`. Every refusal names field/got/expected/offset/
+file-length in loader.rs style; every address arithmetic is checked (rva+vsize RVA
+overflow, rawdata past EOF, `PointerToRawData==0` with nonzero size — the .bss lesson
+carried over — overlapping sections, zero alignments, table past EOF). `rdec pe-info`
+prints the whole picture and ends with a LOUD `loaded, not yet read:` line naming the
+next slices (.pdata/.xdata unwind, .reloc, imports). Exit 0 / exit 2.
+m7.exe reads clean: image base 0x140000000, entry RVA 0x1280, 7 sections, EXCEPTION
+dir 0x1c000/0xfc0 == .pdata, BASERELOC == .reloc, 16 dirs declared, 5 filled. The
+parity leg cross-checks llvm-objdump and documents its quirk: objdump's `Size` column
+is min(VirtualSize, SizeOfRawData) (m7 .data prints 0xc00 = raw, vsize 0x1b60 BSS tail).
+Sabotage: overflow guard removed -> the fixture STILL refuses (with a DIFFERENT,
+wrong diagnosis: section overlap) — the class is covered, the diagnosis degrades;
+rawdata-EOF guard removed -> hostile image ACCEPTED, fixture red; magic 0x10b
+accepted -> PE32 loads 4-bytes-off, red. Parent re-measured on master+patch: 22+4
+tests, workspace 315/0, t2 1700/1700/0/4 + memory 288 + ir 288, ratchet/fmt/clippy/
+status exit 0; refusal exit 2 measured UN-PIPED (the first measure through `| head`
+printed 0 — the pipe lesson, fifth demonstration, now in the commit).

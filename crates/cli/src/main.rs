@@ -85,6 +85,7 @@ fn main() {
                 1
             }
         },
+        "pe-info" => cmd_pe_info(&args),
         "fuzz" => match fuzz::cmd_fuzz(&args) {
             Ok(rc) => rc,
             Err(e) => {
@@ -132,6 +133,10 @@ fn print_help() {
          \x20                                   (load, demangle, discover, lift, passes,
          \x20                                   verify, emit C, interpreter). Per-stage
          \x20                                   census; exit 1 on any panic or hang
+         \x20 pe-info <exe>                   M7: PE32+ image headers - image base,
+         \x20                                   entry RVA, subsystem, section table
+         \x20                                   (name/vaddr/vsize/rawptr/rawsize/flags);
+         \x20                                   refuses non-PE by field, exit 2
          \x20 status                          roadmap section 9's table, from commands\n\
          \n\
          coming next (M1): disasm <obj> [symbol]"
@@ -738,6 +743,113 @@ fn corpus_row() -> (String, String, bool) {
         )
     };
     ("corpus".into(), verdict, bad.is_empty() && n > 0)
+}
+
+/// `rdec pe-info <exe>` — the M7 first slice made visible: what the PE32+ image
+/// reader read, and what it refused.
+///
+/// Exit codes follow the convention already in this file: **0** on a parsed
+/// image, **2** on a refusal — the `c` / `t2` / `lift` / `fuzz` arms use 2 for
+/// "the input was refused", and `discover`'s 1 is a pipeline gap, a different
+/// event. The refusal text is `PeImage::load`'s verbatim, which names the
+/// field, the value found, the value expected, the offset and the file length,
+/// so the same message is what `tests/pe_fixtures.rs` asserts on.
+fn cmd_pe_info(args: &[String]) -> i32 {
+    use rdec_arch_x86::pe::PeImage;
+    let Some(path) = args.get(1) else {
+        eprintln!("pe-info: usage: rdec pe-info <exe>");
+        return 2;
+    };
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("pe-info: {path}: {e}");
+            return 2;
+        }
+    };
+    let img = match PeImage::load(&bytes, path) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("{e}");
+            return 2;
+        }
+    };
+    println!(
+        "{}: PE32+ image, {} bytes, machine {:#x} ({})",
+        img.path,
+        img.file_len,
+        img.machine,
+        if img.machine == 0x8664 {
+            "AMD64"
+        } else {
+            "not AMD64"
+        }
+    );
+    println!(
+        "  image base      {:#x}   entry RVA {:#x} (VA {:#x})",
+        img.image_base,
+        img.entry_rva,
+        img.entry_va()
+    );
+    println!(
+        "  subsystem       {} ({})   characteristics {:#x}   DllCharacteristics {:#x}",
+        img.subsystem,
+        img.subsystem_name(),
+        img.characteristics,
+        img.dll_characteristics
+    );
+    println!(
+        "  size of image   {:#x}   size of headers {:#x}   section align {:#x}   file align {:#x}",
+        img.size_of_image, img.size_of_headers, img.section_alignment, img.file_alignment
+    );
+    println!(
+        "  data directories {} declared (NumberOfRvaAndSizes)",
+        img.number_of_rva_and_sizes
+    );
+    for d in img
+        .data_directories
+        .iter()
+        .filter(|d| d.rva != 0 || d.size != 0)
+    {
+        println!("    {:<15} rva {:#x} size {:#x}", d.name, d.rva, d.size);
+    }
+    println!("  sections        {}", img.sections.len());
+    println!(
+        "  {:<3} {:<10} {:<10} {:<10} {:<10} {:<10} flags",
+        "idx", "name", "vaddr", "vsize", "rawptr", "rawsize"
+    );
+    for s in &img.sections {
+        println!(
+            "  {:<3} {:<10} {:<10} {:<10} {:<10} {:<10} {}",
+            s.index,
+            s.name,
+            format!("{:#x}", s.virtual_address),
+            format!("{:#x}", s.virtual_size),
+            format!("{:#x}", s.pointer_to_raw_data),
+            format!("{:#x}", s.size_of_raw_data),
+            s.flags_summary()
+        );
+    }
+    // What the reader did NOT read, printed so "it loaded" is never mistaken
+    // for "the image is understood": these are the next M7 slices.
+    let mut later: Vec<&str> = Vec::new();
+    if img.section_named(".pdata").is_some() {
+        later.push(".pdata/.xdata SEH unwind (the function-start source)");
+    }
+    if img.section_named(".reloc").is_some() {
+        later.push(".reloc base relocations");
+    }
+    if img
+        .data_directories
+        .iter()
+        .any(|d| (d.name == "IMPORT" || d.name == "IAT") && d.rva != 0)
+    {
+        later.push("the import table (imports are calls to a boundary that stays LOUD)");
+    }
+    if !later.is_empty() {
+        println!("  loaded, not yet read: {}", later.join("; "));
+    }
+    0
 }
 
 /// Run a command, return (success, stdout+stderr).
