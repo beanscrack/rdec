@@ -4,15 +4,137 @@
 //! a single dangling `VId` becomes a wrong C expression three passes later, far
 //! from the bug. Everything is reported as a list of human-readable errors, so
 //! a failure prints the exact offending value/block and a pass can be bisected.
+//!
+//! THE COST MODEL. Every check here is O(1) per node, backed by one sweep that
+//! builds the tables the checks ask about: the def site of every value, the use
+//! sites of every value, the first index at which every block id appears, and
+//! the dominator-tree intervals that answer "does this def dominate that use" in
+//! constant time. The first version asked those questions by scanning
+//! `f.blocks` per query — the shape the passes had before their own per-sweep
+//! tables — and it cost O(nodes) *per query*: measured on the 20k-block ladder
+//! (60,007 nodes) in release, `verify_ssa` was 274.7 s while the whole pass
+//! pipeline was 86 ms.
+//!
+//! THE REFUSALS ARE THE CONTRACT, NOT THE SPEED. Every `e.hard(...)`/`e.soft(...)`
+//! below has a fixture in `crates/core/tests/verify_ssa_rejections.rs` that turns
+//! red if the check is deleted, so a faster verifier that misses a rejection
+//! cannot land. The checks no fixture can reach are named there.
 
 use crate::cfg::Cfg;
 use crate::ir::*;
 use crate::ty::Ty;
+use std::collections::HashMap;
 
 pub type Verdict = Result<(), Vec<String>>;
 
+/// One sweep over the function, and the tables every query below reads.
+///
+/// Built in a single pass over blocks, instructions and terminators, so the
+/// whole verifier is O(nodes + edges). The tables are keyed by value id and
+/// block id — exactly the space `Function::def` / `Function::uses_of` scan — and
+/// they reproduce those scans:
+///
+///  * `def` holds the FIRST definition site in block order / instruction order,
+///    which is what `Function::def` returns when a value is defined twice (the
+///    duplicate is a separate hard failure, reported by the census below).
+///  * `uses` holds the sites in the order `Function::uses_of` emits them
+///    (instructions in order, operand slots in `Op::uses` order, then the
+///    terminator), over the same value range: an id at or past `next_value` has
+///    no entry, exactly as the scan reports nothing for it.
+///  * `def_count` is the census `verify` used to build inline.
+///  * `first_pos` maps a block id to the first index at which it appears — the
+///    `position(|x| x.id == b.id)` the id/index rule asked for. A block list
+///    where two blocks claim one id keeps the old behaviour exactly: the FIRST
+///    occurrence is the one that satisfies `id == index`.
+#[derive(Default)]
+struct Sweep {
+    def: Vec<Option<(BbId, usize)>>,
+    def_count: Vec<u32>,
+    uses: Vec<Vec<UseSite>>,
+    first_pos: HashMap<BbId, usize>,
+}
+
+impl Sweep {
+    fn build(f: &Function) -> Sweep {
+        let nv = f.next_value as usize;
+        let mut t = Sweep {
+            def: vec![None; nv],
+            def_count: vec![0u32; nv],
+            uses: vec![Vec::new(); nv],
+            first_pos: HashMap::new(),
+        };
+        let mut ops: Vec<VId> = Vec::new();
+        for (idx, b) in f.blocks.iter().enumerate() {
+            t.first_pos.entry(b.id).or_insert(idx);
+            for (ii, ins) in b.instrs.iter().enumerate() {
+                if ins.dest != NO_VAL && (ins.dest as usize) < nv {
+                    let d = ins.dest as usize;
+                    if t.def[d].is_none() {
+                        t.def[d] = Some((b.id, ii));
+                    }
+                    t.def_count[d] += 1;
+                }
+                ins.op.uses(&mut ops);
+                for (slot, u) in ops.iter().enumerate() {
+                    if (*u as usize) < nv {
+                        t.uses[*u as usize].push(UseSite {
+                            bb: b.id,
+                            instr: ii,
+                            slot,
+                        });
+                    }
+                }
+            }
+            // Terminator operands are uses, exactly as `Function::uses_of` says
+            // (including the `usize::MAX` instruction marker and the `NO_VAL`
+            // guard: a `Return(NO_VAL)` names no value and is no use).
+            let top: Option<VId> = match b.term {
+                Terminator::Branch { cond, .. } => Some(cond),
+                Terminator::Return(x) | Terminator::TailReturn(x) if x != NO_VAL => Some(x),
+                Terminator::Switch { index, .. } => Some(index),
+                _ => None,
+            };
+            if let Some(v) = top {
+                if (v as usize) < nv {
+                    t.uses[v as usize].push(UseSite {
+                        bb: b.id,
+                        instr: usize::MAX,
+                        slot: 0,
+                    });
+                }
+            }
+        }
+        t
+    }
+
+    /// The def site `Function::def` would return.
+    fn def_of(&self, v: VId) -> Option<(BbId, usize)> {
+        self.def.get(v as usize).copied().flatten()
+    }
+
+    fn defined(&self, v: VId) -> bool {
+        self.def_of(v).is_some()
+    }
+
+    /// The use sites `Function::uses_of` would return, as a slice.
+    fn uses_of(&self, v: VId) -> &[UseSite] {
+        self.uses
+            .get(v as usize)
+            .map(|u| u.as_slice())
+            .unwrap_or(&[])
+    }
+
+    fn is_used(&self, v: VId) -> bool {
+        !self.uses_of(v).is_empty()
+    }
+}
+
 /// Structural checks that must hold in every IR state (SSA form not required).
 pub fn verify(f: &Function) -> Verdict {
+    verify_swept(f, &Sweep::build(f))
+}
+
+fn verify_swept(f: &Function, t: &Sweep) -> Verdict {
     let mut e = Errs::default();
 
     if f.blocks.is_empty() {
@@ -23,12 +145,7 @@ pub fn verify(f: &Function) -> Verdict {
         e.hard("entry block id out of range");
     }
     for b in &f.blocks {
-        if b.id as usize
-            != f.blocks
-                .iter()
-                .position(|x| x.id == b.id)
-                .unwrap_or(usize::MAX)
-        {
+        if b.id as usize != t.first_pos.get(&b.id).copied().unwrap_or(usize::MAX) {
             e.soft(format!("block id {} is not at index {}", b.id, b.id));
         }
     }
@@ -37,7 +154,6 @@ pub fn verify(f: &Function) -> Verdict {
     }
 
     // Value space: every def is unique and every operand is defined.
-    let mut def_count = vec![0u32; f.next_value as usize];
     for b in &f.blocks {
         for i in &b.instrs {
             if i.dest == NO_VAL {
@@ -51,12 +167,11 @@ pub fn verify(f: &Function) -> Verdict {
                 ));
                 continue;
             }
-            def_count[i.dest as usize] += 1;
             // Op-declared type must agree with the recorded type.
-            if let Some(t) = i.op.ty(f) {
-                if t != i.ty {
+            if let Some(ty) = i.op.ty(f) {
+                if ty != i.ty {
                     e.soft(format!(
-                        "bb{}: %{} op type {t} != recorded {}",
+                        "bb{}: %{} op type {ty} != recorded {}",
                         b.id, i.dest, i.ty
                     ));
                 }
@@ -116,7 +231,7 @@ pub fn verify(f: &Function) -> Verdict {
             if let Op::FBin(_, x, y) | Op::FCmp(_, x, y) = &i.op {
                 for v in [*x, *y] {
                     match f.ty_of(v) {
-                        Some(t) if t.is_float() => {}
+                        Some(ty) if ty.is_float() => {}
                         other => e.hard(format!(
                             "bb{}: %{} float op reads %{} with type {} (needs a float)",
                             b.id,
@@ -153,7 +268,7 @@ pub fn verify(f: &Function) -> Verdict {
                         "bb{}: %{} call with an empty callee name",
                         b.id, i.dest
                     )),
-                    Callee::Indirect(v) if !defined(f, *v) => e.hard(format!(
+                    Callee::Indirect(v) if !t.defined(*v) => e.hard(format!(
                         "bb{}: %{} indirect call through undefined %{}",
                         b.id, i.dest, v
                     )),
@@ -161,11 +276,11 @@ pub fn verify(f: &Function) -> Verdict {
                 }
                 for a in args.iter() {
                     match f.ty_of(*a) {
-                        Some(ref t)
-                            if !matches!(t, Ty::Int { .. } | Ty::Float { .. } | Ty::Ptr(_)) =>
+                        Some(ref ty)
+                            if !matches!(ty, Ty::Int { .. } | Ty::Float { .. } | Ty::Ptr(_)) =>
                         {
                             e.hard(format!(
-                                "bb{}: %{} call argument %{} is {t} (a call's arguments are register cells: int, float or pointer)",
+                                "bb{}: %{} call argument %{} is {ty} (a call's arguments are register cells: int, float or pointer)",
                                 b.id, i.dest, a
                             ));
                         }
@@ -192,7 +307,7 @@ pub fn verify(f: &Function) -> Verdict {
             // A float conversion whose SOURCE is not a float (or whose result
             // is not the float kind the kind names) is a pass bug: the C cast
             // syntax accepts all of them, and the answers differ.
-            if let Op::Cast(k, t, a) = &i.op {
+            if let Op::Cast(k, ct, a) = &i.op {
                 let src = f.ty_of(*a);
                 // The string, not the Option<Ty>: Ty is Clone but not Copy, and
                 // the closure below is called from several arms.
@@ -213,13 +328,13 @@ pub fn verify(f: &Function) -> Verdict {
                         }
                     }
                     CastKind::SIToFp | CastKind::UIToFp => {
-                        if !src.map(|t| t.is_int()).unwrap_or(false) || !t.is_float() {
+                        if !src.map(|t| t.is_int()).unwrap_or(false) || !ct.is_float() {
                             named("SIToFp/UIToFp");
                         }
                     }
                     CastKind::FPExt | CastKind::FPTrunc
                         if !(src.as_ref().map(|t| t.is_float()).unwrap_or(false)
-                            && t.is_float()) =>
+                            && ct.is_float()) =>
                     {
                         named("FPExt/FPTrunc");
                     }
@@ -237,7 +352,7 @@ pub fn verify(f: &Function) -> Verdict {
         }
         match &b.term {
             Terminator::Return(v) => {
-                if *v != NO_VAL && !defined(f, *v) {
+                if *v != NO_VAL && !t.defined(*v) {
                     e.hard(format!("bb{}: ret of undefined %{}", b.id, v));
                 }
                 // The declared return type is a WIDTH CLAIM, and it is the one
@@ -274,11 +389,11 @@ pub fn verify(f: &Function) -> Verdict {
             // `Indirect`, an empty name) means the function's whole answer belongs
             // to nobody, which is the hole the C would paper over with a prototype.
             Terminator::TailReturn(v) => {
-                if *v == NO_VAL || !defined(f, *v) {
+                if *v == NO_VAL || !t.defined(*v) {
                     e.hard(format!("bb{}: tail return of undefined %{}", b.id, v));
                     continue;
                 }
-                let Some((dbb, di)) = f.def(*v) else {
+                let Some((dbb, di)) = t.def_of(*v) else {
                     e.hard(format!(
                         "bb{}: tail return of %{} has no definition",
                         b.id, v
@@ -343,7 +458,7 @@ pub fn verify(f: &Function) -> Verdict {
                 // The index is read by the dispatch, so it must be a value this
                 // function defines (or a parameter): an undefined selector means
                 // the lifter pointed the switch at nothing.
-                if !defined(f, *index) {
+                if !t.defined(*index) {
                     e.hard(format!("bb{}: switch on undefined index %{}", b.id, index));
                 }
                 // A switch over no target at all is the shape a half-resolved
@@ -381,7 +496,7 @@ pub fn verify(f: &Function) -> Verdict {
                 }
             }
             Terminator::Branch { cond, .. } => {
-                if !defined(f, *cond) {
+                if !t.defined(*cond) {
                     e.hard(format!("bb{}: branch on undefined %{}", b.id, cond));
                 }
                 // Hard, not a warning: `br` requires a bool. If the condition is
@@ -397,8 +512,8 @@ pub fn verify(f: &Function) -> Verdict {
             _ => {}
         }
     }
-    for (v, c) in def_count.iter().enumerate() {
-        if *c == 0 && v < f.next_value as usize && is_used(f, v as VId) {
+    for (v, c) in t.def_count.iter().enumerate() {
+        if *c == 0 && v < f.next_value as usize && t.is_used(v as VId) {
             e.hard(format!("value %{v} is used but never defined"));
         }
         if *c > 1 {
@@ -408,11 +523,10 @@ pub fn verify(f: &Function) -> Verdict {
         }
     }
     for v in 0..f.next_value {
-        for u in f.uses_of(v) {
+        for u in t.uses_of(v) {
             if u.instr != usize::MAX && u.instr >= f.blocks[u.bb as usize].instrs.len() {
                 e.hard(format!("bad use-site for %{v} in bb{}", u.bb));
             }
-            let _ = u;
         }
     }
     e.finish()
@@ -434,15 +548,21 @@ fn phi_pred(f: &Function, u: UseSite) -> Option<BbId> {
 }
 
 pub fn verify_ssa(f: &Function) -> Verdict {
+    // ONE sweep for the whole function, shared by the structural checks and the
+    // SSA checks below. Every question the checks ask — `where is %v defined`,
+    // `where is %v read`, `does bb{a} dominate bb{b}` — is a table read, so the
+    // cost is O(nodes + edges) and not O(nodes) per query.
+    let t = Sweep::build(f);
     let mut e = Errs::default();
     let cfg = Cfg::build(f);
     // B7: structural failures used to be routed into a local `Errs` and then
     // discarded, so callers saw `Err(vec![])` -- a rejection with no reason.
-    if let Err(errs) = verify(f) {
+    if let Err(errs) = verify_swept(f, &t) {
         for x in errs {
             e.hard(x);
         }
     }
+    let dom = DomIndex::build(&cfg);
 
     for b in &f.blocks {
         // Phis form a contiguous prefix.
@@ -477,21 +597,27 @@ pub fn verify_ssa(f: &Function) -> Verdict {
             }
         }
 
-        // phi incoming blocks == predecessors, as a multiset.
+        // phi incoming blocks == predecessors, as a multiset. The sorted
+        // predecessor list is the same for every phi in the block, so it is
+        // built once per block, not cloned and sorted once per phi.
+        let mut want: Option<Vec<BbId>> = None;
         for i in &b.instrs {
             if let Op::Phi(pairs) = &i.op {
                 let mut got: Vec<BbId> = pairs.iter().map(|(_, bb)| *bb).collect();
-                let mut want: Vec<BbId> = cfg.preds[b.id as usize].clone();
                 got.sort();
-                want.sort();
-                if got != want {
+                let want = want.get_or_insert_with(|| {
+                    let mut w = cfg.preds[b.id as usize].clone();
+                    w.sort();
+                    w
+                });
+                if got != *want {
                     e.hard(format!(
                         "bb{}: phi %{} incoming {got:?} != predecessors {want:?}",
                         b.id, i.dest
                     ));
                 }
                 for (v, from) in pairs.iter() {
-                    if !defined(f, *v) {
+                    if !t.defined(*v) {
                         e.hard(format!("bb{}: phi %{} takes undefined %{v}", b.id, i.dest));
                     } else if !cfg.is_reachable(*from) {
                         e.hard(format!(
@@ -506,13 +632,13 @@ pub fn verify_ssa(f: &Function) -> Verdict {
 
     // Def must dominate every use; in-block uses must be program-order later.
     for v in 0..f.next_value {
-        let Some((dbb, dii)) = f.def(v) else {
+        let Some((dbb, dii)) = t.def_of(v) else {
             continue;
         };
         if !cfg.is_reachable(dbb) {
             e.hard(format!("%{v} is defined in unreachable bb{dbb}"));
         }
-        for u in f.uses_of(v) {
+        for u in t.uses_of(v) {
             // A phi operand is a claim about its EDGE, not about the phi's
             // position: the value has to be live at the END of its predecessor.
             // Ordinary dominance (def dominates the phi's block, and is earlier
@@ -520,8 +646,8 @@ pub fn verify_ssa(f: &Function) -> Verdict {
             // standard loop-carried form `%v = phi [%init, %head], [%next, %loop]`
             // where `%next` is defined in the latch - the case a self edge makes
             // into "defined later in this very block".
-            if let Some(pred) = phi_pred(f, u) {
-                if dbb != pred && !cfg.dominates(dbb, pred) {
+            if let Some(pred) = phi_pred(f, *u) {
+                if dbb != pred && !dom.dominates(&cfg, dbb, pred) {
                     e.hard(format!(
                         "%{v} defined in bb{dbb} is not available on the edge bb{pred} -> bb{}",
                         u.bb
@@ -539,7 +665,7 @@ pub fn verify_ssa(f: &Function) -> Verdict {
                         u.bb, u.instr
                     ));
                 }
-            } else if !cfg.dominates(dbb, u.bb) {
+            } else if !dom.dominates(&cfg, dbb, u.bb) {
                 e.hard(format!(
                     "%{v} defined in bb{dbb} does not dominate use in bb{}",
                     u.bb
@@ -550,12 +676,91 @@ pub fn verify_ssa(f: &Function) -> Verdict {
     e.finish()
 }
 
-fn defined(f: &Function, v: VId) -> bool {
-    f.def(v).is_some()
+/// Constant-time dominance queries over a `Cfg`, by DFS number.
+///
+/// `Cfg::dominates` walks `b`'s idom chain upward: O(depth) per query. On the
+/// 20k-block ladder the dominator tree is a 20k-deep chain and the
+/// def-dominates-use loop asks it 60,007 questions. A block's dominator-tree
+/// subtree is exactly the interval `[pre, post]` a DFS gives it, so one
+/// traversal answers every query in O(1).
+///
+/// The answer matches `Cfg::dominates` on every input, including the two
+/// degenerate classes that one treats specially: a block whose `idom` is `NO_BB`
+/// dominates nothing (the entry self-dominates; unreachable blocks have no idom),
+/// and a block with no DFS number is dominated by nobody. The
+/// `dominance_index_agrees_with_the_walk` test checks EVERY block pair of ten
+/// shapes against the walk.
+struct DomIndex {
+    pre: Vec<u32>,
+    post: Vec<u32>,
 }
 
-fn is_used(f: &Function, v: VId) -> bool {
-    !f.uses_of(v).is_empty()
+impl DomIndex {
+    fn build(cfg: &Cfg) -> DomIndex {
+        let n = cfg.reachable.len();
+        // `u32::MAX` = "no interval", the same role `NO_BB` plays for `idom`.
+        let mut pre = vec![u32::MAX; n];
+        let mut post = vec![u32::MAX; n];
+        let mut clock = 0u32;
+        // Iterative: the dominator tree of a long chain is 20k deep and the
+        // native stack is not that patient.
+        for root in 0..n {
+            // Dom-tree roots: a block that dominates itself (the entry) and a
+            // reachable block the idom fixpoint never reached (defensive; the
+            // walk answers "no" for every pair that goes through it, and so
+            // does an interval-less node).
+            let is_root = pre[root] == u32::MAX
+                && (cfg.idom[root] as usize == root
+                    || (cfg.reachable[root] && cfg.idom[root] == NO_BB));
+            if !is_root {
+                continue;
+            }
+            pre[root] = clock;
+            clock += 1;
+            let mut stack: Vec<(usize, usize)> = vec![(root, 0)];
+            while let Some((node, idx)) = stack.last_mut().copied() {
+                if idx < cfg.dom_tree[node].len() {
+                    stack.last_mut().unwrap().1 += 1;
+                    let c = cfg.dom_tree[node][idx] as usize;
+                    if pre[c] == u32::MAX {
+                        pre[c] = clock;
+                        clock += 1;
+                        stack.push((c, 0));
+                    }
+                } else {
+                    stack.pop();
+                    post[node] = clock;
+                    clock += 1;
+                }
+            }
+        }
+        DomIndex { pre, post }
+    }
+
+    fn dominates(&self, cfg: &Cfg, a: BbId, b: BbId) -> bool {
+        let (ai, bi) = (a as usize, b as usize);
+        // The walk's own first guard: a block with no idom dominates nothing.
+        match cfg.idom.get(ai) {
+            Some(&NO_BB) | None => return false,
+            Some(_) => {}
+        }
+        let (pa, pb, qa, qb) = match (
+            self.pre.get(ai),
+            self.pre.get(bi),
+            self.post.get(ai),
+            self.post.get(bi),
+        ) {
+            (Some(&pa), Some(&pb), Some(&qa), Some(&qb)) => (pa, pb, qa, qb),
+            _ => return false,
+        };
+        // No number = outside the dominator tree = dominated by nobody, which is
+        // the walk's answer for an unreachable `b`: its idom chain is `NO_BB`
+        // and never reaches `a`.
+        if pa == u32::MAX || pb == u32::MAX {
+            return false;
+        }
+        pa <= pb && qb <= qa
+    }
 }
 
 #[derive(Default)]
@@ -579,5 +784,274 @@ impl Errs {
         } else {
             Err(self.errs)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::IntCmp;
+
+    /// A diamond: entry -> {a, b} -> join -> exit.
+    fn diamond() -> Function {
+        let mut f = Function::new("diamond", 0);
+        let e = f.entry;
+        let p = f.emit(e, Op::Param, Ty::i64(), 0);
+        f.params.push(p);
+        let c = f.emit(e, Op::Cmp(IntCmp::Eq, p, p), Ty::Bool, 0);
+        let a = f.new_block(0x10);
+        let b = f.new_block(0x20);
+        let j = f.new_block(0x30);
+        let x = f.new_block(0x40);
+        f.block_mut(e).term = Terminator::Branch {
+            cond: c,
+            then_bb: a,
+            else_bb: b,
+        };
+        f.block_mut(a).term = Terminator::Jump(j);
+        f.block_mut(b).term = Terminator::Jump(j);
+        f.block_mut(j).term = Terminator::Jump(x);
+        f.block_mut(x).term = Terminator::Return(p);
+        f
+    }
+
+    /// A loop: entry -> head, head -> {tail, exit}, tail -> head.
+    fn looped() -> Function {
+        let mut f = Function::new("looped", 0);
+        let e = f.entry;
+        let p = f.emit(e, Op::Param, Ty::i64(), 0);
+        f.params.push(p);
+        let c = f.emit(e, Op::Cmp(IntCmp::Eq, p, p), Ty::Bool, 0);
+        let head = f.new_block(0x10);
+        let tail = f.new_block(0x20);
+        let exit = f.new_block(0x30);
+        f.block_mut(e).term = Terminator::Jump(head);
+        f.block_mut(head).term = Terminator::Branch {
+            cond: c,
+            then_bb: tail,
+            else_bb: exit,
+        };
+        f.block_mut(tail).term = Terminator::Jump(head);
+        f.block_mut(exit).term = Terminator::Return(p);
+        f
+    }
+
+    /// An irreducible pair: two blocks that jump to each other, both entered
+    /// from the entry. The dominator tree here is as flat as it gets.
+    fn irreducible() -> Function {
+        let mut f = Function::new("irreducible", 0);
+        let e = f.entry;
+        let p = f.emit(e, Op::Param, Ty::i64(), 0);
+        f.params.push(p);
+        let c = f.emit(e, Op::Cmp(IntCmp::Eq, p, p), Ty::Bool, 0);
+        let a = f.new_block(0x10);
+        let b = f.new_block(0x20);
+        let z = f.new_block(0x30);
+        f.block_mut(e).term = Terminator::Branch {
+            cond: c,
+            then_bb: a,
+            else_bb: b,
+        };
+        f.block_mut(a).term = Terminator::Branch {
+            cond: c,
+            then_bb: b,
+            else_bb: z,
+        };
+        f.block_mut(b).term = Terminator::Jump(a);
+        f.block_mut(z).term = Terminator::Return(p);
+        f
+    }
+
+    /// A chain: the shape whose dominator tree is n deep.
+    fn chain(n: usize) -> Function {
+        let mut f = Function::new("chain", 0);
+        let e = f.entry;
+        let p = f.emit(e, Op::Param, Ty::i64(), 0);
+        f.params.push(p);
+        let mut cur = e;
+        for i in 1..n {
+            let nx = f.new_block(0x10 * i as u64);
+            f.block_mut(cur).term = Terminator::Jump(nx);
+            cur = nx;
+        }
+        f.block_mut(cur).term = Terminator::Return(p);
+        f
+    }
+
+    /// Blocks nothing reaches: the dominator tree does not contain them.
+    fn with_unreachable() -> Function {
+        let mut f = diamond();
+        let o1 = f.new_block(0x900);
+        let o2 = f.new_block(0x910);
+        f.block_mut(o1).term = Terminator::Jump(o2);
+        f.block_mut(o2).term = Terminator::Jump(o1);
+        f
+    }
+
+    /// A switch fan-out with a duplicated table slot.
+    fn switchy() -> Function {
+        let mut f = Function::new("switchy", 0);
+        let e = f.entry;
+        let p = f.emit(e, Op::Param, Ty::u64(), 0);
+        f.params.push(p);
+        let a = f.new_block(0x10);
+        let b = f.new_block(0x20);
+        let c = f.new_block(0x30);
+        f.block_mut(e).term = Terminator::Switch {
+            index: p,
+            targets: vec![a, b, c, a],
+        };
+        f.block_mut(a).term = Terminator::Jump(c);
+        f.block_mut(b).term = Terminator::Jump(c);
+        f.block_mut(c).term = Terminator::Return(p);
+        f
+    }
+
+    /// A loop with two entry edges (a rotated loop): the header's idom is the
+    /// entry and its latch is inside the loop.
+    fn two_entry_loop() -> Function {
+        let mut f = Function::new("two_entry_loop", 0);
+        let e = f.entry;
+        let p = f.emit(e, Op::Param, Ty::u64(), 0);
+        f.params.push(p);
+        let c = f.emit(e, Op::Cmp(IntCmp::Eq, p, p), Ty::Bool, 0);
+        let head = f.new_block(0x10);
+        let mid = f.new_block(0x20);
+        let latch = f.new_block(0x30);
+        let exit = f.new_block(0x40);
+        f.block_mut(e).term = Terminator::Branch {
+            cond: c,
+            then_bb: head,
+            else_bb: mid,
+        };
+        f.block_mut(head).term = Terminator::Jump(mid);
+        f.block_mut(mid).term = Terminator::Branch {
+            cond: c,
+            then_bb: latch,
+            else_bb: exit,
+        };
+        f.block_mut(latch).term = Terminator::Jump(head);
+        f.block_mut(exit).term = Terminator::Return(p);
+        f
+    }
+
+    /// A self-loop block: the degenerate back edge.
+    fn self_loop() -> Function {
+        let mut f = Function::new("self_loop", 0);
+        let e = f.entry;
+        let p = f.emit(e, Op::Param, Ty::u64(), 0);
+        f.params.push(p);
+        let c = f.emit(e, Op::Cmp(IntCmp::Eq, p, p), Ty::Bool, 0);
+        let s = f.new_block(0x10);
+        let x = f.new_block(0x20);
+        f.block_mut(e).term = Terminator::Branch {
+            cond: c,
+            then_bb: s,
+            else_bb: x,
+        };
+        f.block_mut(s).term = Terminator::Branch {
+            cond: c,
+            then_bb: s,
+            else_bb: x,
+        };
+        f.block_mut(x).term = Terminator::Return(p);
+        f
+    }
+
+    /// THE EQUIVALENCE THE REWRITE DEPENDS ON: the interval index answers every
+    /// (a, b) pair the way the O(depth) idom walk does, for every shape. Break
+    /// either one and this goes red.
+    #[test]
+    fn dominance_index_agrees_with_the_walk() {
+        let shapes = [
+            diamond(),
+            looped(),
+            irreducible(),
+            chain(1),
+            chain(2),
+            chain(40),
+            with_unreachable(),
+            switchy(),
+            two_entry_loop(),
+            self_loop(),
+        ];
+        for f in shapes {
+            let cfg = Cfg::build(&f);
+            let idx = DomIndex::build(&cfg);
+            let n = f.blocks.len();
+            for a in 0..n {
+                for b in 0..n {
+                    let (a, b) = (a as BbId, b as BbId);
+                    let walk = cfg.dominates(a, b);
+                    let fast = idx.dominates(&cfg, a, b);
+                    assert_eq!(
+                        walk, fast,
+                        "{}: dominates(bb{a}, bb{b}): the idom walk says {walk}, the interval index says {fast} (idom[bb{a}]={}, reachable[bb{a}]={})",
+                        f.name,
+                        cfg.idom[a as usize],
+                        cfg.reachable[a as usize]
+                    );
+                }
+            }
+        }
+    }
+
+    /// The sweep is the other half of the rewrite: the tables must answer what
+    /// the scans answer, on IR that is deliberately messy (a duplicate def,
+    /// terminator uses, phi operands, a use in a block that is not the def's).
+    #[test]
+    fn the_sweep_reproduces_def_and_uses_of() {
+        let mut f = diamond();
+        let p = f.params[0];
+        // A phi with two operand uses (slot 0 and slot 1, on different edges).
+        let phi = f.new_value(Ty::i64());
+        f.block_mut(2).instrs.insert(
+            0,
+            Instr::new(
+                phi,
+                Op::Phi(vec![(p, 0), (p, 1)].into_boxed_slice()),
+                Ty::i64(),
+                0x30,
+            ),
+        );
+        // A value defined twice: the table keeps the FIRST site, as the scan does.
+        let dup = f.new_value(Ty::i64());
+        f.block_mut(1)
+            .push(Instr::new(dup, Op::Const(1), Ty::i64(), 0x20));
+        f.block_mut(1)
+            .push(Instr::new(dup, Op::Const(2), Ty::i64(), 0x20));
+        // A terminator use.
+        f.block_mut(3).term = Terminator::Return(dup);
+        let t = Sweep::build(&f);
+        for v in 0..f.next_value {
+            assert_eq!(
+                t.def_of(v),
+                f.def(v),
+                "the def table disagrees with the scan for %{v}"
+            );
+            assert_eq!(
+                t.uses_of(v),
+                f.uses_of(v).as_slice(),
+                "the use table disagrees with the scan for %{v}"
+            );
+        }
+        assert_eq!(t.def_count[dup as usize], 2, "the census counts both defs");
+        assert_eq!(t.uses_of(phi).len(), 0, "the phi's result is never read");
+        // %p is read by the entry's comparison (slots 0 and 1), by the phi
+        // (slots 0 and 1) and by the exit's terminator.
+        assert_eq!(
+            t.uses_of(p).len(),
+            5,
+            "the operand slots and the terminator use are all counted"
+        );
+        assert_eq!(
+            t.uses_of(p)[4],
+            UseSite {
+                bb: 4,
+                instr: usize::MAX,
+                slot: 0
+            },
+            "the terminator use carries the usize::MAX marker, as the scan emits it"
+        );
     }
 }

@@ -1886,3 +1886,26 @@ The CARGO_TARGET_DIR trap fired a third time (this session: leaked from a dispat
 build into the parent shell; and mid-run in the child): every result above was
 re-measured after `unset`. The export rule for dispatch commands is a hazard, not
 just for interactive shells - use `env CARGO_TARGET_DIR=... cargo ...` per-command.
+
+## `verify_ssa` is linear: the 20k-block verify leg 274.7 s -> 9.5 ms (release), contract pinned first
+
+The named gap from the perf ledger is closed. Census (same ladder, ms per single
+verify_ssa, release): 500 blocks 119.3 -> 0.3; 2k 2732.8 -> 1.0; 8k 43211.7 -> 3.9;
+20k **271775 -> 9.5** (debug 1136005 -> 40.4). x40-blocks growth: x2278 -> x34.8 —
+work-per-node, not quadratic. The shape is the perf lane's own: a `Sweep` (one pass
+-> def site, def census, use sites, block-id index) + `DomIndex` (DFS [pre,post]
+intervals, O(1) dominance, exhaustively parity-checked against `Cfg::dominates`).
+CONTRACT FIRST: `crates/core/tests/verify_ssa_rejections.rs` — 54 fixtures pinning
+every rejection verify_ssa implements, written and sabotage-proven BEFORE the
+rewrite, and proven to pass against HEAD's OLD verifier in a clean clone (the suite
+pins the contract, not the new implementation). 13-entry sabotage table: each check
+deleted -> its fixture goes red with `was ACCEPTED by verify_ssa`; `DomIndex::
+dominates -> true` reddens a diamond parity test. Named unwitnessed check: the
+`bad use-site for %{v} in bb{}` message is defensive (stays green when deleted, as
+the suite header says).
+All 49 diagnostic strings preserved; the 20k verify test un-ignored with measured
+bounds (release 600 ms = 50x headroom, debug 5 s = 118x). Floors: t2 1700/1700/0/4 +
+memory 288 + ir 288 byte-preserved THROUGH the verifier rewrite (the oracle is
+load-bearing for every leg — lift 136/136, workspace 283/0, fmt/clippy/ratchet/status
+clean). Parent re-measured everything on c5374de + patch; child's environmental
+notes (clang 0xc0000142 under lane load, mid-build file swap) are its own, not tree state.

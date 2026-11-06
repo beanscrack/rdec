@@ -232,17 +232,83 @@ fn a_20k_block_function_finishes_and_answers_the_right_number() {
 }
 
 #[test]
-#[ignore = "release-only, measured: verify_ssa is quadratic in nodes on this fixture (debug 1k 1.95s, 2k 12.53s; release 1k 432ms, 2k 1.73s), so at 20k blocks the SSA check costs minutes-to-hours while the pipeline costs 86ms. Run with: cargo test --release -p rdec-core --test pipeline_scaling -- --ignored"]
 fn a_20k_block_ladder_is_valid_ir() {
-    // The claim the CI probe cannot afford: the FIXTURE, 20k blocks of it, is valid
-    // IR. Ignored with its measured cost in the reason, so nobody reads a green CI as
-    // "verify_ssa saw 20k blocks". It converges nothing and optimizes nothing; it is
-    // the fixture's own validity certificate, kept honest about when it runs.
-    let f = ladder(20_000);
-    let t = Instant::now();
-    verify_ssa(&f).expect("the 20k ladder fixture is valid IR");
-    println!("verify_ssa(20k blocks): {:?}", t.elapsed());
+    // The claim the CI probe used to be unable to afford. This test was
+    // `#[ignore]`d with its cost in the reason: "verify_ssa is quadratic in the
+    // node count (debug 1k 1.95s, 2k 12.53s; release 1k 432ms, 2k 1.73s), so at
+    // 20k blocks the SSA check costs minutes-to-hours while the pipeline costs
+    // 86ms". That number was real — re-measured on this machine at HEAD 893a0fe
+    // before the fix (pre-fix `verify.rs` installed, same probe):
+    //
+    //   blocks   BEFORE (release)   BEFORE (debug)
+    //     500        119.3 ms          496.4 ms
+    //    2 000     2 732.8 ms        10 777.1 ms
+    //    8 000    43 211.7 ms       184 357.7 ms
+    //   20 000   271 775.0 ms     1 136 005.5 ms   (272 s / 18.9 min)
+    //
+    // = x2278 (release) and x2288 (debug) of time for x40 of blocks. After the
+    // rewrite, the same probe in the same harness: release 0.3 / 1.0 / 3.9 / 9.6 ms
+    // and debug 1.1 / 4.1 / 16.7 / 40.0 ms at 500 / 2k / 8k / 20k — x32 (release)
+    // and x36 (debug) for the same x40 of blocks, i.e. work per node. The 20k leg
+    // is 28310x faster in release and 28400x in debug.
+    //
+    // `verify.rs` is now table-driven: one sweep builds the def site of every
+    // value, the use sites of every value, the block-id index, and the
+    // dominator-tree intervals that answer dominance in O(1), so the census
+    // below runs at every size, in CI, and the bound is set from the measurement
+    // with margin. THE RATIO IS THE LOAD-BEARING ASSERTION: 40x the blocks may
+    // cost tens of times the time; quadratic is 1600x and cannot hide inside it.
+    // The rejections this check must keep making are pinned by
+    // `crates/core/tests/verify_ssa_rejections.rs`.
+    let mut curve = Vec::new();
+    for n in [500usize, 2_000, 8_000, 20_000] {
+        let f = ladder(n);
+        let built = nodes(&f);
+        let t = Instant::now();
+        verify_ssa(&f)
+            .unwrap_or_else(|r| panic!("the {n}-block ladder fixture is valid IR: {r:?}"));
+        let el = t.elapsed();
+        println!(
+            "verify_ssa census: {n:>6} blocks / {built:>7} nodes -> {:>9.1} ms",
+            el.as_secs_f64() * 1e3
+        );
+        curve.push((n, el));
+    }
+    let (n1, t1) = curve[0];
+    let (n4, t4) = *curve.last().unwrap();
+    let ratio = t4.as_secs_f64() / t1.as_secs_f64().max(1e-6);
+    println!(
+        "verify_ssa census: {n1} -> {n4} blocks ({}x), time x{ratio:.1} | 20k leg {t4:?}",
+        n4 / n1
+    );
+    // Linear is 40x. The bound leaves room for a per-node constant that grows a
+    // little (cache, allocation) and for a loaded CI box, while the shape that
+    // lived here before - the O(nodes)-per-query scan, measured at x2278 for this
+    // same 40x - fails immediately.
+    assert!(
+        ratio < 400.0,
+        "{n1} -> {n4} blocks ({}x) cost {ratio:.0}x more verification time: verify_ssa grew super-linear",
+        n4 / n1
+    );
+    // The absolute bound, from the measured after-numbers with margin: the
+    // 20k-block SSA leg is the middle end's oracle at production scale and it
+    // must stay a rounding error next to the 357 ms pipeline leg.
+    assert!(
+        t4 < VERIFY_20K_BOUND,
+        "verify_ssa on the 20k-block ladder took {t4:?}, over the {VERIFY_20K_BOUND:?} bound"
+    );
 }
+
+/// The 20k `verify_ssa` bound, set from the measured after-numbers of the
+/// table-driven rewrite with ~50x-60x of headroom for a loaded CI box: the 20k
+/// leg measured 11.8 ms in release and 42.3 ms in debug on this machine, from
+/// this file's own census (which prints the curve on every run, so a bound that
+/// stops matching the measurement is visible, not folklore).
+const VERIFY_20K_BOUND: Duration = if cfg!(debug_assertions) {
+    Duration::from_millis(5_000)
+} else {
+    Duration::from_millis(600)
+};
 
 #[test]
 fn the_scaling_census_covers_1k_and_5k_blocks() {
