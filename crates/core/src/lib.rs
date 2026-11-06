@@ -20,7 +20,6 @@ pub mod fuse;
 pub mod interp;
 pub mod ir;
 pub mod passes;
-pub mod structure;
 pub mod tv;
 pub mod ty;
 pub mod verify;
