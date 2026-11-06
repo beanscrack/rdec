@@ -34,15 +34,23 @@ jobs:
       - name: clippy (deny warnings)
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: "corpus --cpp (fixtures the demangle tests read)"
+      - name: "corpus (C + C++ objects: generated, and tests read them)"
         # Generated, not committed (`*.obj` is gitignored) - so it has to exist
         # BEFORE the test step: the demangle integration tests read
         # corpus/cpp/obj/*.obj, and CI failed with "The system cannot find the path
         # specified" when the generation step sat after them (run 41415743892).
-        # The C++ gate itself, and the two-build manifest check, stay in the later
-        # "cpp corpus + demangle" step.
+        # The C corpus has the same property, and the same trap: the relocation tests
+        # (crates/arch-x86/tests/relocs.rs, rip_sites.rs) assert the loader's parsed
+        # relocation set against `llvm-objdump -r` on real corpus objects, so `corpus`
+        # must run here too - it used to live only in the later determinism step, and
+        # CI went red the same way (run 42148930772). Any test that reads a corpus
+        # object needs generation on its left in this file.
+        # The C++ gate itself, and the two-build manifest checks, stay in the later
+        # "corpus" and "cpp corpus + demangle" steps.
         shell: powershell
-        run: cargo run -q -p rdec-cli -- corpus --cpp
+        run: |
+          cargo run -q -p rdec-cli -- corpus
+          cargo run -q -p rdec-cli -- corpus --cpp
 
       - name: test (B1-B7 fixtures, TV, T1 grid, sabotage)
         run: cargo test --no-fail-fast
