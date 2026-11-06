@@ -1634,3 +1634,36 @@ object for it needs the builder's REL32 addend convention, and a first attempt p
 Two lanes are in flight on this HEAD: production robustness (`rdec fuzz`, hostile-input hardening
 across loader/demangler/discovery/decoder/emitter) and M5's first structuring slice (`if` /
 `if-else` / `while` recovery, conservatively, with T2 mismatch 0 as the semantic proof).
+
+### Gate ledger: production hardening — `c584a10` ratchet + release-mode parity
+
+**Release-mode parity, measured on `c584a10` in an isolated worktree with its own
+`CARGO_TARGET_DIR`** (the shared working tree had two children editing it, and a build
+there measures their in-flight code, not a commit):
+
+    discover  120 objects, 124 functions, 0 missing, 0 extra starts,
+              5956/5956 = 100.00%, 2 tables / 12 slots / 0 unresolved, gaps: none
+    c         124 lifted / 86 emitted / 38 refused / 0 invalid; clang -Werror: OK
+    lift      OK: every lifted function is structurally valid IR
+    objdump   OK;  demangle 68/68
+    t2 C      compared 1412 | match 1412 | mismatch 0 | 4 faults (the same loop_do timeouts)
+    t2 C++    compared 856 | match 856 | mismatch 0; buckets sum 69 == lifted 69
+    status    exit 0, zero FAIL rows
+    cargo test --release --workspace   180 passed, 0 failed
+
+Every number equals the debug-mode floor, and the suite passes with `debug_assert!`
+compiled out — so the decoder's asserts are exercised by the debug suite and are not
+load-bearing for any answer the release build gives. This is now a standing CI job
+(`release-parity`), not a one-off measurement: `--release` is what a user runs.
+
+**Panic-site ratchet.** Every `unwrap()`/`expect()`/`panic!()`/`todo!()`/`unimplemented!()`
+in the repo was read (99 sites; 30 in library non-test code). One is a certain panic on
+realistic input — `loader.rs` sorting symbols by `symbols[i].section.unwrap()`, where
+`section` is `None` for `SectionNumber == 0` absolute symbols that every linked object
+carries. The demangler's `peek().unwrap()` sites and `interp.rs`'s `d.cf.unwrap()` are
+assigned to the robustness lane with red-first fixture requirements. `cfg.rs:66`,
+`flags.rs:241`, `lift.rs:1851` and the four `sig.unwrap()`s were checked and are guarded —
+recorded so the next audit does not re-litigate them, and so nobody "fixes" a non-bug.
+`scripts/unwrap_ratchet.sh` + `.gate/unwrap-baseline` pins the per-crate count, fails on a
+rise, fails on a fall (with an instruction to lower the baseline), fails on a missing
+baseline, and runs in both CI jobs.

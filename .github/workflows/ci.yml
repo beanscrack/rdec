@@ -130,6 +130,53 @@ jobs:
       - name: status (prints section 9's table from the commands above)
         run: cargo run -q -p rdec-cli -- status
 
+  release-parity:
+    # Release mode is what a user runs, and `--release` compiles OUT every
+    # `debug_assert!` - including the ones in the decoder that keep iced's
+    # instruction claims honest. A gate that only ever runs in debug proves the
+    # claims of a build nobody ships. Measured parity at c584a10: every floor is
+    # identical to debug (discover 100.00% 5956/5956, gaps none; c 124 lifted /
+    # 86 emitted / 38 refused / 0 invalid; t2 --corpus 1412/1412/mismatch 0 with the
+    # same 4 faults; t2 --cpp 856/856/0; objdump-check OK; demangle 68/68; `status`
+    # exit 0 with zero FAIL rows) and the whole suite passes with the asserts gone:
+    # 180 passed, 0 failed.
+    #
+    # The binary is target/release/rdec.exe - the PACKAGE is rdec-cli, the BINARY is
+    # rdec. A script that names `rdec-cli.exe` reports "no binary" and looks exactly
+    # like a build failure (measured: it cost two runs of this measurement).
+    needs: gates
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
+      - name: "build (release mode; every debug_assert is compiled out)"
+        run: cargo build --release -p rdec-cli
+
+      - name: "corpus (generated, gitignored; the gates read these objects)"
+        run: |
+          cargo run --release -q -p rdec-cli -- corpus
+          cargo run --release -q -p rdec-cli -- corpus --cpp
+
+      - name: "gates under release (the same commands, the same floors)"
+        run: |
+          cargo run --release -q -p rdec-cli -- discover --corpus
+          cargo run --release -q -p rdec-cli -- c --corpus
+          cargo run --release -q -p rdec-cli -- cpp --corpus
+          cargo run --release -q -p rdec-cli -- lift --corpus
+          cargo run --release -q -p rdec-cli -- objdump-check --corpus
+          cargo run --release -q -p rdec-cli -- demangle --cpp
+          cargo run --release -q -p rdec-cli -- t2 --corpus
+          cargo run --release -q -p rdec-cli -- t2 --cpp
+          cargo run --release -q -p rdec-cli -- status
+
+      - name: "test --release (fixtures, TV, T1 grid, sabotage; asserts OFF)"
+        run: cargo test --release --workspace --no-fail-fast
+
+      - name: "ratchet (panic sites; the same gate, on the release tree)"
+        run: bash scripts/unwrap_ratchet.sh
+
   t1-full:
     # 9.7e9 probes against hardware EFLAGS, ~6 min release build. Nightly/dispatch
     # only: the grid is the PR gate, the sweep is the regression net.
