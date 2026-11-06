@@ -481,6 +481,19 @@ pub fn run_budget(f: &Function, inputs: &[u64], budget: usize) -> Exec {
     run_program_budget(f, inputs, &[], budget)
 }
 
+/// Run with the memory PRE-SEEDED at given bytes, as (address, byte).
+///
+/// The caller owns the seed: T2's caller-buffer vectors preload the same
+/// window bytes the two harnesses memcpy before the call, so the IR leg
+/// starts the run reading the same bytes the machine buffer and `rdec_mem`
+/// window hold. A load of a byte nothing wrote stays `Fault::UnmodeledLoad`
+/// (the seed never silences a read outside the window): seeding is the point
+/// of this entry, and a memory model that reads unseeded bytes as 0 is the
+/// silent-0 the interpreter exists to refuse.
+pub fn run_budget_seed(f: &Function, inputs: &[u64], budget: usize, seed: &[(u64, u8)]) -> Exec {
+    run_program_budget_seed(f, inputs, &[], budget, seed)
+}
+
 /// Run `f` with `program` as the set of functions it may call: a call to a
 /// named target in the program executes that function's own body, in this run,
 /// with the arguments bound to its parameters and the same flat memory.
@@ -493,6 +506,17 @@ pub fn run_program_budget(
     inputs: &[u64],
     program: &[Function],
     budget: usize,
+) -> Exec {
+    run_program_budget_seed(f, inputs, program, budget, &[])
+}
+
+/// `run_program_budget` with the memory pre-seeded (see `run_budget_seed`).
+pub fn run_program_budget_seed(
+    f: &Function,
+    inputs: &[u64],
+    program: &[Function],
+    budget: usize,
+    seed: &[(u64, u8)],
 ) -> Exec {
     let mut it = Interp {
         f,
@@ -507,6 +531,9 @@ pub fn run_program_budget(
         abort: None,
         prev_bb: None,
     };
+    for &(addr, byte) in seed {
+        it.mem.store(addr, 1, byte as u64);
+    }
     let outcome = it.exec_entry(inputs);
     Exec {
         outcome,

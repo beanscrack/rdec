@@ -411,6 +411,144 @@ fn c_wrapper(idx: usize, cname: &str) -> String {
     )
 }
 
+/// The job tables plus the window map. `w[j]` is 1 for a caller-buffer job:
+/// the runner calls `FNW[JOB_SYM[j]](JOB_VEC[j], words)` and reports the
+/// post-call buffer words beside the return value.
+fn job_tables_win(jobs: &[(usize, usize)], w: &[u32]) -> String {
+    let n = jobs.len();
+    format!(
+        "{}static const unsigned JOB_WIN[{n}] = {{{}}};\n",
+        job_tables(jobs),
+        w.iter()
+            .enumerate()
+            .map(|(i, x)| format!("{x}{}", if i + 1 < n { "," } else { "" }))
+            .collect::<String>()
+    )
+}
+
+/// The body every window runner shares: same one-flushed-line protocol as
+/// `main_body`, plus the post-call buffer words for a caller-buffer job. The
+/// `fflush` *before* the call is the point, unchanged: a crashing job leaves
+/// no line, so the parent blames the right function.
+fn main_body_mem(n_jobs: usize, seed: &str) -> String {
+    format!(
+        "int main(int argc, char **argv) {{\n\
+         {seed}\
+         \x20 long long start = 0;\n\
+         \x20 if (argc >= 3 && strcmp(argv[1], \"--start\") == 0) start = atoll(argv[2]);\n\
+         \x20 for (long long j = start; j < (long long){n_jobs}; ++j) {{\n\
+         \x20   fflush(stdout);\n\
+         \x20   if (JOB_WIN[j]) {{\n\
+         \x20     uint64_t words[512];\n\
+         \x20     uint64_t r = FNW[JOB_SYM[j]](JOB_VEC[j], words);\n\
+         \x20     printf(\"RDEC %lld %016llx W\", j, (unsigned long long)r);\n\
+         \x20     for (int k = 0; k < 512; ++k) printf(\" %016llx\", (unsigned long long)words[k]);\n\
+         \x20     printf(\"\\n\");\n\
+         \x20   }} else {{\n\
+         \x20     uint64_t r = FN[JOB_SYM[j]](V[JOB_VEC[j]][0], V[JOB_VEC[j]][1],\n\
+         \x20                              V[JOB_VEC[j]][2], V[JOB_VEC[j]][3]);\n\
+         \x20     printf(\"RDEC %lld %016llx\\n\", j, (unsigned long long)r);\n\
+         \x20   }}\n\
+         \x20   fflush(stdout);\n\
+         \x20 }}\n\
+         \x20 printf(\"RDEC DONE\\n\");\n\
+         \x20 fflush(stdout);\n\
+         \x20 return 0;\n}}\n"
+    )
+}
+
+/// The decompiled side's caller-buffer wrapper: preload the window with the
+/// vector's shared pattern, call with the window's ADDRESS INTEGER, read the
+/// window back. The mapping is exact by the PRELUDE's own rule: a store the
+/// emitted code performs is `store_n(RDEC_ADDR(x), v)` with
+/// `x = 0x2000 + delta`, and `RDEC_ADDR` is the identity on the window -
+/// native buffer byte k IS `rdec_mem[0x2000 + k]`. The return is widened
+/// from the declared type exactly as `c_wrapper` does.
+fn c_wrapper_mem(idx: usize, cname: &str) -> String {
+    format!(
+        "static uint64_t v{idx}(unsigned j, uint64_t* out) {{\n\
+         \x20 memcpy(&rdec_mem[RDEC_ADDR({WIN_ADDR}ULL)], W[j], sizeof W[j]);\n\
+         \x20 uint64_t r = (uint64_t){cname}((int64_t)RDEC_ADDR({WIN_ADDR}ULL),\n\
+         \x20                            (int64_t)V[j][1], (int64_t)V[j][2], (int64_t)V[j][3]);\n\
+         \x20 for (int k = 0; k < 512; ++k) out[k] = load_8(RDEC_ADDR({WIN_ADDR}ULL + 8 * (uint64_t)k));\n\
+         \x20 return r;\n}}\n"
+    )
+}
+
+/// The machine side's caller-buffer wrapper: a real 4 KiB buffer, preloaded
+/// with the same `W[j]` bytes, called through its address. The machine side
+/// is never sabotaged - the sabotage hooks corrupt the decompiled side, the
+/// side under test.
+fn native_wrapper_mem(idx: usize, sym: &str) -> String {
+    format!(
+        "static uint64_t g{idx}(unsigned j, uint64_t* out) {{\n\
+         \x20 uint64_t buf[512];\n\
+         \x20 memcpy(buf, W[j], sizeof buf);\n\
+         \x20 uint64_t r = (uint64_t){sym}((uint64_t)(uintptr_t)buf, V[j][1], V[j][2], V[j][3]);\n\
+         \x20 memcpy(out, buf, sizeof buf);\n\
+         \x20 return r;\n}}\n"
+    )
+}
+
+/// Sabotage hooks (self-test, LOUD: the run prints the mode it was given,
+/// and `crates/cli/tests/t2_memory_effects.rs` pins that each mode goes the
+/// gate red for exactly the reason it names):
+///  * `store`: every store the decompiled side performs INTO THE WINDOW
+///    RANGE lands 8 bytes later. The values, the loads and the returns are
+///    untouched - a scribble a return-value comparison cannot see, which is
+///    the whole class this lane added the memory axis to catch.
+///  * `prologue`: every caller-buffer function gets a store into word 0 of
+///    the buffer it was handed: a SPURIOUS WRITE, including into functions
+///    whose source writes nothing at all.
+///  * `cmp`: the buffer comparison is replaced by "lengths match". A
+///    sabotage of the COMPARATOR: with `store` it must turn a real
+///    difference green, which is the proof that the red is the bytes and
+///    not the bookkeeping.
+fn sabotage_modes() -> (bool, bool, bool) {
+    let s = std::env::var("RDEC_T2_SABOTAGE").unwrap_or_default();
+    let has = |m: &str| s.split(',').any(|x| x.trim() == m);
+    (has("store"), has("prologue"), has("cmp"))
+}
+
+/// The shifted-store helpers, emitted into the decompiled TU under
+/// `RDEC_T2_SABOTAGE=store`. `rdec_sab` shifts only addresses inside the
+/// window `[0x2000, 0x3000)`: frame stores (0x80000) and data stores
+/// (0x81000+) are untouched, so the functions T2 has always compared keep
+/// returning exactly what they return today, and the ONLY thing that goes
+/// red is the buffer byte comparison.
+fn saboteur_prelude() -> &'static str {
+    "/* RDEC_T2_SABOTAGE=store: the decompiled side's window stores are shifted +8 (self-test hook). */\n\
+     static inline __attribute__((unused)) uint64_t rdec_sab(uint64_t a){ return a + (((a - 0x2000ULL) & ((1u << 20) - 1)) < 0x1000ULL ? 8 : 0); }\n\
+     static inline __attribute__((unused)) void rdec_sab_store_1(uint64_t a,uint64_t v){store_1(rdec_sab(a),v);}\n\
+     static inline __attribute__((unused)) void rdec_sab_store_2(uint64_t a,uint64_t v){store_2(rdec_sab(a),v);}\n\
+     static inline __attribute__((unused)) void rdec_sab_store_4(uint64_t a,uint64_t v){store_4(rdec_sab(a),v);}\n\
+     static inline __attribute__((unused)) void rdec_sab_store_8(uint64_t a,uint64_t v){store_8(rdec_sab(a),v);}\n"
+}
+
+/// The `prologue` scribble: insert one window store as the emitted
+/// function's first statement. `a0` is the emitter's own name for parameter
+/// 0, and the store it writes is one the SOURCE never performed.
+fn prologue_scribble(text: &str, cname: &str) -> String {
+    let head = format!("{cname}(");
+    let Some(h) = text.find(&head) else {
+        return text.to_string();
+    };
+    let Some(o) = text[h..].find('{') else {
+        return text.to_string();
+    };
+    let at = h + o + 1;
+    // The scribble lands at window word 48 (byte 384 from the window base):
+    // INSIDE the 4 KiB window, OUTSIDE every fixture's footprint (the
+    // largest fixture touches words 0..15). The function's return value
+    // cannot depend on it, so this sabotage can ONLY be caught by the
+    // buffer comparison - exactly the sin it simulates.
+    format!(
+        "{}\n  store_8(RDEC_ADDR(a0 + 384), 0x5ab5deadbeefULL);{}",
+        &text[..at],
+        &text[at..]
+    )
+}
+
 /// Does this function's emitted C declare a 32-bit return, i.e. did the lifter
 /// record that its answer reaches `RAX` through a 32-bit write? Counted so the
 /// width modelling is a number the gate prints, not a claim in a comment.
@@ -431,6 +569,9 @@ fn declares_32_bit_return(f: &Function) -> bool {
 struct Run {
     /// Global job id -> the 64-bit value the side returned.
     vals: BTreeMap<usize, u64>,
+    /// Global job id -> the 512 post-call window words a caller-buffer job
+    /// reported beside its return value.
+    wins: BTreeMap<usize, Vec<u64>>,
     /// Global job ids that never reported, with why.
     faults: Vec<(usize, String)>,
     restarts: usize,
@@ -443,6 +584,7 @@ struct Run {
 fn drain(exe: &Path, ids: &[usize]) -> Run {
     let total = ids.len();
     let mut vals = BTreeMap::new();
+    let mut wins: BTreeMap<usize, Vec<u64>> = BTreeMap::new();
     let mut faults: Vec<(usize, String)> = Vec::new();
     let mut next = 0usize;
     let mut restarts = 0usize;
@@ -507,8 +649,23 @@ fn drain(exe: &Path, ids: &[usize]) -> Run {
                     ) else {
                         continue;
                     };
+                    // A caller-buffer job appends ` W <512 words>` to the
+                    // same line: the return value and the post-call buffer
+                    // arrive as one atomic line, so the crash protocol can
+                    // never observe half a job.
+                    let mut words: Option<Vec<u64>> = None;
+                    if it.next() == Some("W") {
+                        let wv: Vec<u64> =
+                            it.filter_map(|t| u64::from_str_radix(t, 16).ok()).collect();
+                        if wv.len() == WIN_WORDS {
+                            words = Some(wv);
+                        }
+                    }
                     if i < total {
                         vals.insert(ids[i], v);
+                        if let Some(wv) = words {
+                            wins.insert(ids[i], wv);
+                        }
                         last = last.max(i + 1);
                     }
                 }
@@ -546,6 +703,7 @@ fn drain(exe: &Path, ids: &[usize]) -> Run {
     }
     Run {
         vals,
+        wins,
         faults,
         restarts,
     }
@@ -702,6 +860,12 @@ struct Sub<'a> {
     /// Declared return kind (XMM0 class): Int = compare RAX, F32/F64 =
     /// compare XMM0's bits at that width.
     xret: XRet,
+    /// Caller-buffer (window) class: the function reads/writes memory
+    /// through `param 0` under the caller-buffer rule. The harness hands
+    /// the machine code a real 4 KiB buffer and the decompiled C the
+    /// window's address integer (0x2000) preloaded with the same bytes,
+    /// and the run compares the RETURN **and** the buffer's bytes.
+    win: bool,
 }
 
 /// Zero-extend every argument to 32 bits.
@@ -840,6 +1004,13 @@ pub fn cmd_t2(args: &[String]) -> Result<i32, String> {
     // seeded into the C model's flat memory at the SAME addresses the emitted
     // code names: `m4::data_map_of`, one map per object, chunked into arrays.
     let data_chunks = data_images(&files)?;
+    // The seeded byte ranges, as (start, end): the caller-buffer rule admits
+    // a constant-address load exactly when its bytes are in here (both sides
+    // seed them) — an unseeded constant is stack garbage vs zero.
+    let data_ranges: Vec<(u64, u64)> = data_chunks
+        .iter()
+        .map(|(va, bytes)| (*va, va + bytes.len() as u64))
+        .collect();
 
     for (si, s) in subjects.iter().enumerate() {
         lifted += 1;
@@ -902,9 +1073,33 @@ pub fn cmd_t2(args: &[String]) -> Result<i32, String> {
             );
             continue;
         }
+        // Memory outside the modelled frame used to end the question. The
+        // caller-buffer rule (see the block above `loose_root`) decides which
+        // of these functions share an address the two sides can compare:
+        // a base-arithmetic chain from `param 0` means the harness hands the
+        // machine code a real 4 KiB buffer and the decompiled C the window's
+        // address integer - same bytes, same offsets - and the run compares
+        // the buffer's bytes as well as the return value. The rule's `Err`
+        // text names the instruction the way the RAX bucket names its sites.
+        let mut win = false;
         if touches_memory_outside_the_frame(&s.f) {
-            skip("memory outside the modelled frame", &mut skipped);
-            continue;
+            match caller_buffer_rule(&s.f, &data_ranges) {
+                Ok(()) => {
+                    win = true;
+                    if std::env::var_os("RDEC_T2_NAMES").is_some() {
+                        // The window class is an admission decision; the
+                        // diagnostic lists its members, like every other class.
+                        println!("window: {tag}");
+                    }
+                }
+                Err(why) => {
+                    skipped
+                        .entry("memory outside the modelled frame".to_string())
+                        .or_default()
+                        .push(format!("{tag}: caller-buffer rule: {why}"));
+                    continue;
+                }
+            }
         }
         if returns_undef(&s.f) {
             // Name the paths, not just the function: which return, at what
@@ -940,6 +1135,7 @@ pub fn cmd_t2(args: &[String]) -> Result<i32, String> {
             // The C corpus has no declared shapes: the integer model.
             xargs: Vec::new(),
             xret: XRet::Int,
+            win,
         });
     }
     if subs.is_empty() {
@@ -983,6 +1179,27 @@ pub fn cmd_t2(args: &[String]) -> Result<i32, String> {
         .count();
 
     // --- the decompiled side: the emitter's own text, plus a table ---
+    let has_win = subs.iter().any(|s| s.win);
+    // The shared W[v] table is emitted right after the PRELUDE: the w{idx}
+    // window wrappers below read W[v], and the native driver emits the same
+    // table before its g{pos} wrappers. One definition, same numbers, both
+    // drivers - the seed bytes are the program's, not the harness's.
+    let wtab_c = window_c_array(&window_table(vecs.len()));
+    let (sab_store, sab_prologue, sab_cmp) = sabotage_modes();
+    if sab_store || sab_prologue || sab_cmp {
+        println!(
+            "SABOTAGE: RDEC_T2_SABOTAGE={} - the decompiled side is deliberately broken (self-test hook; the machine side is never touched)",
+            std::env::var("RDEC_T2_SABOTAGE").unwrap_or_default()
+        );
+    }
+    if (sab_store || sab_prologue || sab_cmp) && !has_win {
+        println!("SABOTAGE WARNING: no caller-buffer functions in this run - the requested sabotage has NOTHING to bite, and this run measures nothing");
+    }
+    let win_cnames: BTreeSet<&str> = subs
+        .iter()
+        .filter(|s| s.win)
+        .map(|s| s.s.cname.as_str())
+        .collect();
     let mut decomp = String::from(
         "/* rdec t2: the decompiled side. Every function below is the text\n\
          \x20  `rdec c` writes into corpus/c/all.c, from the same emitter. */\n\
@@ -990,13 +1207,37 @@ pub fn cmd_t2(args: &[String]) -> Result<i32, String> {
     );
     decomp.push_str(PRELUDE);
     decomp.push('\n');
+    if has_win {
+        decomp.push_str(&wtab_c);
+        // The window wrappers read V[v][1..3] for the untouched args, so the
+        // vector table precedes the wrappers here too.
+        decomp.push_str(&c_array(&vecs));
+    }
+    if sab_store {
+        decomp.push_str(saboteur_prelude());
+    }
     decomp.push_str(&data_arrays(&data_chunks));
     // EVERY emitted definition whose calls all land inside the TU (the
     // fixpoint above): a text whose extern names a refused symbol would
     // break the link, so it is not emitted here.
     for (i, t) in texts.iter().enumerate() {
         if include[i] {
-            decomp.push_str(t.as_ref().expect("include implies Ok").text.as_str());
+            let mut text = t.as_ref().expect("include implies Ok").text.clone();
+            if sab_store {
+                // The emitter's own stores, redirected through `rdec_sab`
+                // (window-range addresses only): a scribble in the buffer the
+                // returns cannot see. Frame/data stores are untouched.
+                for n in [1, 2, 4, 8] {
+                    text = text.replace(
+                        &format!("store_{n}(RDEC_ADDR("),
+                        &format!("rdec_sab_store_{n}(RDEC_ADDR("),
+                    );
+                }
+            }
+            if sab_prologue && win_cnames.contains(subjects[i].cname.as_str()) {
+                text = prologue_scribble(&text, &subjects[i].cname);
+            }
+            decomp.push_str(&text);
             decomp.push('\n');
         }
     }
@@ -1006,14 +1247,48 @@ pub fn cmd_t2(args: &[String]) -> Result<i32, String> {
     }
     decomp.push_str("static const Fn FN[] = {\n");
     for sb in &subs {
+        // A caller-buffer job never calls through FN (the JOB_WIN branch
+        // calls FNW), but the wrapper is callable and inert for a window
+        // function - it preloads the window, the call's result is discarded.
+        // Keeping the reference here is what keeps -Wunused-function off the
+        // wrapper while the protocol keeps the two tables disjoint by class.
+        let _ = sb.win;
         decomp.push_str(&format!("  w{},\n", sb.c_sym));
     }
     decomp.push_str("};\n");
-    decomp.push_str(&c_array(&vecs));
+    if has_win {
+        decomp.push_str("typedef uint64_t (*FnW)(unsigned, uint64_t*);\n");
+        for sb in &subs {
+            if sb.win {
+                decomp.push_str(&c_wrapper_mem(sb.c_sym, &sb.s.cname));
+            }
+        }
+        decomp.push_str("static const FnW FNW[] = {\n");
+        for sb in &subs {
+            let entry = if sb.win {
+                format!("  v{},\n", sb.c_sym)
+            } else {
+                "  0,\n".to_string()
+            };
+            decomp.push_str(&entry);
+        }
+        decomp.push_str("};\n");
+    }
+    if !has_win {
+        // Without a window class there are no wrappers: V keeps its natural
+        // slot (with one, it was emitted above, right after W).
+        decomp.push_str(&c_array(&vecs));
+    }
     // The decompiled side runs every job in job order, so its job list is the
     // global one: that is what makes the two sides' job lists the same list.
-    decomp.push_str(&job_tables(&jobs));
-    decomp.push_str(&main_body(jobs.len(), &data_memcpy(&data_chunks)));
+    if has_win {
+        let w: Vec<u32> = jobs.iter().map(|(k, _)| subs[*k].win as u32).collect();
+        decomp.push_str(&job_tables_win(&jobs, &w));
+        decomp.push_str(&main_body_mem(jobs.len(), &data_memcpy(&data_chunks)));
+    } else {
+        decomp.push_str(&job_tables(&jobs));
+        decomp.push_str(&main_body(jobs.len(), &data_memcpy(&data_chunks)));
+    }
     let decomp_src = PathBuf::from(format!("{out_dir}/t2_decomp.c"));
     let decomp_exe = PathBuf::from(format!("{out_dir}/t2_decomp.exe"));
     std::fs::write(&decomp_src, &decomp).map_err(|e| format!("{}: {e}", decomp_src.display()))?;
@@ -1038,19 +1313,22 @@ pub fn cmd_t2(args: &[String]) -> Result<i32, String> {
     let mut drivers: Vec<(String, PathBuf, Vec<usize>)> = Vec::new();
     for obj in &order {
         let ks = &by_obj[obj];
-        let mut syms: Vec<String> = Vec::new();
+        // (symbol, is-caller-buffer) per table slot: the same table the
+        // decompiled side uses, the same slot indexing the job tables use.
+        let mut symwin: Vec<(String, bool)> = Vec::new();
         for &k in ks {
             let sym = subs[k].s.sym.clone();
-            if !syms.contains(&sym) {
-                syms.push(sym);
+            if !symwin.iter().any(|(s, _)| *s == sym) {
+                symwin.push((sym, subs[k].win));
             }
         }
+        let obj_win = symwin.iter().any(|(_, w)| *w);
         let mut src = format!(
             "/* rdec t2: the machine-code side of {obj}.\n\
              \x20  The real .obj is linked in; the externs are its own symbols. */\n\
              #include <stdint.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n"
         );
-        for sym in &syms {
+        for (sym, _) in &symwin {
             // The declared types are the ABI's, not the source's: the object
             // reads ECX of a Win64 first argument, and ECX is the low 32 bits of
             // the 64-bit register the driver passes — the same read the lifter
@@ -1059,25 +1337,66 @@ pub fn cmd_t2(args: &[String]) -> Result<i32, String> {
                 "extern uint64_t {sym}(uint64_t, uint64_t, uint64_t, uint64_t);\n"
             ));
         }
+        if obj_win {
+            src.push_str(&window_c_array(&window_table(vecs.len())));
+            // The g{pos} wrappers read V[v][1..3]; the V table is the same
+            // table the decompiled driver embeds.
+            src.push_str(&c_array(&vecs));
+        }
         src.push_str("typedef uint64_t (*Fn)(uint64_t, uint64_t, uint64_t, uint64_t);\n");
         src.push_str("static const Fn FN[] = {\n");
-        for sym in &syms {
-            src.push_str(&format!("  {sym},\n"));
+        for (sym, w) in &symwin {
+            let entry = if *w {
+                "  0,\n".to_string()
+            } else {
+                format!("  {sym},\n")
+            };
+            src.push_str(&entry);
         }
         src.push_str("};\n");
+        if obj_win {
+            src.push_str("typedef uint64_t (*FnW)(unsigned, uint64_t*);\n");
+            for (pos, (sym, w)) in symwin.iter().enumerate() {
+                if *w {
+                    src.push_str(&native_wrapper_mem(pos, sym));
+                }
+            }
+            src.push_str("static const FnW FNW[] = {\n");
+            for (pos, (_, w)) in symwin.iter().enumerate() {
+                let entry = if *w {
+                    format!("  g{pos},\n")
+                } else {
+                    "  0,\n".to_string()
+                };
+                src.push_str(&entry);
+            }
+            src.push_str("};\n");
+        }
         // This driver's jobs, in global order: (symbol index, vector), plus the
         // global job id it reports, so the parent can merge the two sides.
         let mut local: Vec<(usize, usize)> = Vec::new();
+        let mut localwin: Vec<u32> = Vec::new();
         let mut ids: Vec<usize> = Vec::new();
         for (g, (k, v)) in jobs.iter().enumerate() {
             if ks.contains(k) {
-                local.push((ks.iter().position(|kk| kk == k).unwrap(), *v));
+                let pos = ks.iter().position(|kk| kk == k).unwrap();
+                local.push((pos, *v));
+                localwin.push(subs[ks[pos]].win as u32);
                 ids.push(g);
             }
         }
-        src.push_str(&c_array(&vecs));
-        src.push_str(&job_tables(&local));
-        src.push_str(&main_body(local.len(), ""));
+        if !obj_win {
+            // With a window class, V was emitted early (the g wrappers read
+            // it); without one it keeps its natural slot before the tables.
+            src.push_str(&c_array(&vecs));
+        }
+        if obj_win {
+            src.push_str(&job_tables_win(&local, &localwin));
+            src.push_str(&main_body_mem(local.len(), ""));
+        } else {
+            src.push_str(&job_tables(&local));
+            src.push_str(&main_body(local.len(), ""));
+        }
         let sp = PathBuf::from(format!("{out_dir}/t2_native_{}.c", stem_of(obj)));
         let ep = PathBuf::from(format!("{out_dir}/t2_native_{}.exe", stem_of(obj)));
         std::fs::write(&sp, &src).map_err(|e| format!("{}: {e}", sp.display()))?;
@@ -1125,6 +1444,13 @@ pub fn cmd_t2(args: &[String]) -> Result<i32, String> {
         "return width: {ret32}/{} of the runnable functions declare uint32_t (their answer reaches RAX through a 32-bit write, which zeroes bits 63:32), the rest int64_t",
         subs.len()
     );
+    if has_win {
+        let wf = subs.iter().filter(|s| s.win).count();
+        let wj = jobs.iter().filter(|(k, _)| subs[*k].win).count();
+        println!(
+            "caller-buffer: {wf} functions ({wj} jobs) take a 4 KiB window in arg 0: the machine side passes a real buffer, the decompiled C the window's address integer (0x2000), both preloaded from one shared W[v] table; these runs compare the buffer's bytes as well as the return value"
+        );
+    }
     println!(
         "build: {built}/{} harnesses with {cc} -Werror in {:?}, {} failures",
         builds.len(),
@@ -1143,11 +1469,13 @@ pub fn cmd_t2(args: &[String]) -> Result<i32, String> {
     let all_ids: Vec<usize> = (0..jobs.len()).collect();
     let crun = drain(&decomp_exe, &all_ids);
     let mut native: BTreeMap<usize, u64> = BTreeMap::new();
+    let mut native_wins: BTreeMap<usize, Vec<u64>> = BTreeMap::new();
     let mut native_faults: Vec<(usize, String)> = Vec::new();
     let mut native_restarts = 0usize;
     for (obj, exe, ids) in &drivers {
         let r = drain(exe, ids);
         native.extend(r.vals);
+        native_wins.extend(r.wins);
         native_restarts += r.restarts;
         for (g, why) in r.faults {
             native_faults.push((g, format!("{obj}: {why}")));
@@ -1162,6 +1490,15 @@ pub fn cmd_t2(args: &[String]) -> Result<i32, String> {
     let mut mismatch: Vec<String> = Vec::new();
     let mut not_compared = 0usize;
     let mut above_bit31 = 0usize;
+    // The memory axis: caller-buffer jobs compare the POST-CALL WINDOW bytes
+    // as well as the return value. Its own buckets, its own line: the return
+    // tuple above keeps counting exactly what it counted before this axis
+    // existed, and a scribble the returns cannot see gets its own count, its
+    // own names, and its own FAIL.
+    let mut mem_cmp = 0usize;
+    let mut mem_match = 0usize;
+    let mut mem_mismatch: Vec<String> = Vec::new();
+    let mut mem_nc = 0usize;
     // snippet -> (mismatches, comparisons)
     let mut by_snippet: BTreeMap<String, [usize; 2]> = BTreeMap::new();
     // IR shape signature -> how many mismatching functions carry it
@@ -1216,6 +1553,73 @@ pub fn cmd_t2(args: &[String]) -> Result<i32, String> {
                 y
             ));
         }
+        // --- memory axis: the caller-buffer job's post-call window bytes ---
+        // A job that faulted never reached here (no line, named fault above);
+        // a job that reported delivered return and buffer on ONE line, so
+        // this comparison sees both sides' full runs of the function.
+        if subs[*k].win {
+            mem_cmp += 1;
+            match (native_wins.get(&g), crun.wins.get(&g)) {
+                (Some(nw), Some(cw)) => {
+                    // `RDEC_T2_SABOTAGE=cmp` (comparator sabotage): "lengths
+                    // match" replaces byte equality. Paired with `store` it
+                    // turns a REAL byte difference green, which is the proof
+                    // the memory red lives in the bytes and not in
+                    // bookkeeping. It is a sabotage, not a mode: the
+                    // hermetic test demands the gate go red WITHOUT it.
+                    let eq = if sab_cmp {
+                        nw.len() == cw.len()
+                    } else {
+                        nw == cw
+                    };
+                    if eq {
+                        mem_match += 1;
+                    } else {
+                        let off = nw
+                            .iter()
+                            .zip(cw.iter())
+                            .position(|(a, b)| a != b)
+                            .unwrap_or(0);
+                        mem_mismatch.push(format!(
+                            "{} :: {}  vector {v}  MEMORY: the return {:#018x} AGREES and the caller buffer DIFFERS: word {off} (byte offset {:#x}) machine={:#018x} decompiled C={:#018x}",
+                            subs[*k].s.obj,
+                            subs[*k].s.sym,
+                            x,
+                            off * 8,
+                            nw[off],
+                            cw[off]
+                        ));
+                    }
+                }
+                (None, None) => {
+                    mem_nc += 1;
+                    if mem_nc <= FAULT_LINES {
+                        println!(
+                            "NOT COMPARED (memory): {} :: {}  vector {v}  both sides are missing the window bytes",
+                            subs[*k].s.obj, subs[*k].s.sym
+                        );
+                    }
+                }
+                (None, Some(_)) => {
+                    mem_nc += 1;
+                    if mem_nc <= FAULT_LINES {
+                        println!(
+                            "NOT COMPARED (memory): {} :: {}  vector {v}  side missing the window bytes: machine code",
+                            subs[*k].s.obj, subs[*k].s.sym
+                        );
+                    }
+                }
+                (Some(_), None) => {
+                    mem_nc += 1;
+                    if mem_nc <= FAULT_LINES {
+                        println!(
+                            "NOT COMPARED (memory): {} :: {}  vector {v}  side missing the window bytes: decompiled C",
+                            subs[*k].s.obj, subs[*k].s.sym
+                        );
+                    }
+                }
+            }
+        }
     }
     let compared = match_n + mismatch.len();
     let fault_jobs: BTreeSet<usize> = crun
@@ -1224,6 +1628,122 @@ pub fn cmd_t2(args: &[String]) -> Result<i32, String> {
         .map(|(g, _)| *g)
         .chain(native_faults.iter().map(|(g, _)| *g))
         .collect();
+
+    // --- the third leg: the IR interpreter, in-process, same seed bytes ---
+    // The C leg compares machine vs decompiled text. This leg runs the same
+    // window vectors on the post-pass IR (`s.f`) with the interpreter's
+    // sparse memory pre-seeded with the same `W[v]` bytes at the same
+    // 0x2000, and compares the return value and the window:
+    // native buffer byte k == interpreter byte at 0x2000 + k. A vector the
+    // interpreter cannot run (unmodelled load, step budget, float return)
+    // is counted LOUD as not-compared on THIS leg, with the fault named -
+    // never silently dropped.
+    let wtab = window_table(vecs.len());
+    let mut ir_cmp = 0usize;
+    let mut ir_match = 0usize;
+    let mut ir_mismatch: Vec<String> = Vec::new();
+    let mut ir_nc: Vec<String> = Vec::new();
+    for (g, (k, v)) in jobs.iter().enumerate() {
+        if !subs[*k].win {
+            continue;
+        }
+        let tag = format!("{} :: {}  vector {v}", subs[*k].s.obj, subs[*k].s.sym);
+        let (Some(&x), Some(nw)) = (native.get(&g), native_wins.get(&g)) else {
+            ir_nc.push(format!(
+                "{tag}: the machine side faulted - no buffer outcome to compare"
+            ));
+            continue;
+        };
+        let seed: Vec<(u64, u8)> = wtab[*v]
+            .iter()
+            .enumerate()
+            .flat_map(|(wi, w)| {
+                (0..8u64).map(move |bi| {
+                    (
+                        WIN_ADDR + wi as u64 * 8 + bi,
+                        ((w >> (8 * bi)) & 0xff) as u8,
+                    )
+                })
+            })
+            .collect();
+        let ex = rdec_core::interp::run_budget_seed(
+            &subs[*k].s.f,
+            &[WIN_ADDR, vecs[*v][1], vecs[*v][2], vecs[*v][3]],
+            rdec_core::interp::DEFAULT_BUDGET,
+            &seed,
+        );
+        let bits = match ex.outcome {
+            rdec_core::interp::Outcome::Ret(rdec_core::interp::Val::Int(b)) => b,
+            rdec_core::interp::Outcome::Ret(other) => {
+                ir_nc.push(format!("{tag}: the IR answered {other:?}, not an integer"));
+                continue;
+            }
+            rdec_core::interp::Outcome::Fault(f) => {
+                ir_nc.push(format!("{tag}: IR fault {f:?}"));
+                continue;
+            }
+            rdec_core::interp::Outcome::NoReturn => {
+                ir_nc.push(format!("{tag}: the IR reached Exit"));
+                continue;
+            }
+            rdec_core::interp::Outcome::Budget => {
+                ir_nc.push(format!("{tag}: the IR hit the step budget"));
+                continue;
+            }
+        };
+        let map: HashMap<u64, u8> = ex.mem.into_iter().collect();
+        let mut iw: Vec<u64> = Vec::with_capacity(WIN_WORDS);
+        let mut hole = None;
+        for wi in 0..WIN_WORDS {
+            let mut w = 0u64;
+            for bi in 0..8u64 {
+                match map.get(&(WIN_ADDR + wi as u64 * 8 + bi)) {
+                    Some(b) => w |= (*b as u64) << (8 * bi),
+                    None => {
+                        hole = Some(WIN_ADDR + wi as u64 * 8 + bi);
+                        break;
+                    }
+                }
+            }
+            if hole.is_some() {
+                break;
+            }
+            iw.push(w);
+        }
+        if let Some(a) = hole {
+            ir_nc.push(format!(
+                "{tag}: IR memory has no byte at {a:#x} - the run read (or never wrote) a window byte the seed covered, and the interpreter will not answer 0 for it"
+            ));
+            continue;
+        }
+        ir_cmp += 1;
+        if bits == x && iw == *nw {
+            ir_match += 1;
+        } else {
+            let off = if iw == *nw {
+                None
+            } else {
+                Some(
+                    iw.iter()
+                        .zip(nw.iter())
+                        .position(|(a, b)| a != b)
+                        .unwrap_or(0),
+                )
+            };
+            ir_mismatch.push(format!(
+                "{tag}  IR leg: machine={x:#018x} IR={bits:#018x}  {}",
+                match off {
+                    Some(o) => format!(
+                        "caller buffer differs: word {o} (byte offset {:#x}) machine={:#018x} IR={:#018x}",
+                        o * 8,
+                        nw[o],
+                        iw[o]
+                    ),
+                    None => "caller buffer matches".to_string(),
+                }
+            ));
+        }
+    }
 
     println!(
         "runs: {} native drivers ({} restarts after faults), 1 decompiled runner ({} restarts)",
@@ -1236,6 +1756,15 @@ pub fn cmd_t2(args: &[String]) -> Result<i32, String> {
          {not_compared} | of the mismatches, differing only above bit 31: {above_bit31}",
         mismatch.len()
     );
+    if has_win {
+        // The memory axis has its own tuple: the return tuple above counts
+        // exactly what it counted before this axis existed; window jobs enter
+        // `compared` on the return axis, and their BYTES enter here.
+        println!(
+            "memory: {mem_cmp} caller-buffer comparisons | match: {mem_match} | mismatch: {} | not compared: {mem_nc}  (mapping: native buffer byte k == rdec_mem[0x2000 + k] == IR byte at 0x2000 + k; 4 KiB window, per-vector pattern W[v] embedded in all three legs)"
+            ,mem_mismatch.len()
+        );
+    }
     if !by_snippet.is_empty() {
         // Grouped by snippet across all four -O levels: 100 mismatch lines are
         // noise, the six snippets they land on are the work list.
@@ -1275,6 +1804,31 @@ pub fn cmd_t2(args: &[String]) -> Result<i32, String> {
     }
     if mismatch.len() > 10 {
         println!("  ... and {} more", mismatch.len() - 10);
+    }
+    for m in mem_mismatch.iter().take(200) {
+        println!("  MEMORY MISMATCH {m}");
+    }
+    if mem_mismatch.len() > 10 {
+        println!(
+            "  ... and {} more memory mismatches",
+            mem_mismatch.len() - 10
+        );
+    }
+    if has_win {
+        // The IR leg's own accounting: every window job lands in exactly one
+        // of match / mismatch / named-not-compared, so a claim that got
+        // smaller on this leg is visible from the gate, not only from a diff.
+        println!(
+            "ir leg: {ir_cmp} window runs on the lifted IR, same seed bytes | match: {ir_match} | mismatch: {} | not compared: {}",
+            ir_mismatch.len(),
+            ir_nc.len()
+        );
+        for m in ir_mismatch.iter().take(FAULT_LINES) {
+            println!("  IR MISMATCH {m}");
+        }
+        for m in ir_nc.iter().take(FAULT_LINES) {
+            println!("  IR NOT COMPARED: {m}");
+        }
     }
     if !fault_jobs.is_empty() {
         // Faults are their own bucket: a function that crashes under the
@@ -1321,8 +1875,27 @@ pub fn cmd_t2(args: &[String]) -> Result<i32, String> {
         );
         return Ok(1);
     }
+    if !mem_mismatch.is_empty() {
+        println!(
+            "FAIL: the decompiled C leaves DIFFERENT bytes in the caller buffer on {} of {mem_cmp} runs; the return values of those runs matched - this is the scribble a return-only comparison cannot see",
+            mem_mismatch.len()
+        );
+        return Ok(1);
+    }
+    if !ir_mismatch.is_empty() {
+        println!(
+            "FAIL: the IR interpreter disagrees with the machine code on {} of {ir_cmp} caller-buffer runs (return value and/or window bytes)",
+            ir_mismatch.len()
+        );
+        return Ok(1);
+    }
     println!(
-        "OK: the decompiled C computes the same 64-bit result as the machine code on all {compared} runs"
+        "OK: the decompiled C computes the same 64-bit result as the machine code on all {compared} runs{}",
+        if has_win {
+            format!("; the caller-buffer bytes match on all {mem_cmp} memory comparisons, and the IR leg agrees on all {ir_cmp} of its runs")
+        } else {
+            String::new()
+        }
     );
     Ok(0)
 }
@@ -2085,6 +2658,214 @@ fn this_window_taint(f: &Function) -> Result<(), String> {
 const WIN_ADDR: u64 = 0x2000;
 const WIN_WORDS: usize = 512; // 4 KiB
 
+// ---------------------------------------------------------------------------
+// The caller-buffer rule (T2 memory effects, corpus lane).
+// ---------------------------------------------------------------------------
+//
+// The corpus T2 used to refuse EVERY function that touched memory through a
+// parameter ("memory outside the modelled frame"): the two sides share no
+// address, so the comparison was undefined. This rule defines the shared
+// address, and it is deliberately wider than the C++ lane's `window_rooted`
+// (that rule is untouched; the C++ lane's floors do not move):
+//
+//   * The machine side calls the function with a pointer to a real 4 KiB
+//     buffer; the C side calls it with the window's ADDRESS INTEGER (0x2000).
+//     Both start from the same bytes (one shared `W[v]` table embedded in
+//     both harnesses), and the post-call bytes are compared. The mapping is
+//     exact: **native buffer byte k == `rdec_mem[RDEC_ADDR(0x2000) + k]` ==
+//     the IR interpreter's byte at 0x2000 + k**, because a store the C emits
+//     is `store_n(RDEC_ADDR(x), v)` with `x = 0x2000 + delta`, and `RDEC_ADDR`
+//     is the identity on that range.
+//   * An address of the form `base + any delta` is admitted when the base is
+//     `param 0` reached by plain addition/subtraction (through frame slots
+//     that carry it, the -O0 spill idiom). The delta is ANY integer value:
+//     both sides add the same delta to their own base, so in-window offsets
+//     agree word for word. A delta that leaves the 4 KiB buffer makes the
+//     MACHINE side take an access fault; the crash protocol files that job
+//     as not-compared with the fault named, so bounds are enforced by the
+//     protocol, never by a silent mask.
+//   * `param 0` multiplied by anything is refused: the machine scales a real
+//     address, the C side scales 0x2000, and the two land on different bytes.
+//   * Loads from constant addresses are admitted only from bytes BOTH sides
+//     seed (the `.data`/`.rdata` images) or from frame slots some store wrote
+//     (an unwritten slot is stack garbage on one side and a zero on the
+//     other). A function that never addresses `param 0` is not a caller-buffer
+//     function and stays in the named exclusion it has always been in.
+
+/// How an address expression relates to the caller buffer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Root {
+    /// Not nameable from the buffer.
+    Not,
+    /// A value both sides compute identically (a constant, a frame slot, a
+    /// reload of seeded `.data`/`.rdata`) - usable as a delta, never a base.
+    Delta,
+    /// `param 0` plus base arithmetic: the buffer's own bytes.
+    Base,
+}
+
+/// See the caller-buffer rule above. SSA is acyclic (one def per value), so
+/// the recursion ends, memo or no memo.
+fn loose_root(
+    f: &Function,
+    v: u32,
+    this: u32,
+    slots: &BTreeMap<u64, Vec<u32>>,
+    data: &[(u64, u64)],
+    memo: &mut HashMap<u32, Root>,
+) -> Root {
+    if let Some(&r) = memo.get(&v) {
+        return r;
+    }
+    let r = match def_op(f, v) {
+        Some(Op::Const(_)) => Root::Delta,
+        Some(Op::Param) => {
+            if v == this {
+                Root::Base
+            } else {
+                Root::Not
+            }
+        }
+        Some(Op::Copy(a)) => loose_root(f, *a, this, slots, data, memo),
+        Some(Op::Cast(CastKind::Bitcast | CastKind::ZExt | CastKind::SExt, _, a)) => {
+            loose_root(f, *a, this, slots, data, memo)
+        }
+        Some(Op::Un(rdec_core::ir::UnOp::Neg, a)) => loose_root(f, *a, this, slots, data, memo),
+        Some(Op::Bin(op, a, b)) => match op {
+            // Base +/- anything: the same delta applied to each side's own
+            // base. Anything +/- base: a scaled-pointer shape off the base
+            // side; admitted as Base (the machine's access fault and the
+            // crash protocol name the jobs where the delta leaves the
+            // buffer), and no fixture takes it.
+            BinOp::Add | BinOp::Sub => {
+                let ra = loose_root(f, *a, this, slots, data, memo);
+                let rb = loose_root(f, *b, this, slots, data, memo);
+                if ra == Root::Base || rb == Root::Base {
+                    Root::Base
+                } else {
+                    Root::Not
+                }
+            }
+            // Scaling the buffer pointer itself scales DIFFERENT addresses
+            // on the two sides (`8*real_ptr` vs `8*0x2000`): never rooted.
+            // Scale a constant/delta by a constant and the product is still
+            // a delta.
+            BinOp::Mul => {
+                let ra = loose_root(f, *a, this, slots, data, memo);
+                let rb = loose_root(f, *b, this, slots, data, memo);
+                if ra == Root::Base || rb == Root::Base {
+                    Root::Not
+                } else if ra == Root::Delta && rb == Root::Delta {
+                    Root::Delta
+                } else {
+                    Root::Not
+                }
+            }
+            _ => Root::Not,
+        },
+        // The -O0 idiom `mov [rbp-8],rcx; mov rax,[rbp-8]`: the slot folds
+        // to a constant both sides share, and the value it carries roots the
+        // reload. A data reload (seeded `.rdata` jump-table slot) is a Delta:
+        // both sides read the seeded bytes. An unwritten constant slot is
+        // garbage-vs-zero and stays refused.
+        Some(Op::Load(_, a)) => {
+            let ra = loose_root(f, *a, this, slots, data, memo);
+            if ra == Root::Not {
+                Root::Not
+            } else if let Some(addr) = fold_addr(f, *a) {
+                if data.iter().any(|(s, e)| addr >= *s && addr < *e) {
+                    Root::Delta
+                } else if let Some(vs) = slots.get(&addr) {
+                    if vs.is_empty() {
+                        Root::Not
+                    } else {
+                        let rs: Vec<Root> = vs
+                            .iter()
+                            .map(|&x| loose_root(f, x, this, slots, data, memo))
+                            .collect();
+                        if rs.contains(&Root::Base) {
+                            Root::Base
+                        } else if rs.iter().all(|&x| x == Root::Delta) {
+                            Root::Delta
+                        } else {
+                            Root::Not
+                        }
+                    }
+                } else {
+                    Root::Not
+                }
+            } else {
+                // A reload from a dynamic rooted chain (a window slot at
+                // `this + disp`): the bytes are seeded on both sides.
+                ra
+            }
+        }
+        _ => Root::Not,
+    };
+    memo.insert(v, r);
+    r
+}
+
+/// Why this function is (not) a caller-buffer function T2 can run with the
+/// buffer's bytes compared. `data` is the seeded `.data`/`.rdata` address
+/// range (start, end) per chunk.
+fn caller_buffer_rule(f: &Function, data: &[(u64, u64)]) -> Result<(), String> {
+    let this = *f.params.first().ok_or_else(|| {
+        "lifted with no parameters: no pointer parameter to root a buffer on".to_string()
+    })?;
+    let mut slots: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
+    for b in &f.blocks {
+        for i in &b.instrs {
+            if let Op::Store(_, a, val) = &i.op {
+                if let Some(addr) = fold_addr(f, *a) {
+                    slots.entry(addr).or_default().push(*val);
+                }
+            }
+        }
+    }
+    let mut memo: HashMap<u32, Root> = HashMap::new();
+    let mut has_base = false;
+    for b in &f.blocks {
+        for i in &b.instrs {
+            let (addr, is_load) = match &i.op {
+                Op::Load(_, a) => (*a, true),
+                Op::Store(_, a, _) => (*a, false),
+                _ => continue,
+            };
+            let root = loose_root(f, addr, this, &slots, data, &mut memo);
+            if root == Root::Not {
+                return Err(format!(
+                    "0x{:x}: {} reaches memory at an address the caller-buffer rule does not cover (no base arithmetic from param 0, not a written frame slot, not seeded data)",
+                    i.addr,
+                    rdec_core::fmt_ir::format_instr(f, i)
+                ));
+            }
+            if root == Root::Base {
+                has_base = true;
+            }
+            if is_load {
+                if let Some(ad) = fold_addr(f, addr) {
+                    let seeded = data.iter().any(|(s, e)| ad >= *s && ad < *e);
+                    if !seeded && !slots.contains_key(&ad) {
+                        return Err(format!(
+                            "0x{:x}: {} reads a constant address nothing seeds (the machine reads its own bytes, the C model reads zeros)",
+                            i.addr,
+                            rdec_core::fmt_ir::format_instr(f, i)
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    if !has_base {
+        return Err(
+            "never addresses param 0: the pointer parameter is not a caller buffer here"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Window bytes: pure function of (vector, word), embedded verbatim in both
 /// harnesses the way the argument table is, so "same bytes in the window" is
 /// a property of the generator, not a claim about two files.
@@ -2546,6 +3327,11 @@ pub(crate) fn t2_cpp_run(
             loops: loop_shaped(&s.f),
             xargs: xargs.clone(),
             xret,
+            // The C++ lane keeps its own window machinery (`c_wrapper_win`:
+            // return-value comparison only, windows NOT compared - stated in
+            // the cpp header and unchanged by this lane). The corpus lane's
+            // `win` flag drives the memory axis and its harness protocol.
+            win: false,
         };
         match class {
             "rax" => subs.push(sub),

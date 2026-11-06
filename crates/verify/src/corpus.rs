@@ -183,6 +183,27 @@ pub const SNIPPETS: &[Snippet] = &[
         exercises: "computed-goto-ish shape: two-entry loop, goto fallback must not crash",
         code: "int f(int n) { int s = 0, i = 0; goto mid; top: s += i; i++; mid: if (i < n) { if (s < 500) goto top; else goto top; } return s; }",
     },
+    // Caller-buffer fixtures: the ground truth is the buffer's bytes, which the
+    // return value cannot see. `store_to_buffer` is the shape that proves a
+    // memory-effect comparison bites: return the right `b[0]` while scribbling
+    // `b[3]` anywhere but its own slot, and a return-value gate stays green on
+    // a broken decompiler. All three take a single pointer parameter, so the
+    // Win64 driver delivers the buffer in RCX (no stack-passed arguments).
+    Snippet {
+        name: "store_to_buffer",
+        exercises: "writes through a caller buffer: b[3] is a scribble the return value cannot see",
+        code: "long long f(long long *b) { b[0] = b[1] + b[2]; b[3] = b[0] * 2; return b[0]; }",
+    },
+    Snippet {
+        name: "copy_words",
+        exercises: "fixed-count store loop through a caller buffer: 16 words written, 16 returned",
+        code: "long long f(long long *b) { int n = 16; for (int i = 0; i < n; i++) b[i] = b[i] + (long long)i; return n; }",
+    },
+    Snippet {
+        name: "read_only_words",
+        exercises: "read-mostly over a caller buffer: MUST NOT write; a spurious store is a miscompile",
+        code: "long long f(const long long *b) { long long s = b[0] + b[1] * 2 + b[2] * 3 + b[3] * 4; return s; }",
+    },
 ];
 
 pub const OPTS: &[&str] = &["O0", "O1", "O2", "Oz"];

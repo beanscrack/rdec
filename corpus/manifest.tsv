@@ -30,6 +30,10 @@ cmp_unsigned	O0	corpus\obj\cmp_unsigned.O0.obj	936	e26d76689e5881c4
 cmp_unsigned	O1	corpus\obj\cmp_unsigned.O1.obj	660	db8f5c16e528ce50
 cmp_unsigned	O2	corpus\obj\cmp_unsigned.O2.obj	660	db8f5c16e528ce50
 cmp_unsigned	Oz	corpus\obj\cmp_unsigned.Oz.obj	660	97218f377e9b26f0
+copy_words	O0	corpus\obj\copy_words.O0.obj	931	fbb4b571ad38ad9f
+copy_words	O1	corpus\obj\copy_words.O1.obj	677	ef3a145a98b0ab63
+copy_words	O2	corpus\obj\copy_words.O2.obj	1892	709f0193093b0653
+copy_words	Oz	corpus\obj\copy_words.Oz.obj	665	df7574e2c77aa829
 div_pow2	O0	corpus\obj\div_pow2.O0.obj	917	8b65e813ea5ae9e2
 div_pow2	O1	corpus\obj\div_pow2.O1.obj	704	608d32846c2b6137
 div_pow2	O2	corpus\obj\div_pow2.O2.obj	704	608d32846c2b6137
@@ -94,6 +98,10 @@ nested_if_tree	O0	corpus\obj\nested_if_tree.O0.obj	967	2f943b6fdeb6ce04
 nested_if_tree	O1	corpus\obj\nested_if_tree.O1.obj	687	f0e930f460d76885
 nested_if_tree	O2	corpus\obj\nested_if_tree.O2.obj	687	f0e930f460d76885
 nested_if_tree	Oz	corpus\obj\nested_if_tree.Oz.obj	687	818aba69090993e5
+read_only_words	O0	corpus\obj\read_only_words.O0.obj	918	87b14a2c888da8d1
+read_only_words	O1	corpus\obj\read_only_words.O1.obj	672	c80a2604a8732221
+read_only_words	O2	corpus\obj\read_only_words.O2.obj	672	c80a2604a8732221
+read_only_words	Oz	corpus\obj\read_only_words.Oz.obj	669	67b9d473521a80d2
 saturation	O0	corpus\obj\saturation.O0.obj	924	66897dc936b68320
 saturation	O1	corpus\obj\saturation.O1.obj	646	75c86e245cadd54b
 saturation	O2	corpus\obj\saturation.O2.obj	646	75c86e245cadd54b
@@ -106,6 +114,10 @@ shift_all	O0	corpus\obj\shift_all.O0.obj	924	35332e98a8aaa6c1
 shift_all	O1	corpus\obj\shift_all.O1.obj	667	c89899c0719f8b63
 shift_all	O2	corpus\obj\shift_all.O2.obj	667	c89899c0719f8b63
 shift_all	Oz	corpus\obj\shift_all.Oz.obj	667	68450fcaaf0d95c3
+store_to_buffer	O0	corpus\obj\store_to_buffer.O0.obj	899	072c1cc36cc69552
+store_to_buffer	O1	corpus\obj\store_to_buffer.O1.obj	662	d449842250584258
+store_to_buffer	O2	corpus\obj\store_to_buffer.O2.obj	662	d449842250584258
+store_to_buffer	Oz	corpus\obj\store_to_buffer.Oz.obj	662	39748f01cf812ab8
 struct_access	O0	corpus\obj\struct_access.O0.obj	910	24cc3173b4c0b4da
 struct_access	O1	corpus\obj\struct_access.O1.obj	675	79dd16a0237005e8
 struct_access	O2	corpus\obj\struct_access.O2.obj	675	79dd16a0237005e8

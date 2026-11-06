@@ -1862,3 +1862,27 @@ inputs with a 146 ms slowest input (`289645b`); at `78f23c7` the same surface do
 20000 inputs in 7.4 s, slowest 10 ms - the pass-pipeline fixpoint work (fe425cf)
 sped up every front-half consumer, which is what "the middle end scales" means
 when measured at the product's own fuzzer.
+
+## T2 memory-effect equivalence is real (2026-11-06) — the return-blind scribble is now caught
+
+The gate that mattered most now exists: T2 compares CALLER BUFFERS, not just return
+values. `t2 --corpus` = `1700/1700/mismatch 0/not-compared 4` (the 1412 return axis
+preserved exactly, +288 window vectors; the 4 named `loop_do` faults kept), plus
+`memory: 288 | match 288 | mismatch 0` and `ir leg: 288 | 288 | 0` on the same seed
+bytes. Mapping printed by the gate: `native buffer byte k == rdec_mem[0x2000+k] ==
+IR byte at 0x2000+k`; admission is a named rule (every memory touch outside the frame
+must chain from param 0; rejections name the instruction).
+Fixtures: `store_to_buffer` (the return-blind scribble), `copy_words`,
+`read_only_words` x4 opts = 12 objects; 15 pre-existing window functions admitted.
+SABOTAGE (the point of the lane, all four directions in `crates/cli/tests/t2_memory_effects.rs`):
+store-shift-by-8 -> `return 0x10 AGREES and the caller buffer DIFFERS: word 1 (byte
+offset 0x8)` with return `mismatch: 0`; spurious prologue store -> `read_only_words`
+red on memory only; comparator sabotaged to lengths-equals-bytes flips the SAME run
+green - the red lives in the bytes.
+Floors moved UP by design: `c --corpus` 124/86/38 -> 136/96/40 (the +2 refusals are
+`copy_words` O2/Oz lowering to `movdqu` - the M8 packed-SIMD gap with named corpus
+witnesses), discover 5956 -> 6514 (100.00%), objdump-check 136 exact, workspace 226.
+The CARGO_TARGET_DIR trap fired a third time (this session: leaked from a dispatch
+build into the parent shell; and mid-run in the child): every result above was
+re-measured after `unset`. The export rule for dispatch commands is a hazard, not
+just for interactive shells - use `env CARGO_TARGET_DIR=... cargo ...` per-command.
