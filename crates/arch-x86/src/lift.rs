@@ -3440,15 +3440,55 @@ impl<'a> Lifter<'a> {
                 {
                     continue;
                 }
-                // `movslq (%base,%idx,4),%tmp`: a 4-byte slot, indexed, into the
-                // register the fold reads, off the register the `lea` wrote.
-                // `movslq` is iced's `Movsxd`: sign-extend a memory 32-bit
-                // value into a 64-bit register. `Movsx` is the 8/16-bit form.
+                // `movslq (%base,%idx,4),%tmp`: a 4-byte slot, indexed, off the
+                // register the `lea` wrote. `movslq` is iced's `Movsxd`:
+                // sign-extend a memory 32-bit value into a 64-bit register.
+                // `Movsx` is the 8/16-bit form.
+                //
+                // WHERE THE DELTA LANDS IS A LOWERING ARTIFACT, NOT A FACT ABOUT
+                // THE JUMP. clang 22.1.8 loads the slot delta into the BASE
+                // register and adds it into the index register; clang 20.1.8 - the
+                // CI runner's compiler, whose bytes were dumped from CI in run
+                // 42166188651 - loads it into the INDEX register and adds the base
+                // in:
+                //   clang 22:  movslq (%rax,%rcx,4),%rcx ; addq %rcx,%rax
+                //   clang 20:  movslq (%rcx,%rax,4),%rax ; addq %rcx,%rax
+                // The `.rdata` bytes, the 8 relocations and the 8 targets are
+                // byte-identical on both; only the register roles swap. Requiring
+                // the delta to be the fold's SOURCE operand made the corpus's two
+                // switches model locally and be REFUSED on CI - which is why
+                // `t2 --corpus` compared 1412 here and 1364 there, both green. The
+                // machine facts are: the jump reads the fold's destination; the
+                // fold's two operands are the relocation-named table base and the
+                // delta loaded at 4-byte scale off that base; every slot target is
+                // a block this function owns.
+                let (ld, aa, ab, lr) = (
+                    split(load.op_register(0)),
+                    split(add.op_register(0)),
+                    split(add.op_register(1)),
+                    split(lea.op_register(0)),
+                );
+                // The fold is `base + delta` in one of exactly two role
+                // assignments (the jump already reads `add`'s destination, checked
+                // above):
+                //   dest == base && src == delta   (clang 22)
+                //   dest == delta && src == base   (clang 20)
+                // A destination or source equal to neither is rejected, and so is
+                // the degenerate `add r,r`, which doubles one register and is not a
+                // fold of anything.
+                //
+                // NAMED GAP, no fixture witness: nothing in `jump_table_fixtures.rs`
+                // exercises `aa == ab`. A hand-built object for it needs the
+                // builder's REL32 addend convention (a first attempt produced
+                // targets [0x2, 0x4, 0x6, 0x8] instead of the bodies) and is worth
+                // one line of a follow-up; the guard is defensive, not load-bearing
+                // for any shape observed so far.
                 if load.mnemonic() != Mnemonic::Movsxd
                     || load.op_kind(1) != OpKind::Memory
-                    || split(load.op_register(0)) != split(add.op_register(1))
-                    || load.memory_index_scale() != 4
                     || lea.op_kind(0) != OpKind::Register
+                    || aa == ab
+                    || !((aa == lr && ab == ld) || (aa == ld && ab == lr))
+                    || load.memory_index_scale() != 4
                     || load.memory_base() != lea.op_register(0)
                 {
                     continue;
