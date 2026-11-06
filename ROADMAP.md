@@ -1461,3 +1461,39 @@ Rsp`. C++ (7): `4 indirect call | 1 arithmetic-unmodelled | 1 rip-relative mov |
 mov-unmodelled source`. Next by the ledger's own ranking: relocation-aware targets, then
 `cdq`/`imul`/`div` (arithmetic facts, each with a red-first fixture), then M5 structuring
 on top of real control flow.
+
+### The relocation table is the evidence source M1 was missing (2026-11-05, `82c285f`)
+
+Reading the COFF per-section relocation lists moved four recorded gaps at once, and
+parent-verified:
+
+| gate | before | after |
+|---|---|---|
+| `c --corpus` | 99 emitted / 42 refused | **105 / 36**, 0 invalid; `calls: 17 modelled` (was 0), `lea of an address we cannot name` 14 -> **6** |
+| `cpp --corpus` | 71 / 7 | **74 / 4**; `calls: 7 modelled`, 9 of 222 relocs resolved as targets |
+| `t2 --corpus` | 1364/1364/0, 4 faults | **identical**; the 15 `calls a symbol` exclusions gone, `unmodelled control flow (Exit)` 1 -> 16, buckets sum 141 |
+| `t2 --cpp` | 688/688/0 | **760 / 760 / 0**, buckets 35 + 39 + 4 = 78 (callee definitions enter the TU by least-fixpoint, never referenced without being defined) |
+| lift · objdump · demangle · tests | 141/141 · 124/124 · 68/68 · 143 | unchanged · **149**, `status` exit 0 with zero FAIL rows |
+
+Two loader bugs were real and are fixed red-first. Symbol indexes in relocation records
+count RAW table entries, aux records included; using the filtered index read `.llvm_addrsig`
+where objdump reads `.xdata`. And `.bss` `PointerToRawData == 0` means "no data in the file",
+not "data at offset 0" - the loader was reading the **file header** as `.bss` content, which
+was a live miscompile with a T2 witness: `?count@Widget@@SAHH@Z`, 24 runs, machine `0x0`
+against C `0x78664`. Parsed relocations are asserted equal to `llvm-objdump -r` on all 120
+objects (173: 41 REL32, 132 ADDR32NB, 4 long names).
+
+**M1's two jump tables are now a resolution problem with named evidence, not missing
+information** (measured, not implemented; `discover` stays red at 97.88%). The 2 runs are the
+O0 switch pair. `switch_dense.O0`: 80-byte run at `.text+0x2a`; table in `.rdata`, 32 bytes =
+8 entries x 4, `IMAGE_REL_AMD64_REL32 -> .text` at 0x0,0x4,...,0x1c with the addend in the
+entry bytes (`2e 3c 4a 58 66 74 82 90`) -> `.text+0x2a, 0x34, ... 0x8c`, the 8 case bodies,
+first entry exactly the uncovered run's first byte; base named by `.text` `REL32 -> .rdata`
+at 0x1d; dispatch `movslq` + `jmpq *%rax`. `switch_fallthrough.O0`: 46 bytes at `.text+0x32`,
+`.rdata` 16 bytes = 4 entries. 12 relocations carry every target for both tables.
+
+Next, by the ledger's own ranking: (1) jump-table target resolution in discovery, which
+closes M1 and feeds M5 structuring; (2) `cdq` / `imul` / `div` arithmetic facts (10 + 6 + 4 =
+the bulk of the 36 C refusals, each needing a red-first fixture); (3) the 6 remaining
+non-RIP `lea` refusals, which are artifacts of mis-decoded blocks and therefore belong with
+discovery, not with the emitter.
