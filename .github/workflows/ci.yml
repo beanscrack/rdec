@@ -34,6 +34,9 @@ jobs:
       - name: clippy (deny warnings)
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: "ratchet (no NEW panic site in a library crate's non-test code; .gate/unwrap-baseline)"
+        run: bash scripts/unwrap_ratchet.sh
+
       - name: "corpus (C + C++ objects: generated, and tests read them)"
         # Generated, not committed (`*.obj` is gitignored) - so it has to exist
         # BEFORE the test step: the demangle integration tests read
