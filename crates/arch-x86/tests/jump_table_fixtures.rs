@@ -1110,3 +1110,76 @@ fn clean(f: &mut Function) {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// THE `aa == ab` GUARD, WITNESSED. (Named gap in lift.rs: the guard rejecting
+// the degenerate `add r,r` had no fixture; a first attempt died on the REL32
+// addend convention. This one reuses JT_A's own bytes, so the convention is
+// JT_A's, quoted above, and only the FOLD is patched.)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_degenerate_add_of_a_register_with_itself_is_not_a_fold() {
+    // The shape: `lea (%rip),%rax` names the table; `movslq (%rax,%rcx,4),%rax`
+    // loads the slot INTO the base register; `add %rax,%rax` doubles it;
+    // `jmp *%rax` dispatches. The role check alone ACCEPTS this (`aa == lr &&
+    // ab == ld`, both %rax), and the doubling means the dispatched address is
+    // 2*(base + delta) - not a table entry. Recognizing it would fabricate
+    // switch successors the machine code does not have.
+    //
+    // Byte-patched from JT_A_OBJ, same instruction sizes:
+    //   48 63 0c 88  movslq (%rax,%rcx,4),%rcx  ->  48 63 04 90  movslq (%rax,%rcx,4),%rax
+    //   48 01 c8     add    %rcx,%rax           ->  48 01 c0     add    %rax,%rax
+    // The .rdata table, the naming relocation, and the `jmp *%rax` are
+    // UNCHANGED: the table is real; the fold that reads it is fake.
+    let mut obj = JT_A_OBJ;
+    let pat = [0x48, 0x63, 0x0c, 0x88, 0x48, 0x01, 0xc8, 0xff, 0xe0];
+    let i = obj
+        .windows(pat.len())
+        .position(|w| w == pat)
+        .expect("JT_A's fold+dispatch bytes exist in its own object");
+    obj[i..i + pat.len()].copy_from_slice(&[0x48, 0x63, 0x04, 0x90, 0x48, 0x01, 0xc0, 0xff, 0xe0]);
+
+    let (o, fx) = discover_bytes(&obj);
+    // The table evidence is untouched - discovery keys it at the jmp, as in JT_A.
+    assert_eq!(
+        fx.tables.keys().copied().collect::<Vec<_>>(),
+        vec![0x18],
+        "the .rdata table and its relocations are unchanged; only the fold is degenerate"
+    );
+
+    let (f, rep) = lift_text(&o, &fx);
+    // Lift must NOT model it: the guard rejects the doubling fold.
+    assert_eq!(
+        rep.jump_tables, 0,
+        "a degenerate `add %rax,%rax` doubles the base register - it is not `base + delta`, \
+         and modelling it invents switch targets the machine code does not have"
+    );
+    let switches = f
+        .blocks
+        .iter()
+        .filter(|b| matches!(b.term, Terminator::Switch { .. }))
+        .count();
+    assert_eq!(switches, 0, "no Switch terminator from a fake fold");
+    // The dispatch stays a LOUD, counted refusal, exactly as an unmodelled
+    // computed jump does everywhere else in this repo.
+    let indirect = f
+        .blocks
+        .iter()
+        .flat_map(|b| b.instrs.iter())
+        .filter(|i| matches!(&i.op, rdec_core::ir::Op::Opaque(t) if t.as_ref() == "indirect jmp"))
+        .count();
+    assert_eq!(
+        indirect, 1,
+        "the dispatch must remain a loud `indirect jmp` gap, not a fabricated switch"
+    );
+    // The LOUD home of this refusal is the lift-level `Opaque` above: the
+    // DISCOVERY side keys a table at the jmp from the relocations, so it
+    // treats the site as a dispatch (no plan gap) - which is exactly why the
+    // fold guard, not the plan, is the thing this test witnesses. The refusal
+    // is counted in the lift report.
+    assert!(
+        rep.gaps >= 1,
+        "the refused dispatch must be counted in the lift report, got {rep:?}"
+    );
+}

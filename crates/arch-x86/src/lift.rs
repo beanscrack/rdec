@@ -3477,12 +3477,15 @@ impl<'a> Lifter<'a> {
                 // the degenerate `add r,r`, which doubles one register and is not a
                 // fold of anything.
                 //
-                // NAMED GAP, no fixture witness: nothing in `jump_table_fixtures.rs`
-                // exercises `aa == ab`. A hand-built object for it needs the
-                // builder's REL32 addend convention (a first attempt produced
-                // targets [0x2, 0x4, 0x6, 0x8] instead of the bodies) and is worth
-                // one line of a follow-up; the guard is defensive, not load-bearing
-                // for any shape observed so far.
+                // WITNESSED, 2026-11-06: `jump_table_fixtures.rs::
+                // a_degenerate_add_of_a_register_with_itself_is_not_a_fold`
+                // patches JT_A's own bytes (same instruction sizes, so the
+                // REL32 addend convention quoted in that file is unchanged)
+                // into `movslq (%rax,%rcx,4),%rax ; add %rax,%rax ; jmp *%rax`.
+                // The role check alone ACCEPTS that shape (both roles are
+                // %rax); the doubling dispatches to 2*(base+delta). Without
+                // `aa == ab` the fixture goes red with `jump_tables: 1` - the
+                // guard is the load-bearing line.
                 if load.mnemonic() != Mnemonic::Movsxd
                     || load.op_kind(1) != OpKind::Memory
                     || lea.op_kind(0) != OpKind::Register
