@@ -892,9 +892,23 @@ fn the_embedded_c_names_every_case_body_and_traps_past_the_table() {
         out.text
     );
     for k in 0..8 {
+        // M6 epilogue materialization (2026-11-06) moved this pin on purpose:
+        // arms that flow into a pure return tail now spell `return EXPR;`
+        // directly and the shared label is gone. The machine fact this fixture
+        // owns is the SWITCH SHAPE — one case per slot, every arm transfers
+        // control; the printer's choice between `goto l…` and a direct
+        // `return` is exactly the readability progress the corpus census
+        // measures, and a pin on the printer's current spelling pins today's
+        // readability bug as law.
+        let arm = format!("case {k}: ");
+        let at = out
+            .text
+            .find(&arm)
+            .unwrap_or_else(|| panic!("slot {k} has no case label"));
+        let head = out.text[at + arm.len()..].lines().next().unwrap_or("");
         assert!(
-            out.text.contains(&format!("case {k}: goto l")),
-            "slot {k} jumps to a block label"
+            head.starts_with("goto l") || head.starts_with("return"),
+            "slot {k} must transfer control (block label or direct return); got: {head}"
         );
     }
 

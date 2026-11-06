@@ -778,6 +778,12 @@ pub fn cmd_c(args: &[String]) -> Result<i32, String> {
     println!("{}", control_flow_line(&reports, emitted));
     println!("{}", readability_line(&all, emitted));
     println!("{}", readability_exchange_line(&reports));
+    // The epilogue lane's own tally, printed so the win is measured and not
+    // assumed: how many pure return tails moved onto their edges (the mechanism
+    // behind the `goto -> return` conversions in the line above), how many were
+    // refused and for what, and the two numbers this lane promises are zeros:
+    // a frame store is never deleted, and the teardown writes DCE removed.
+    println!("{}", rdec_core::passes::epilogue_line());
     if let Some(d) = census_drift(&reports, &all) {
         // The census is a claim about the emitted C. When the emitter's own count
         // and a scan of the text are not the same number, the census is broken,

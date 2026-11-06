@@ -1988,3 +1988,33 @@ accepted -> PE32 loads 4-bytes-off, red. Parent re-measured on master+patch: 22+
 tests, workspace 315/0, t2 1700/1700/0/4 + memory 288 + ir 288, ratchet/fmt/clippy/
 status exit 0; refusal exit 2 measured UN-PIPED (the first measure through `| head`
 printed 0 — the pipe lesson, fifth demonstration, now in the commit).
+
+## Epilogue DCE: the 29 `target computes` refusals are at 0 — return tails materialize on the edges
+
+Investigation first, and it falsified the handed premise (reported, not papered):
+(A) RSP/RBP teardown was ALREADY DCE'd (lift lowers `mov rsp,rbp`/`pop` to pure
+Copy/Load/Add nodes; the existing sweep deletes them; a fixture pins it). (B) the
+frame-slot store is NOT deletable — `Exec::diff` compares the effect trace and
+memory, and the T2 memory axis only sees the caller window; invisible is not dead —
+kept, pinned. What the 29 actually compute: pure chains materializing the answer.
+The fix is `passes::materialize_return_tails`: copy a pure tail's chain onto each
+incoming edge (phi arms substituted), leave a phi in the tail, `Return(phi)` — the
+originals die in the same DCE fixpoint, so it is a MOVE. Gates: pure, no
+Store/Call/Clobber, FAULTING ops only move onto a pred whose only successor is the
+tail (a div cannot appear on a switch arm it never runs — sabotage S3 runs p0=0:
+machine returns 0, a copied div raises), operands `value_readable` at the edge.
+Census prints the work: `epilogue: 72 return tails materialized on 108 edges | 267
+kept (163 store/call/flag, 0 faults on an arm it did not run, 0 unreadable, 104
+value computed outside the tail)`. The win: 29 -> 0 refusals, readability 100 -> 75
+goto / 215 -> 201 labels, exchange `39 printed-as-return | 16 absorbed | 10 flat`.
+SECOND WIN, forced by the first: the tail move exposed a latent quadratic — the
+deletion cascade ran against block order, one level per sweep; `dce_sweep` now runs
+it on a worklist inside one sweep. cascade fixture 4000 blocks 23.0 s -> 12.8 ms;
+`clean` at 4k 31.5 s -> 23.8 ms.
+COLLISION handled in the open: `jump_table_fixtures.rs` pinned `case {k}: goto l` —
+the arms now spell `return` (the win on the fixture's own shape). The pin asserted
+the printer's CURRENT SPELLING, the exact anti-pattern this repo's rules name;
+relaxed to the machine fact (every arm transfers control; switch/8 cases/default
+trap stay pinned). Parent re-measured all floors on master+patch: t2
+1700/1700/0/4 + memory 288 + ir 288 byte-identical, structuring 18/18 untouched,
+workspace 326/0, ratchet/fmt/clippy/status exit 0.

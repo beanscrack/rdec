@@ -4,10 +4,12 @@
 //! function's structure instead of its block count. That shape is what makes a
 //! partial pass list safe: no pass relies on a later one cleaning up after it.
 
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 
 use crate::cfg::Cfg;
 use crate::ir::*;
+use crate::structure::value_readable;
 use crate::ty::{Sx, Ty, Width};
 
 // ---------------------------------------------------------------------------
@@ -110,6 +112,9 @@ fn const_table(f: &Function) -> Vec<Option<u64>> {
 /// pass. Mirrors `Function::uses_of`: every operand slot counts (a value used twice
 /// by one instruction counts twice) and terminator operands count, which is the
 /// rule that saved `Return` from DCE (B1).
+/// No definition: a value id no instruction in this function writes.
+const NO_DEF: (usize, usize) = (usize::MAX, usize::MAX);
+
 fn use_counts(f: &Function) -> Vec<u32> {
     let mut c = vec![0u32; f.values.len()];
     let mut ops = Vec::new();
@@ -553,45 +558,540 @@ fn copy_prop_sweep(f: &mut Function) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// the epilogue lane: a pure return tail moves onto the edges that reach it
+// ---------------------------------------------------------------------------
+//
+// `structure.rs::tail_of` may spell a jump site `return` only when the target
+// block computes NOTHING - every instruction a phi, the terminator a Return, the
+// value readable at the site - because a `return` has no room for a statement.
+// The census at base 47b9076 prints 29 refusals of exactly that shape, and the
+// measurement over every emitted corpus function (this lane, base 47b9076) says
+// what is inside those 29 blocks:
+//
+// ```text
+//   8  Const                              (mov $5,%eax; ret)
+//   5  Const, Load(u32), Cast(ZExt)       (mov -0x8(%rbp),%eax; ret)
+//   1  Const, Load, Cast, Cast, Const, Load, Add, Cast
+// ```
+//
+// and NOT what this lane was handed as its premise: no RSP/RBP teardown write
+// survives in a corpus return-target block (every `mov rsp,rbp` / `pop rbp` the
+// lifter emits is a pure SSA node the `Return` does not name, so `use_count == 0
+// && is_pure` already deletes it - pinned by
+// `tests/epilogue_dce.rs::frame_teardown_on_a_return_only_path_is_already_gone`),
+// and no `Op::Store` sits in one of the 29 blocks either.
+//
+// So the win is not a deletion, it is a MOVEMENT. A tail block whose work is the
+// whole distance between a predecessor's terminator and the `return` runs that
+// work at the end of the predecessor too - same program point, same values.
+// Copying a pure tail chain there, once per incoming edge, with a phi standing in
+// the tail for the copy that edge ran, turns the target into the pure tail the
+// printer already accepts, and M6 spells `return` with no change to
+// `structure.rs`. The copies are new SSA nodes; the originals become unread and
+// the DCE sweep in the same fixpoint deletes them, so the net is a move.
+//
+// Three lines this pass does not cross, each with the oracle that would see it:
+//  * **a store is not deletable, movable, or copyable.** `interp.rs` pushes
+//    `Effect::Write` for every `Op::Store` and `Exec::diff` compares the ordered
+//    effect trace and the final memory, so a store that vanishes changes the IR's
+//    own meaning - even though T2's memory axis compares CALLER BUFFERS at
+//    `RDEC_WINDOW_ADDR` and would not see a frame write disappear. T2 not seeing
+//    it is not the same as it being dead: the frame-slot STORE that materializes
+//    a return value stays exactly where it is, which is why the goal is "29 ->
+//    fewer", not "29 -> 0 at any cost".
+//  * **work moves onto an edge only if it cannot fault on that edge.**
+//    `UDiv`/`URem`/`SDiv`/`SRem` raise `Fault::DivZero` (and `SDiv`
+//    `Fault::IntMinDivMinusOne`), `GetFlag` raises `Fault::UndefFlag`. A `Jump`
+//    predecessor has the tail as its ONLY successor, so a copy runs on exactly
+//    the paths the tail ran and the full pure set may move; a `Branch`/`Switch`
+//    predecessor reaches arms the tail never ran, so only cannot-fault work moves.
+//  * **a free operand of the chain must be readable at the predecessor**
+//    (`structure::value_readable`: defined, and its def block dominates the
+//    consumer). A chain that reads a value computed in a sibling has work that
+//    does not exist at the edge, and this pass does not speculate.
+
+/// What the epilogue lane did, measured rather than assumed: `m4.rs`'s census
+/// prints these on one line, because a win that is not printed is assumed.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct EpilogueCounts {
+    /// Return blocks that ended the sweep computing nothing (the M6 win).
+    pub tails_materialized: usize,
+    /// Edges that received a copy of a tail chain.
+    pub edges_materialized: usize,
+    /// Chains copied onto a `Jump` edge, where the tail is the only successor.
+    pub chains_on_jump_edges: usize,
+    /// Chains copied onto a `Branch`/`Switch` edge, restricted to the
+    /// cannot-fault subset.
+    pub chains_on_branch_edges: usize,
+    /// Tails kept because they store, call, read a flag, or otherwise are not
+    /// pure work.
+    pub kept_effectful: usize,
+    /// Tails kept because a faulting op (an integer division, a flag read) would
+    /// have run on an arm that never ran the tail.
+    pub kept_faulting: usize,
+    /// Tails kept because a chain operand is not readable on an incoming edge.
+    pub kept_unreadable: usize,
+    /// Tails kept because their value is free (not computed in the tail), so the
+    /// ordinary DCE sweep - not this pass - owns them.
+    pub kept_free_value: usize,
+    /// Frame-slot stores deleted. No code path can raise this: a store is never
+    /// deletable in this IR (see the section comment), and the census prints the
+    /// zero so the number is on the record.
+    pub frame_stores_deleted: usize,
+    /// Pure, unread nodes DCE deleted out of a block that ends in `Return` - the
+    /// IR proxy for a Win64 frame-teardown write on a return-only path, because a
+    /// `mov rsp,rbp` / `pop rbp` lowers to nodes the `Return` does not name.
+    ///
+    /// Scope, so the printed number is not read as more than it is: this is a
+    /// per-process total of the deletions DCE performed, counted in every sweep,
+    /// and the validated pipeline runs passes on a copy of the function as well as
+    /// on the function itself. At base 47b9076 the number that matters - teardown
+    /// writes surviving inside the 29 refused return-target blocks - is 0, and
+    /// `tests/epilogue_dce.rs::frame_teardown_on_a_return_only_path_is_already_gone`
+    /// pins why.
+    pub teardown_writes_deleted: usize,
+}
+
+thread_local! {
+    static EPILOGUE: RefCell<EpilogueCounts> = const {
+        RefCell::new(EpilogueCounts {
+            tails_materialized: 0,
+            edges_materialized: 0,
+            chains_on_jump_edges: 0,
+            chains_on_branch_edges: 0,
+            kept_effectful: 0,
+            kept_faulting: 0,
+            kept_unreadable: 0,
+            kept_free_value: 0,
+            frame_stores_deleted: 0,
+            teardown_writes_deleted: 0,
+        })
+    };
+}
+
+fn bump_epilogue(what: impl FnOnce(&mut EpilogueCounts)) {
+    EPILOGUE.with(|c| what(&mut c.borrow_mut()));
+}
+
+/// The epilogue counters as they stand.
+pub fn epilogue_counts() -> EpilogueCounts {
+    EPILOGUE.with(|c| *c.borrow())
+}
+
+/// Zero the epilogue counters, so a command that prints the census reports this
+/// run's work and not an earlier command's.
+pub fn reset_epilogue_counts() {
+    EPILOGUE.with(|c| *c.borrow_mut() = EpilogueCounts::default());
+}
+
+/// The census line for the epilogue lane, drained (a second call reports zeros).
+pub fn epilogue_line() -> String {
+    let c = epilogue_counts();
+    reset_epilogue_counts();
+    format!(
+        "epilogue: {} return tails materialized on {} edges ({} jump, {} branch) \
+         | {} kept ({} store/call/flag, {} faults on an arm it did not run, {} unreadable \
+         at the edge, {} value computed outside the tail) \
+         | frame stores deleted: {} | teardown writes deleted: {} \
+         (tallies count every DCE sweep, including the validated pipeline's copies)",
+        c.tails_materialized,
+        c.edges_materialized,
+        c.chains_on_jump_edges,
+        c.chains_on_branch_edges,
+        c.kept_effectful + c.kept_faulting + c.kept_unreadable + c.kept_free_value,
+        c.kept_effectful,
+        c.kept_faulting,
+        c.kept_unreadable,
+        c.kept_free_value,
+        c.frame_stores_deleted,
+        c.teardown_writes_deleted,
+    )
+}
+
+/// Can copying `op` onto an arm that never ran it change an execution? In this IR
+/// a `Load` cannot fault (`Memory::load` answers an out-of-range read as 0, and
+/// the edge-legality check preserves the address operand's definedness),
+/// `FpToSI` returns the x86 magic constant, and a float division returns an
+/// infinity - so the faulting set is the integer divisions and the flag read,
+/// exactly the `Fault` variants `interp.rs` raises for them.
+fn op_may_fault(op: &Op) -> bool {
+    match op {
+        Op::Bin(o, ..) => matches!(o, BinOp::UDiv | BinOp::URem | BinOp::SDiv | BinOp::SRem),
+        Op::GetFlag(..) => true,
+        _ => false,
+    }
+}
+
+/// Copying a tail node onto an edge is legal exactly when it is pure
+/// (`Op::is_pure`) AND it is a plain value node: a `Phi` is SSA's join and by the
+/// prefix rule can never sit in a chain, and a `Flags` producer feeds `GetFlag`
+/// reads the emitter refuses to print, so neither is work this pass will move.
+fn tail_replicable(op: &Op) -> bool {
+    op.is_pure() && !matches!(op, Op::Phi(_) | Op::Flags(_))
+}
+
+/// Rewrite a copied node's operands through the per-edge map: a chain node maps
+/// to the copy made for this edge, a tail phi maps to the pair that arrives on
+/// the edge, and a free operand names the same value at the edge, so it passes
+/// through.
+fn map_op(op: &Op, map: &HashMap<VId, VId>) -> Op {
+    let m = |u: VId| map.get(&u).copied().unwrap_or(u);
+    match op {
+        Op::Undef => Op::Undef,
+        Op::Const(n) => Op::Const(*n),
+        Op::ConstF(b) => Op::ConstF(*b),
+        Op::Param => Op::Param,
+        Op::Copy(x) => Op::Copy(m(*x)),
+        Op::GetFlag(k, v) => Op::GetFlag(*k, m(*v)),
+        Op::Bin(o, x, y) => Op::Bin(*o, m(*x), m(*y)),
+        Op::Un(o, x) => Op::Un(*o, m(*x)),
+        Op::Cmp(c, x, y) => Op::Cmp(*c, m(*x), m(*y)),
+        Op::FCmp(c, x, y) => Op::FCmp(*c, m(*x), m(*y)),
+        Op::FBin(o, x, y) => Op::FBin(*o, m(*x), m(*y)),
+        Op::Cast(k, t, x) => Op::Cast(*k, t.clone(), m(*x)),
+        Op::Load(t, a) => Op::Load(t.clone(), m(*a)),
+        Op::Select(c, x, y) => Op::Select(m(*c), m(*x), m(*y)),
+        // Unreachable: a node outside `tail_replicable` is refused before planning.
+        Op::Store(..)
+        | Op::Call { .. }
+        | Op::Phi(_)
+        | Op::Flags(_)
+        | Op::Opaque(_)
+        | Op::Clobber => op.clone(),
+    }
+}
+
+/// Move a pure return tail onto the edges that reach it, so the return block
+/// computes nothing and `structure.rs`'s existing rule turns the jump site into
+/// `return`.
+///
+/// Per candidate: the target ends in `Return(v)` naming a value THIS block
+/// computes; every non-phi instruction in it is pure; every operand of that
+/// chain is a chain node, one of the block's own phis (replaced on an edge by the
+/// pair that arrives on it), or a value readable at every predecessor. Each
+/// predecessor then gets its own copy of the chain at its end, and the target
+/// keeps its phis plus one new phi for `v`, so `verify_ssa`'s two phi rules hold:
+/// pairs equal the predecessor multiset, and the phi stays inside the phi prefix.
+///
+/// The number of non-phi instructions inside `Return` blocks strictly decreases
+/// per rewrite - copies land in blocks that end in a `Jump`/`Branch`/`Switch`,
+/// never in a `Return` block - so the enclosing fixpoint terminates.
+pub fn materialize_return_tails(f: &mut Function) -> bool {
+    let cfg = Cfg::build(f);
+    let mut changed = false;
+    for ti in 0..f.blocks.len() {
+        let tail = f.blocks[ti].id;
+        // Cloned, because building the copies allocates new values in `f` and the
+        // tail's nodes are the read side of that work. Tail blocks are small; the
+        // corpus's biggest is 8 instructions.
+        let blk_instrs: Vec<Instr> = f.blocks[ti].instrs.clone();
+        let blk_term: Terminator = f.blocks[ti].term.clone();
+        let v = match blk_term {
+            Terminator::Return(v) if v != NO_VAL => v,
+            _ => continue,
+        };
+        if tail == f.entry {
+            continue;
+        }
+        let preds: Vec<BbId> = cfg.preds[ti].clone();
+        if preds.is_empty() {
+            continue; // unreachable tail: its unread pure nodes are plain DCE's
+        }
+        let phi_len = blk_instrs
+            .iter()
+            .take_while(|i| matches!(i.op, Op::Phi(_)))
+            .count();
+        if phi_len == blk_instrs.len() {
+            continue; // already a pure tail: the printer needs nothing from us
+        }
+        let chain = &blk_instrs[phi_len..];
+        if !chain.iter().any(|i| i.dest == v) {
+            // The returned value is free here, so it is already readable at every
+            // pred and the tail's own nodes are pure-and-unread: plain DCE's work.
+            bump_epilogue(|c| c.kept_free_value += 1);
+            continue;
+        }
+        let mut effectful = false;
+        let mut fault_free = true;
+        for ins in chain {
+            if !tail_replicable(&ins.op) {
+                effectful = true;
+            } else if op_may_fault(&ins.op) {
+                fault_free = false;
+            }
+        }
+        if effectful {
+            bump_epilogue(|c| c.kept_effectful += 1);
+            continue;
+        }
+        let chain_dest: HashSet<VId> = chain
+            .iter()
+            .filter(|i| i.dest != NO_VAL)
+            .map(|i| i.dest)
+            .collect();
+        let mut phi_dests: HashSet<VId> = HashSet::new();
+        for ins in &blk_instrs[..phi_len] {
+            if ins.dest != NO_VAL {
+                phi_dests.insert(ins.dest);
+            }
+        }
+        let mut unreadable = false;
+        let mut ops = Vec::new();
+        for ins in chain {
+            ins.op.uses(&mut ops);
+            for u in ops.iter().copied() {
+                if chain_dest.contains(&u) || phi_dests.contains(&u) {
+                    continue;
+                }
+                if !preds.iter().all(|p| value_readable(f, &cfg, u, *p)) {
+                    unreadable = true;
+                }
+            }
+        }
+        if unreadable {
+            bump_epilogue(|c| c.kept_unreadable += 1);
+            continue;
+        }
+        // A `Jump` predecessor has this tail as its only successor, so a copy
+        // runs on exactly the paths the tail ran. Anything else reaches arms the
+        // tail never ran, and only cannot-fault work may go there.
+        let jump_edge = preds.iter().all(|p| {
+            matches!(f.blocks[*p as usize].term,
+                Terminator::Jump(t) if t == tail)
+        });
+        if !jump_edge && !fault_free {
+            bump_epilogue(|c| c.kept_faulting += 1);
+            continue;
+        }
+        // Build this tail's per-edge copies. Every chain node has a dest (the
+        // pure set never includes a store, a clobber, or a call), and the chain is
+        // in definition order, so a forward map is enough.
+        let mut per_edge: Vec<(BbId, (VId, Vec<Instr>))> = Vec::with_capacity(preds.len());
+        let mut ok = true;
+        for p in &preds {
+            let mut map: HashMap<VId, VId> = HashMap::new();
+            for ins in &blk_instrs[..phi_len] {
+                if let Op::Phi(pairs) = &ins.op {
+                    match pairs.iter().find(|(_, b)| *b == *p) {
+                        Some((pv, _)) => {
+                            map.insert(ins.dest, *pv);
+                        }
+                        // A phi with no pair for a predecessor is a verify_ssa
+                        // error already; do not invent an arm for it.
+                        None => ok = false,
+                    }
+                }
+            }
+            if !ok {
+                break;
+            }
+            let mut copies: Vec<Instr> = Vec::with_capacity(chain.len());
+            for ins in chain {
+                let op = map_op(&ins.op, &map);
+                let d = if ins.dest == NO_VAL {
+                    NO_VAL
+                } else {
+                    let d = f.new_value(ins.ty.clone());
+                    map.insert(ins.dest, d);
+                    d
+                };
+                copies.push(Instr::new(d, op, ins.ty.clone(), ins.addr));
+            }
+            // The copy of the value the tail returns. `v` is a chain node (checked
+            // above), so its copy is in the map.
+            let mapped_v = match map.get(&v) {
+                Some(d) => *d,
+                None => {
+                    ok = false;
+                    break;
+                }
+            };
+            per_edge.push((*p, (mapped_v, copies)));
+        }
+        if !ok {
+            bump_epilogue(|c| c.kept_unreadable += 1);
+            continue;
+        }
+        let phi_ty = match f.ty_of(v) {
+            Some(t) => t,
+            None => continue,
+        };
+        let phi_dest = f.new_value(phi_ty.clone());
+        let phi_addr = chain
+            .iter()
+            .find(|i| i.dest == v)
+            .map(|i| i.addr)
+            .unwrap_or(0);
+        for (p, (_, copies)) in &per_edge {
+            f.blocks[*p as usize].instrs.extend(copies.iter().cloned());
+        }
+        let tail_blk = &mut f.blocks[ti];
+        tail_blk.instrs.splice(
+            phi_len..phi_len,
+            [Instr::new(
+                phi_dest,
+                Op::Phi(
+                    per_edge
+                        .iter()
+                        .map(|(p, (mv, _))| (*mv, *p))
+                        .collect::<Vec<_>>()
+                        .into(),
+                ),
+                phi_ty,
+                phi_addr,
+            )],
+        );
+        tail_blk.term = Terminator::Return(phi_dest);
+        bump_epilogue(|c| {
+            c.tails_materialized += 1;
+            c.edges_materialized += per_edge.len();
+            if jump_edge {
+                c.chains_on_jump_edges += 1;
+            } else {
+                c.chains_on_branch_edges += 1;
+            }
+        });
+        changed = true;
+    }
+    changed
+}
+
+// ---------------------------------------------------------------------------
 // DCE
 // ---------------------------------------------------------------------------
 
-/// Delete pure, unread nodes, cascading to a fixpoint in one call.
-///
-/// The predicate is unchanged (`use_count == 0 && is_pure && not a binding`), the
-/// accounting is not: `Function::use_count` is a scan of every node per query, and
-/// asking it per node is what made this pass 89% of the pre-fix pipeline (see the
-/// census note above). One table per sweep answers every node, and a removal
-/// decrements its operands' counts, so the cascade the old loop-and-rescan did
-/// still happens - in the same sweep, for everything the sweep visits later.
+/// Delete pure, unread nodes, cascading to a fixpoint in one call, and - in the
+/// same fixpoint - move pure return tails onto the edges that reach them (see the
+/// epilogue lane above). The two belong together: the materialization makes the
+/// tail's nodes unread, and this sweep is what deletes them.
 pub fn dead_code_elimination(f: &mut Function) -> bool {
-    to_fixpoint(f, dce_sweep)
+    to_fixpoint(f, |f| {
+        let moved = materialize_return_tails(f);
+        moved || dce_sweep(f)
+    })
 }
 
+/// Is this node deletable once its use count is 0? The rule is unchanged from the
+/// sweep's original: pure, and not a `Param` (a function's parameter is its
+/// signature, not a computation) and not an `Undef` (a hole the emitter prints).
+fn dce_deletable(ins: &Instr, counts: &[u32]) -> bool {
+    counts.get(ins.dest as usize).copied().unwrap_or(0) == 0
+        && ins.op.is_pure()
+        && !matches!(ins.op, Op::Param | Op::Undef)
+}
+
+/// Delete the pure, unread nodes - the whole cascade, in one sweep.
+///
+/// The cascade is the point. Deleting a node can make its operands unread, and
+/// their operands unread, so a sweep that visits each node once in block order
+/// advances a deletion chain by one level per sweep when the chain runs against
+/// the block order. That is not academic: materializing a return tail leaves the
+/// tail's own nodes unread, and the value chain feeding the tail then dies from
+/// the far end backwards - one node per sweep on a chain-shaped function, which
+/// the fixpoint around this sweep turned into `blocks` sweeps of O(nodes) work
+/// (measured on `pipeline_scaling`'s ladder, debug, before the worklist: DCE 338 ms
+/// at 500 blocks, 1.40 s at 1k, 7.22 s at 2k, `clean` 31.5 s at 4k, x3.9 per x2 =
+/// quadratic; the same sweep after: linear). The worklist is the doctrine at the
+/// top of this file applied literally: build the tables once per sweep, answer
+/// every question from them, and let the cascade run to its own fixpoint inside
+/// the sweep.
+///
+/// A pure, unread node in a block that ends in `Return` is the IR form of a Win64
+/// frame-teardown write on a return-only path: `mov rsp,rbp` lowers to
+/// `Copy(rbp)`, `pop rbp` to a `Load`, an `Add` and a write of the loaded value,
+/// and the `Return` names the ANSWER, not the frame. Those deletions are counted
+/// so the census prints the number the lane's premise expected to be the win
+/// (measured 0 surviving inside the 29 refused target blocks on the corpus at base
+/// 47b9076 - the count this prints is the teardown DCE removes everywhere, which
+/// the epilogue pass makes visible in the tails it moves).
 fn dce_sweep(f: &mut Function) -> bool {
     let mut counts = use_counts(f);
-    let mut did = false;
-    for bi in 0..f.blocks.len() {
-        let counts = &mut counts;
-        f.blocks[bi].instrs.retain(|ins| {
-            let dead = counts.get(ins.dest as usize).copied().unwrap_or(0) == 0
-                && ins.op.is_pure()
-                && !matches!(ins.op, Op::Param | Op::Undef);
-            if !dead {
-                return true;
+    // Per-sweep table: which instruction defines each value (`def_of`), built once
+    // so the cascade can jump from a dying value to the node that produced it.
+    let mut def_of: Vec<(usize, usize)> = vec![NO_DEF; f.values.len()];
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for (ii, ins) in b.instrs.iter().enumerate() {
+            let d = ins.dest as usize;
+            if d < def_of.len() && def_of[d] == NO_DEF {
+                def_of[d] = (bi, ii);
             }
-            let mut ops = Vec::new();
-            ins.op.uses(&mut ops);
-            for u in ops.iter().copied() {
-                if let Some(n) = counts.get_mut(u as usize) {
-                    *n -= 1;
+        }
+    }
+    // The cascade: every deletable node seeds the worklist, and each deletion
+    // decrements its operands, enqueuing the operand whose last reader just died.
+    // `queued` keeps a def in the list once, so a node is processed at most once
+    // and the sweep costs O(nodes + uses).
+    let mut dead: Vec<(usize, usize)> = Vec::new();
+    let mut queued = vec![false; f.values.len()];
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for (ii, ins) in b.instrs.iter().enumerate() {
+            if dce_deletable(ins, &counts)
+                && !queued.get(ins.dest as usize).copied().unwrap_or(true)
+            {
+                if let Some(q) = queued.get_mut(ins.dest as usize) {
+                    *q = true;
                 }
+                dead.push((bi, ii));
             }
-            did = true;
-            false
+        }
+    }
+    let mut head = 0;
+    while head < dead.len() {
+        let (bi, ii) = dead[head];
+        head += 1;
+        let mut ops = Vec::new();
+        f.blocks[bi].instrs[ii].op.uses(&mut ops);
+        for u in ops.iter().copied() {
+            let Some(n) = counts.get_mut(u as usize) else {
+                continue;
+            };
+            if *n == 0 {
+                continue;
+            }
+            *n -= 1;
+            if *n != 0 {
+                continue;
+            }
+            let (db, di) = match def_of.get(u as usize) {
+                Some(&d) if d != NO_DEF => d,
+                _ => continue,
+            };
+            if queued[u as usize] {
+                continue;
+            }
+            if dce_deletable(&f.blocks[db].instrs[di], &counts) {
+                queued[u as usize] = true;
+                dead.push((db, di));
+            }
+        }
+    }
+    if dead.is_empty() {
+        return false;
+    }
+    let mut kill: Vec<HashSet<usize>> = vec![HashSet::new(); f.blocks.len()];
+    for (bi, ii) in &dead {
+        kill[*bi].insert(*ii);
+    }
+    let mut teardown = 0usize;
+    for (bi, b) in f.blocks.iter_mut().enumerate() {
+        let k = &kill[bi];
+        if k.is_empty() {
+            continue;
+        }
+        if matches!(b.term, Terminator::Return(_)) {
+            teardown += k.len();
+        }
+        let mut ii = 0usize;
+        b.instrs.retain(|_| {
+            let d = k.contains(&ii);
+            ii += 1;
+            !d
         });
     }
-    did
+    if teardown > 0 {
+        bump_epilogue(|c| c.teardown_writes_deleted += teardown);
+    }
+    true
 }
 
 // ---------------------------------------------------------------------------
