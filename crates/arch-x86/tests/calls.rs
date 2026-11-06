@@ -22,7 +22,7 @@
 //
 // Two functions in one buffer, hand-assembled bytes, no corpus dependency.
 use rdec_arch_x86::discover::{discover_all, Code};
-use rdec_arch_x86::lift::{lift_one_sigs, ArgKind, CalleeSig, FnAbi, Lifter, RetKind};
+use rdec_arch_x86::lift::{lift_one_sigs, no_relocs, ArgKind, CalleeSig, FnAbi, Lifter, RetKind};
 use rdec_core::emit_c::{callee_decl, emit_c_sig, Protos};
 use rdec_core::interp::{run_program_budget, Fault, Outcome, Val};
 use rdec_core::ir::{Function, Op, Terminator};
@@ -80,6 +80,7 @@ fn lift_pair(
         &names,
         abi,
         sigs,
+        &no_relocs(),
     )
 }
 
@@ -278,6 +279,7 @@ fn a_register_live_across_the_call_is_still_a_refusal() {
         &names,
         &FnAbi::integer(),
         &g_table(),
+        &no_relocs(),
     );
     clean(&mut f);
     verify_ssa(&f).expect("valid SSA");
@@ -348,6 +350,7 @@ fn an_indirect_call_stays_loud() {
         &std::collections::HashMap::new(),
         &FnAbi::integer(),
         &std::collections::HashMap::new(),
+        &no_relocs(),
     );
     verify_ssa(&f).expect("valid SSA");
     assert_eq!(rep.calls_indirect, 1);
@@ -407,7 +410,18 @@ fn a_double_returning_call_passes_bits_and_declares_double() {
     let mut names: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
     names.insert(0, "g".to_string());
     names.insert(5, "f".to_string());
-    let (mut g, _) = lift_one_sigs("g", &owned, 0, 0, 5, &plan, &names, &abi_g, &sigs);
+    let (mut g, _) = lift_one_sigs(
+        "g",
+        &owned,
+        0,
+        0,
+        5,
+        &plan,
+        &names,
+        &abi_g,
+        &sigs,
+        &no_relocs(),
+    );
     let (mut f, rep) = lift_one_sigs(
         "f",
         &owned,
@@ -418,6 +432,7 @@ fn a_double_returning_call_passes_bits_and_declares_double() {
         &names,
         &abi_f,
         &sigs,
+        &no_relocs(),
     );
     clean(&mut g);
     clean(&mut f);

@@ -38,7 +38,7 @@
 //! signedness bit patterns (0x80000000, -1, the sign bit), which is where a
 //! wrong sign extension shows up.
 use crate::m4::{self, Subject};
-use rdec_core::emit_c::{emit_c, PRELUDE};
+use rdec_core::emit_c::{emit_c_sig, PRELUDE};
 use rdec_core::ir::{BinOp, CastKind, Function, Op, Terminator};
 use rdec_core::ty::{Sx, Ty, Width};
 use rdec_demangle::Demangled;
@@ -289,9 +289,10 @@ fn c_array(vecs: &[[u64; 4]]) -> String {
 ///
 /// The `fflush` *before* the call is the point: nothing may be pending when a
 /// job can crash, or the parent blames the crash on the wrong function.
-fn main_body(n_jobs: usize) -> String {
+fn main_body(n_jobs: usize, seed: &str) -> String {
     format!(
         "int main(int argc, char **argv) {{\n\
+         {seed}\
          \x20 long long start = 0;\n\
          \x20 if (argc >= 3 && strcmp(argv[1], \"--start\") == 0) start = atoll(argv[2]);\n\
          \x20 for (long long j = start; j < (long long){n_jobs}; ++j) {{\n\
@@ -305,6 +306,62 @@ fn main_body(n_jobs: usize) -> String {
          \x20 fflush(stdout);\n\
          \x20 return 0;\n}}\n"
     )
+}
+
+/// The symbol an emitted `extern <ret> <name>(<ps>);` declaration names.
+fn extern_name(decl: &str) -> String {
+    decl.split_whitespace()
+        .nth(2)
+        .and_then(|t| t.split('(').next())
+        .unwrap_or("?")
+        .to_string()
+}
+
+/// Every data byte the relocation reader can name, as (modelled address,
+/// bytes): the `.data`/`.rdata` contents of every object at the addresses
+/// `m4::data_map_of` places them (per-object stride, clear of the stack).
+/// `.bss` has no bytes and needs none: the model's memory is zero, which is
+/// what a zero-initialised static reads as on both sides.
+fn data_images(files: &[String]) -> Result<Vec<(u64, Vec<u8>)>, String> {
+    let mut out = Vec::new();
+    for (oi, f) in files.iter().enumerate() {
+        let obj = rdec_arch_x86::loader::load(std::path::Path::new(f))
+            .map_err(|e| format!("{f}: {e}"))?;
+        for c in m4::data_map_of(&obj, oi).0 {
+            out.push((c.va, c.bytes));
+        }
+    }
+    Ok(out)
+}
+
+/// The C globals holding those bytes.
+fn data_arrays(chunks: &[(u64, Vec<u8>)]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    for (i, (_, bytes)) in chunks.iter().enumerate() {
+        let _ = write!(s, "static const uint8_t D{i}[] = {{");
+        for (k, b) in bytes.iter().enumerate() {
+            let _ = write!(s, "{b:#04x}{}", if k + 1 < bytes.len() { "," } else { "" });
+        }
+        let _ = writeln!(s, "}};");
+    }
+    s
+}
+
+/// The statements copying them into the model's flat memory, at the top of
+/// main: every process start (including a restart with `--start`) re-seeds,
+/// the way a fresh driver process gets a fresh `.data` from the image loader.
+fn data_memcpy(chunks: &[(u64, Vec<u8>)]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    for (i, (addr, bytes)) in chunks.iter().enumerate() {
+        let _ = writeln!(
+            s,
+            "  memcpy(&rdec_mem[RDEC_ADDR({addr:#x}ULL)], D{i}, {});",
+            bytes.len()
+        );
+    }
+    s
 }
 
 /// The job tables. `jobs[j] = (function index in FN[], vector index)`; the
@@ -632,8 +689,6 @@ fn suspects(f: &Function) -> Vec<&'static str> {
 /// One function T2 will run, on both sides.
 struct Sub<'a> {
     s: &'a Subject,
-    /// The emitted C text — `rdec c`'s text, same emitter, same names.
-    text: String,
     /// Index into the decompiled side's function table.
     c_sym: usize,
     loops: bool,
@@ -723,7 +778,66 @@ pub fn cmd_t2(args: &[String]) -> Result<i32, String> {
     let mut skipped: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut subs: Vec<Sub> = Vec::new();
 
-    for s in &subjects {
+    // Emit EVERY subject first, before asking any runnability question.
+    // A call the relocations resolved names a callee whose OWN generated
+    // definition can sit in this same TU: `extern int h(int);` + `int h(int a)
+    // {...}` is one TU, no linker, and the C side then executes the real
+    // callee, exactly like the machine driver that links the whole object.
+    // A call to a symbol NOT in this map (refused, external, absent) stays
+    // the loud exclusion it was.
+    // `rdec c`'s own emitter entry point: calls with declared shapes emit
+    // through prototypes. Plain `emit_c` has none and would refuse every
+    // modelled call here - T2 must run the text the corpus gate emits.
+    let protos = m4::protos_of(&subjects);
+    let texts: Vec<Result<rdec_core::emit_c::Out, Vec<rdec_core::emit_c::Refusal>>> =
+        subjects.iter().map(|s| emit_c_sig(&s.f, &protos)).collect();
+    // Which definitions may sit in the one TU: a definition only if EVERY
+    // symbol its text calls extern is itself an includable definition (the
+    // least fixpoint: drop a text whose extern names a dropped text, repeat).
+    // `extern int f(void);` without a definition links nowhere, and a T2 side
+    // that does not link compares nothing.
+    let mut include: Vec<bool> = texts.iter().map(|t| t.is_ok()).collect();
+    let idx_of: std::collections::HashMap<&str, usize> = subjects
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.cname.as_str(), i))
+        .collect();
+    loop {
+        let mut changed = false;
+        for (i, t) in texts.iter().enumerate() {
+            if include[i] {
+                let ok = t
+                    .as_ref()
+                    .expect("include implies Ok")
+                    .externs
+                    .iter()
+                    .all(|x| {
+                        idx_of
+                            .get(extern_name(x).as_str())
+                            .is_some_and(|j| include[*j])
+                    });
+                if !ok {
+                    include[i] = false;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let defs: std::collections::BTreeSet<&str> = subjects
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| include[*i])
+        .map(|(_, s)| s.cname.as_str())
+        .collect();
+    // The object data (`.data`/`.rdata`/`.bss` names the relocations resolved)
+    // seeded into the C model's flat memory at the SAME addresses the emitted
+    // code names: `m4::data_map_of`, one map per object, chunked into arrays.
+    let data_chunks = data_images(&files)?;
+
+    for (si, s) in subjects.iter().enumerate() {
         lifted += 1;
         let tag = format!("{} :: {}", s.obj, s.sym);
         let skip = |why: &str, skipped: &mut BTreeMap<String, Vec<String>>| {
@@ -739,14 +853,22 @@ pub fn cmd_t2(args: &[String]) -> Result<i32, String> {
         let (n_paths, n_def, _) = rax_paths(&s.f);
         path_tot += n_paths;
         path_def += n_def;
-        let Ok(out) = emit_c(&s.f) else {
+        let Some(out) = texts[si].as_ref().ok() else {
             // `rdec c` counts and names these; T2 does not re-count an emitter
             // refusal as a T2 gap.
             refused += 1;
             continue;
         };
-        if !out.externs.is_empty() {
-            skip("calls a symbol we do not model", &mut skipped);
+        if let Some(miss) = out
+            .externs
+            .iter()
+            .map(|x| extern_name(x))
+            .find(|n| !defs.contains(n.as_str()))
+        {
+            skip(
+                &format!("calls a symbol we do not model ({miss})"),
+                &mut skipped,
+            );
             continue;
         }
         if has_exit(&s.f) {
@@ -800,7 +922,6 @@ pub fn cmd_t2(args: &[String]) -> Result<i32, String> {
             s,
             // `rdec c`'s own emitter output, verbatim, in one TU with the
             // prelude's memory model.
-            text: out.text.clone(),
             c_sym: subs.len(),
             loops: loop_shaped(&s.f),
             // The C corpus has no declared shapes: the integer model.
@@ -856,9 +977,15 @@ pub fn cmd_t2(args: &[String]) -> Result<i32, String> {
     );
     decomp.push_str(PRELUDE);
     decomp.push('\n');
-    for sb in &subs {
-        decomp.push_str(&sb.text);
-        decomp.push('\n');
+    decomp.push_str(&data_arrays(&data_chunks));
+    // EVERY emitted definition whose calls all land inside the TU (the
+    // fixpoint above): a text whose extern names a refused symbol would
+    // break the link, so it is not emitted here.
+    for (i, t) in texts.iter().enumerate() {
+        if include[i] {
+            decomp.push_str(t.as_ref().expect("include implies Ok").text.as_str());
+            decomp.push('\n');
+        }
     }
     decomp.push_str("typedef uint64_t (*Fn)(uint64_t, uint64_t, uint64_t, uint64_t);\n");
     for sb in &subs {
@@ -873,7 +1000,7 @@ pub fn cmd_t2(args: &[String]) -> Result<i32, String> {
     // The decompiled side runs every job in job order, so its job list is the
     // global one: that is what makes the two sides' job lists the same list.
     decomp.push_str(&job_tables(&jobs));
-    decomp.push_str(&main_body(jobs.len()));
+    decomp.push_str(&main_body(jobs.len(), &data_memcpy(&data_chunks)));
     let decomp_src = PathBuf::from(format!("{out_dir}/t2_decomp.c"));
     let decomp_exe = PathBuf::from(format!("{out_dir}/t2_decomp.exe"));
     std::fs::write(&decomp_src, &decomp).map_err(|e| format!("{}: {e}", decomp_src.display()))?;
@@ -937,7 +1064,7 @@ pub fn cmd_t2(args: &[String]) -> Result<i32, String> {
         }
         src.push_str(&c_array(&vecs));
         src.push_str(&job_tables(&local));
-        src.push_str(&main_body(local.len()));
+        src.push_str(&main_body(local.len(), ""));
         let sp = PathBuf::from(format!("{out_dir}/t2_native_{}.c", stem_of(obj)));
         let ep = PathBuf::from(format!("{out_dir}/t2_native_{}.exe", stem_of(obj)));
         std::fs::write(&sp, &src).map_err(|e| format!("{}: {e}", sp.display()))?;
@@ -2167,7 +2294,67 @@ pub(crate) fn t2_cpp_run(
         bucket(rep, tag, &format!("excluded: {why}"));
     };
 
+    // Emit EVERY subject first (as `cmd_t2` does): a call the relocations
+    // resolved names a callee whose generated definition can sit in this TU,
+    // so the C side executes the real callee the way the linked driver does.
+    // The `Err` arm is kept: the refusal census below reads the refusals.
+    // `rdec cpp`'s own emitter entry point (see `cmd_t2`).
+    let protos = m4::protos_of(&p.subjects);
+    let texts: Vec<Result<rdec_core::emit_c::Out, Vec<rdec_core::emit_c::Refusal>>> = p
+        .subjects
+        .iter()
+        .map(|s| emit_c_sig(&s.f, &protos))
+        .collect();
+    // TU-includable definitions, the least fixpoint `cmd_t2` documents.
+    let mut include: Vec<bool> = texts.iter().map(|t| t.is_ok()).collect();
+    let idx_of: std::collections::HashMap<&str, usize> = p
+        .subjects
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.cname.as_str(), i))
+        .collect();
+    loop {
+        let mut changed = false;
+        for (i, t) in texts.iter().enumerate() {
+            if include[i] {
+                let ok = t
+                    .as_ref()
+                    .expect("include implies Ok")
+                    .externs
+                    .iter()
+                    .all(|x| {
+                        idx_of
+                            .get(extern_name(x).as_str())
+                            .is_some_and(|j| include[*j])
+                    });
+                if !ok {
+                    include[i] = false;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let defs: std::collections::BTreeSet<&str> = p
+        .subjects
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| include[*i])
+        .map(|(_, s)| s.cname.as_str())
+        .collect();
+    // Data bytes at modelled addresses: the objects in first-appearance order,
+    // which is the order `lift_all_named_shapes` numbered them.
+    let mut obj_files: Vec<String> = Vec::new();
     for s in &p.subjects {
+        if !obj_files.contains(&s.obj) {
+            obj_files.push(s.obj.clone());
+        }
+    }
+    let data_chunks = data_images(&obj_files)?;
+
+    for (si, s) in p.subjects.iter().enumerate() {
         rep.lifted += 1;
         let tag = format!("{} :: {}", s.obj, s.sym);
         if rdec_core::verify::verify_ssa(&s.f).is_err() {
@@ -2181,12 +2368,12 @@ pub(crate) fn t2_cpp_run(
             skip(&mut rep, "no COFF symbol to link (discovery target)", &tag);
             continue;
         }
-        let out = match emit_c(&s.f) {
+        let out = match texts[si].as_ref() {
             Ok(o) => o,
             Err(rs) => {
                 rep.refused += 1;
                 bucket(&mut rep, &tag, "refused by the emitter");
-                for r in &rs {
+                for r in rs {
                     *refusal_keys.entry(crate::m4::key(r)).or_default() += 1;
                 }
                 continue;
@@ -2222,8 +2409,13 @@ pub(crate) fn t2_cpp_run(
         };
         // Runnability, `cmd_t2`'s predicates in `cmd_t2`'s order.
         let mut run_gap: Option<String> = None;
-        if !out.externs.is_empty() {
-            run_gap = Some("calls a symbol we do not model".to_string());
+        if let Some(miss) = out
+            .externs
+            .iter()
+            .map(|x| extern_name(x))
+            .find(|n| !defs.contains(n.as_str()))
+        {
+            run_gap = Some(format!("calls a symbol we do not model ({miss})"));
         } else if has_exit(&s.f) {
             run_gap = Some("unmodelled control flow (Exit)".to_string());
         } else if !s.external {
@@ -2306,7 +2498,7 @@ pub(crate) fn t2_cpp_run(
         }
         let sub = Sub {
             s,
-            text: out.text.clone(),
+
             c_sym: match class {
                 "rax" => subs.len(),
                 "win" => wsubs.len(),
@@ -2387,14 +2579,14 @@ pub(crate) fn t2_cpp_run(
     );
     decomp.push_str(PRELUDE);
     decomp.push('\n');
-    for sb in subs
-        .iter()
-        .chain(wsubs.iter())
-        .chain(xsubs.iter())
-        .chain(wxsubs.iter())
-    {
-        decomp.push_str(&sb.text);
-        decomp.push('\n');
+    // EVERY emitted definition whose calls all land inside the TU (the
+    // fixpoint `cmd_t2` documents): a definition whose extern names a refused
+    // symbol cannot link into this TU, so it is not emitted into it.
+    for (i, t) in texts.iter().enumerate() {
+        if include[i] {
+            decomp.push_str(t.as_ref().expect("include implies Ok").text.as_str());
+            decomp.push('\n');
+        }
     }
     // The base carries the function texts only: V is embedded in the RAX
     // runner and in the window runner (its wrappers read V[j][1..3]), W in the
@@ -2408,6 +2600,10 @@ pub(crate) fn t2_cpp_run(
     let mut decomp_exe = PathBuf::new();
     if !subs.is_empty() {
         let mut src = decomp.clone();
+        // The data bytes are seeded by THIS runner's main only, so the arrays
+        // live here: the window runners never read them, and a table one TU
+        // never reads is an unused-static warning.
+        src.push_str(&data_arrays(&data_chunks));
         src.push_str(&c_array(&vecs));
         src.push_str("typedef uint64_t (*Fn)(uint64_t, uint64_t, uint64_t, uint64_t);\n");
         for sb in &subs {
@@ -2424,7 +2620,7 @@ pub(crate) fn t2_cpp_run(
         }
         src.push_str("};\n");
         src.push_str(&job_tables(&jobs));
-        src.push_str(&main_body(jobs.len()));
+        src.push_str(&main_body(jobs.len(), &data_memcpy(&data_chunks)));
         let sp = PathBuf::from(format!("{out_dir}/t2cpp_decomp.c"));
         let ep = PathBuf::from(format!("{out_dir}/t2cpp_decomp.exe"));
         std::fs::write(&sp, &src).map_err(|e| format!("{}: {e}", sp.display()))?;
@@ -2613,7 +2809,7 @@ pub(crate) fn t2_cpp_run(
             }
             src.push_str("};\n");
             src.push_str(&job_tables(&local));
-            src.push_str(&main_body(local.len()));
+            src.push_str(&main_body(local.len(), ""));
         }
         let mut wid_ids: Vec<usize> = Vec::new();
         let mut wlocal: Vec<(usize, usize)> = Vec::new();

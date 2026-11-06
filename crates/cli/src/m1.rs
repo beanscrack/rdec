@@ -125,8 +125,7 @@ pub fn cmd_disasm(args: &[String]) -> i32 {
                         .filter(|r| r.address >= i.va - va && r.address < i.va - va + i.len as u64)
                         .map(|r| {
                             let n = obj
-                                .symbols
-                                .get(r.symbol)
+                                .symbol_of(r.symbol)
                                 .map(|s| s.name.as_str())
                                 .unwrap_or("?");
                             format!("reloc typ {} -> {n}", r.typ)
@@ -450,7 +449,7 @@ pub fn cmd_discover(args: &[String]) -> Result<i32, String> {
                 if !matches!(rl.typ, 2 | 4 | 5 | 6 | 7) {
                     continue;
                 }
-                if let Some(t) = obj.symbols.get(rl.symbol) {
+                if let Some(t) = obj.symbol_of(rl.symbol) {
                     if t.section == Some(sec) && !t.name.starts_with('.') {
                         seeds.entry(r).or_default().1.push(base_of[r] + t.offset);
                     }
@@ -697,6 +696,15 @@ pub fn cmd_lift(args: &[String]) -> Result<i32, String> {
     let mut call_nosym = 0usize;
     let mut call_over = 0usize;
     let mut call_untypable = 0usize;
+    // The relocation census, printed with the calls census. This gate lifts
+    // with `lift_one` - no callee table, no relocation map - so K is 0 by
+    // construction and L counts every rel32 call displacement with no
+    // relocation consulted; the C/C++ gates run the same pipeline WITH the
+    // map, and their `relocs:` lines carry the resolved number.
+    let mut relocs_parsed = 0usize;
+    let mut call_reloc_resolved = 0usize;
+    let mut call_reloc_unresolved = 0usize;
+    let mut rip_named = 0usize;
     let mut unreach_total = 0usize;
     let mut undef_live = 0usize;
     let mut scaffolding = 0usize;
@@ -720,6 +728,7 @@ pub fn cmd_lift(args: &[String]) -> Result<i32, String> {
     for file in &files {
         let obj = loader::load(Path::new(file))?;
         objects += 1;
+        relocs_parsed += obj.reloc_census().parsed;
         let mut ranges: Vec<Code> = Vec::new();
         let mut idx_of = HashMap::new();
         let mut base_of: Vec<u64> = Vec::new();
@@ -755,7 +764,7 @@ pub fn cmd_lift(args: &[String]) -> Result<i32, String> {
                 if !matches!(rl.typ, 2 | 4 | 5 | 6 | 7) {
                     continue;
                 }
-                if let Some(t) = obj.symbols.get(rl.symbol) {
+                if let Some(t) = obj.symbol_of(rl.symbol) {
                     if t.section == Some(sec) && !t.name.starts_with('.') {
                         seeds.entry(r).or_default().1.push(base_of[r] + t.offset);
                     }
@@ -777,7 +786,7 @@ pub fn cmd_lift(args: &[String]) -> Result<i32, String> {
                 names.insert(base_of[r] + s.offset, s.name.clone());
             }
             for rl in &sec.relocations {
-                if let Some(t) = obj.symbols.get(rl.symbol) {
+                if let Some(t) = obj.symbol_of(rl.symbol) {
                     names.insert(base_of[r] + rl.address, t.name.clone());
                 }
             }
@@ -815,6 +824,9 @@ pub fn cmd_lift(args: &[String]) -> Result<i32, String> {
             call_nosym += rep.calls_no_symbol;
             call_over += rep.calls_over_args;
             call_untypable += rep.calls_untypable;
+            call_reloc_resolved += rep.calls_reloc_resolved;
+            call_reloc_unresolved += rep.calls_reloc_external + rep.calls_reloc_absent;
+            rip_named += rep.rip_named;
             unreach_total += rep.unreachable_blocks;
             undef_live += rep.undef_live_ins;
             scaffolding += rep.scaffolding_removed;
@@ -893,6 +905,9 @@ pub fn cmd_lift(args: &[String]) -> Result<i32, String> {
     );
     println!(
         "calls: {call_modelled} modelled | indirect {call_indirect} | no symbol {call_nosym} | >4 args {call_over} | untypable {call_untypable}"
+    );
+    println!(
+        "relocs: {relocs_parsed} parsed | call targets resolved {call_reloc_resolved} | unresolved {call_reloc_unresolved} | rip-relative addresses named {rip_named}  (this gate lifts with `lift_one`: no relocation map, so resolution is 0 by construction - `rdec c`/`rdec cpp` run the same pipeline with the map)"
     );
     println!(
         "evidence: {gap_total} loud gaps, {exit_total} Exit terminators, {unnamed_total} unnamed call targets, {clobber_total} modelled register clobbers, {unreach_total} unreachable blocks dropped, {scaffolding} live-in placeholders resolved, {undef_live} of them `undef` (the ABI question), {self_idioms} register self-idioms translated as machine-code facts (`xor/sub r,r` write 0 without reading the register; `and/or r,r` write it back)"

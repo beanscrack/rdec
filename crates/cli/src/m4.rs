@@ -10,12 +10,119 @@
 //!  3. the passes that run before emission must not break SSA - checked with the
 //!     same verifier, not with trust.
 use rdec_arch_x86::discover::{discover_all, Code};
-use rdec_arch_x86::lift::{lift_one_sigs, CalleeSig, CalleeTable, FnShape};
+use rdec_arch_x86::lift::{lift_one_sigs, CalleeSig, CalleeTable, FnShape, RelocMap, RelocTarget};
 use rdec_core::emit_c::{callee_decl, emit_c_sig, Protos, Refusal, PRELUDE};
 use rdec_core::ir::Function;
 use rdec_core::verify::verify_ssa;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+
+/// Where one object's non-code sections live in the emitter's flat
+/// `rdec_mem[1 << 20]` space. Above the frame (`STACK_BASE = 1 << 19`, where
+/// every rsp-relative load/store already lives) so a stack access can never
+/// collide with a data access; `DATA_STRIDE` apart per object so the 120
+/// objects that all define `f` cannot collide with each other. `RDEC_ADDR`
+/// masks addresses into 20 bits, and `DATA_BASE0 + 120 * DATA_STRIDE` is
+/// below `1 << 20`, so the whole table fits without aliasing.
+///
+/// One function computes the layout and the C-side seeding in `rdec t2`
+/// calls it: a drift between the two is the address a constant reads AT, the
+/// kind of bug that compares clean and answers wrong.
+pub const DATA_BASE0: u64 = rdec_arch_x86::lift::STACK_BASE + 4096;
+pub const DATA_STRIDE: u64 = 4096;
+
+/// One data section's bytes, placed at `va` in the flat space.
+pub struct DataChunk {
+    pub va: u64,
+    pub bytes: Vec<u8>,
+}
+
+/// The data sections of object `oi`, mapped in section order, plus the
+/// section-index -> base table `reloc_map_of` consults, plus the count of
+/// sections DECLINED (a block that would run off the object's stride or the
+/// 1 MiB window): counted, never silently dropped.
+pub fn data_map_of(
+    obj: &rdec_arch_x86::loader::Object,
+    oi: usize,
+) -> (Vec<DataChunk>, HashMap<usize, u64>, usize) {
+    let mut chunks = Vec::new();
+    let mut sec_va = HashMap::new();
+    let mut declined = 0usize;
+    let block0 = DATA_BASE0 + oi as u64 * DATA_STRIDE;
+    let block_end = DATA_BASE0 + (oi as u64 + 1) * DATA_STRIDE;
+    let mut at = block0;
+    let mut full = false;
+    for (i, sec) in obj.sections.iter().enumerate() {
+        if obj.is_code(i) {
+            continue;
+        }
+        // A zero-raw-size section (.bss: a C++ static member, a zero-initialised
+        // global) gets an address and no bytes: `rdec_mem` is zero, which is
+        // exactly .bss's content rule, so there is nothing to seed.
+        let len = sec.bytes.len() as u64;
+        if full || at + len > block_end.min(1 << 20) {
+            full = true;
+            declined += 1;
+            continue;
+        }
+        sec_va.insert(i, at);
+        if len > 0 {
+            chunks.push(DataChunk {
+                va: at,
+                bytes: sec.bytes.clone(),
+            });
+        }
+        at += len + 16;
+    }
+    (chunks, sec_va, declined)
+}
+
+/// The object's relocations keyed by the address of the displacement field
+/// they name, in the same per-object virtual space as `names` and the plan:
+/// the table that turns `callq 0x15` (whose immediate is the UNRELOCATED
+/// next-IP) into the symbol and address the `REL32` relocation at 0x11 names.
+/// A symbol this object does not define keeps its name and a `None` address:
+/// the call site refuses with the symbol named, not the gap swallowed.
+pub fn reloc_map_of(
+    obj: &rdec_arch_x86::loader::Object,
+    oi: usize,
+    idx_of: &HashMap<usize, usize>,
+    base_of: &[u64],
+) -> RelocMap {
+    let (_, sec_va, _) = data_map_of(obj, oi);
+    let mut map = RelocMap::new();
+    for (sec, rels) in obj.sections.iter().enumerate() {
+        let Some(&r) = idx_of.get(&sec) else {
+            continue;
+        };
+        for rl in &rels.relocations {
+            if !rl.kind().is_rel32() {
+                continue;
+            }
+            let Some(sym) = obj.symbol_of(rl.symbol) else {
+                continue;
+            };
+            let addr = match sym.section {
+                // Defined by this object, in a section the pipeline has placed:
+                // a code section in the plan's space, a data section in the
+                // flat `rdec_mem` space.
+                Some(s2) if s2 == sec => Some(base_of[r] + sym.offset),
+                Some(s2) if idx_of.contains_key(&s2) => Some(base_of[idx_of[&s2]] + sym.offset),
+                Some(s2) => sec_va.get(&s2).map(|b| b + sym.offset),
+                // External / absolute: the name is the whole evidence.
+                None => None,
+            };
+            map.insert(
+                base_of[r] + rl.address,
+                RelocTarget {
+                    sym: sym.name.clone(),
+                    addr,
+                },
+            );
+        }
+    }
+    map
+}
 
 /// The pre-emission pipeline. Flag elimination first: `Ty::Flags` has no C
 /// spelling on purpose, so a surviving flags value is a refusal, and the pass
@@ -106,6 +213,10 @@ pub struct Subject {
     /// a scan of the surviving IR: the number is "what the decoder saw", and
     /// that is the only number `llvm-objdump -d` can check.
     pub rep: rdec_arch_x86::lift::Report,
+    /// Relocations the LOADER parsed in this subject's object (all sections).
+    /// Object-level, carried on every subject of the object; `relocs_line`
+    /// de-duplicates by object path, so it is a census, not a per-function count.
+    pub relocs_parsed: usize,
 }
 
 /// Load, discover, lift and clean every function in `files`, named by
@@ -167,7 +278,7 @@ pub fn lift_all_named_shapes(
                 if !matches!(rl.typ, 2 | 4 | 5 | 6 | 7) {
                     continue;
                 }
-                if let Some(t) = obj.symbols.get(rl.symbol) {
+                if let Some(t) = obj.symbol_of(rl.symbol) {
                     if t.section == Some(sec) && !t.name.starts_with('.') {
                         seeds.entry(r).or_default().1.push(base_of[r] + t.offset);
                     }
@@ -208,6 +319,14 @@ pub fn lift_all_named_shapes(
             );
         }
 
+        // The object's relocations, keyed by the address of the displacement
+        // field they name: the evidence a `call`'s immediate does not carry in
+        // an object file, and the same table that names a RIP-relative data
+        // address. Built per object, in the same per-object virtual space as
+        // `names`, the plan, and `data_map_of`.
+        let relocs = reloc_map_of(&obj, oi, &idx_of, &base_of);
+        let relocs_parsed = obj.reloc_census().parsed;
+
         for (k, &start) in plan.functions.iter().enumerate() {
             let Some((_, rg)) = ranges
                 .iter()
@@ -230,7 +349,7 @@ pub fn lift_all_named_shapes(
             let name = name_of(oi, &raw);
             let abi = shape_of(oi, &raw).abi;
             let (mut f, rep) = lift_one_sigs(
-                &name, rg.bytes, rg.base, start, end, &plan, &names, &abi, &sigs,
+                &name, rg.bytes, rg.base, start, end, &plan, &names, &abi, &sigs, &relocs,
             );
             clean(&mut f);
             out.push(Subject {
@@ -239,6 +358,7 @@ pub fn lift_all_named_shapes(
                 cname: name,
                 start,
                 external: external.contains(&start),
+                relocs_parsed,
                 f,
                 abi,
                 rep,
@@ -290,6 +410,25 @@ pub fn calls_line(subjects: &[Subject]) -> String {
         unty += s.rep.calls_untypable;
     }
     format!("calls: {m} modelled | indirect {ind} | no symbol {nosym} | >4 args {over} | untypable {unty}")
+}
+
+/// The relocation census, on the same footing as `calls_line`: N is what the
+/// loader parsed across the objects (counted once per object, not once per
+/// function), K is direct-call displacements whose relocation resolved to a
+/// defined symbol, L is the call sites that stayed loud - the relocation named
+/// a symbol the object does not define, named nothing, or the call's
+/// displacement carried no relocation at all. `llvm-objdump -r` over the same
+/// objects checks N; the lifter's own counters check K and L.
+pub fn relocs_line(subjects: &[Subject]) -> String {
+    let mut by_obj: HashMap<&str, usize> = HashMap::new();
+    let (mut resolved, mut unresolved) = (0usize, 0usize);
+    for s in subjects {
+        by_obj.insert(s.obj.as_str(), s.relocs_parsed);
+        resolved += s.rep.calls_reloc_resolved;
+        unresolved += s.rep.calls_reloc_external + s.rep.calls_reloc_absent;
+    }
+    let parsed: usize = by_obj.values().sum();
+    format!("relocs: {parsed} parsed | call targets resolved {resolved} | unresolved {unresolved}")
 }
 
 /// Load, discover, lift and clean every function in `files`, named by
@@ -348,6 +487,7 @@ pub fn cmd_c(args: &[String]) -> Result<i32, String> {
 
     let subjects = lift_all(&files)?;
     println!("{}", calls_line(&subjects));
+    println!("{}", relocs_line(&subjects));
     // The callee shapes of the whole translation unit, built once, before the
     // first function is emitted: a call to a sibling needs a prototype that
     // already exists, and every definition is in this file, so the set is known.

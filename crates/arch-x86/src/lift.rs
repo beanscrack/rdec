@@ -413,6 +413,39 @@ pub fn no_callees() -> CalleeTable {
     CalleeTable::new()
 }
 
+/// What the COFF relocation attached to a displacement field says: the symbol
+/// that field names, and the address of that symbol in the object's flat
+/// per-object space when the object DEFINES it (`Some`). An external symbol -
+/// one no COFF symbol in this object resolves - carries its name and `None`:
+/// the refusal can name it, and the pipeline cannot pretend it linked.
+///
+/// This is the evidence a `call`'s immediate does not carry: clang's COFF
+/// objects leave the unrelocated next-IP in the displacement and put the
+/// target in the relocation at its address (`callq 0x15` at 0x10 + the
+/// REL32 relocation at 0x11 naming `h` at 0x50). Reading only the immediate
+/// is why `calls: 0 modelled`.
+#[derive(Clone, Debug)]
+pub struct RelocTarget {
+    pub sym: String,
+    pub addr: Option<u64>,
+}
+
+/// Relocations keyed by the address of the displacement field they apply to,
+/// in the same per-object virtual space as `names`. A direct `call` and a
+/// RIP-relative `lea`/`mov` both resolve through this: their displacement is
+/// the last 4 bytes of the instruction, so the key is `next_ip - 4`.
+pub type RelocMap = HashMap<u64, RelocTarget>;
+
+/// An empty map: no displacement has a relocation, which is the model exactly
+/// as it was before the relocation table was read as an evidence source.
+pub fn no_relocs() -> RelocMap {
+    RelocMap::new()
+}
+
+/// An empty relocation map: no call target and no RIP-relative address has a
+/// named symbol, which is the model as it was.
+static EMPTY_RELOCS: std::sync::LazyLock<RelocMap> = std::sync::LazyLock::new(RelocMap::new);
+
 /// Caller-saved: a call may overwrite these.
 const CALLER_SAVED: [Grp; 25] = [
     Grp::Rax,
@@ -592,6 +625,26 @@ pub struct Report {
     /// A direct call to a callee whose declared shape the front end could not
     /// type: the identity is known, the signature is not, so the answer is not.
     pub calls_untypable: usize,
+    /// Direct `call`s whose displacement field carries a REL32 relocation that
+    /// resolves to a symbol DEFINED in this object: the target is the symbol's
+    /// address, which is what lets the `names`/`sigs` lookup model the call.
+    /// Counted at the call site, next to `calls_modelled`, so the gate can show
+    /// the relocation evidence and the modelling evidence as two numbers.
+    pub calls_reloc_resolved: usize,
+    /// Direct `call`s whose displacement carries a relocation naming a symbol
+    /// this object does not define (external, undefined): the name is known,
+    /// the address is not, so the call keeps its loud shape.
+    pub calls_reloc_external: usize,
+    /// Direct `call`s whose displacement field has NO relocation. For an
+    /// intra-section call clang links the target into the immediate, so the
+    /// immediate IS the evidence; counted so the number of calls resolved from
+    /// the table is auditable against the number of calls in the object.
+    pub calls_reloc_absent: usize,
+    /// RIP-relative operands (`lea`, `mov`, arithmetic, scalar SSE loads) whose
+    /// displacement relocation names a symbol the object defines: the address
+    /// became a named constant, so the `lea of an address we cannot name`
+    /// class is cut by this number, counted at the operand.
+    pub rip_named: usize,
     /// Blocks the entry cannot reach; their lifted contents dropped, counted.
     pub unreachable_blocks: usize,
     /// Live-in placeholders SSA construction resolved and deleted.
@@ -740,6 +793,10 @@ pub struct Lifter<'a> {
     /// resolves to, and what its declared shape says to pass. An empty table is
     /// "no target is typable", which is the model exactly as it was.
     sigs: &'a CalleeTable,
+    /// The object's relocations, keyed by the address of the displacement
+    /// field they name. Empty is the model as it was: no call target and no
+    /// RIP-relative address is resolved from the table.
+    relocs: &'a RelocMap,
     fmt: Box<dyn iced_x86::Formatter>,
 }
 
@@ -765,7 +822,7 @@ impl<'a> Lifter<'a> {
         names: &'a HashMap<u64, String>,
         abi: &FnAbi,
     ) -> Lifter<'a> {
-        Lifter::new_sig(name, addr, names, abi, &EMPTY_SIGS)
+        Lifter::new_sig(name, addr, names, abi, &EMPTY_SIGS, &EMPTY_RELOCS)
     }
 
     /// Lift with the declared shapes of this object's CALLEES available, so a
@@ -789,6 +846,7 @@ impl<'a> Lifter<'a> {
         names: &'a HashMap<u64, String>,
         abi: &FnAbi,
         sigs: &'a CalleeTable,
+        relocs: &'a RelocMap,
     ) -> Lifter<'a> {
         let mut f = Function::new(name, addr);
         f.ret_ty = match abi.ret {
@@ -874,6 +932,7 @@ impl<'a> Lifter<'a> {
             rep: Report::default(),
             names,
             sigs,
+            relocs,
             fmt: crate::decode::formatter(crate::decode::Syntax::Intel),
         };
         l.rep.float_params = float_params;
@@ -1247,36 +1306,107 @@ impl<'a> Lifter<'a> {
     }
 
     /// Address value of a memory operand. `None` for anything we cannot name:
-    /// RIP-relative (needs the data/symbol model), unaddressable index.
+    /// a RIP-relative displacement with no relocation naming a defined symbol,
+    /// an unaddressable index.
+    ///
+    /// A RIP-relative displacement is NOT self-describing in an object file:
+    /// the bytes hold `target - next_ip` UNRELOCATED, and the real target lives
+    /// in the REL32 relocation at the displacement's address. With that
+    /// relocation, the address of a defined symbol — code, `.rdata`, a `.bss`
+    /// static — is a constant we can name: an address in the object's flat
+    /// per-object space, which is what the emitter's `RDEC_ADDR` masks into
+    /// `rdec_mem`. Without it, the refusal names the symbol the relocation
+    /// carried, so the gap is a work item with an identity.
     fn addr_of(&mut self, ins: &Instruction, op: u32) -> Option<VId> {
         if ins.op_kind(op) != OpKind::Memory {
             return None;
         }
         let base = ins.memory_base();
-        if base == Register::RIP || base == Register::None {
-            return None;
+        if base == Register::RIP {
+            // The RIP-relative disp32 is the last field of the instruction, so
+            // the relocation's address is `next_ip - 4`.
+            let at = ins.next_ip().wrapping_sub(4);
+            match self.relocs.get(&at).and_then(|rt| rt.addr) {
+                Some(a) => {
+                    self.rep.rip_named += 1;
+                    Some(self.const_of(a, Width::W64))
+                }
+                None => None,
+            }
+        } else if base == Register::None {
+            None
+        } else {
+            let (bg, _) = split(base)?;
+            let mut v = self.read64(bg);
+            let index = ins.memory_index();
+            if index != Register::None {
+                let (ig, _) = split(index)?;
+                let iv = self.read64(ig);
+                let scale = ins.memory_index_scale();
+                if scale > 1 {
+                    let s = self.const_of(scale as u64, Width::W64);
+                    let scaled = self.bin(BinOp::Mul, iv, s);
+                    v = self.bin(BinOp::Add, v, scaled);
+                } else {
+                    v = self.bin(BinOp::Add, v, iv);
+                }
+            }
+            let disp = ins.memory_displacement64() as i64;
+            if disp != 0 {
+                let d = self.const_of(disp as u64, Width::W64);
+                v = self.bin(BinOp::Add, v, d);
+            }
+            Some(v)
         }
-        let (bg, _) = split(base)?;
-        let mut v = self.read64(bg);
-        let index = ins.memory_index();
-        if index != Register::None {
-            let (ig, _) = split(index)?;
-            let iv = self.read64(ig);
-            let scale = ins.memory_index_scale();
-            if scale > 1 {
-                let s = self.const_of(scale as u64, Width::W64);
-                let scaled = self.bin(BinOp::Mul, iv, s);
-                v = self.bin(BinOp::Add, v, scaled);
-            } else {
-                v = self.bin(BinOp::Add, v, iv);
+    }
+
+    /// The symbol named by the RIP-relative relocation on this instruction,
+    /// for refusal text: `": h"`, or `""` when no relocation is there at all.
+    fn rip_sym(&self, ins: &Instruction) -> Option<String> {
+        self.relocs
+            .get(&ins.next_ip().wrapping_sub(4))
+            .map(|rt| format!(": {}", rt.sym))
+    }
+
+    /// Resolve a direct branch target from the relocation at its displacement
+    /// field. `disp_len` is the ENCODING's width (rel32 = 4, rel16 = 2), so the
+    /// lookup key is `next_ip - disp_len`. `count` routes the three outcomes
+    /// into the call census (only call sites count: a `jcc`/`jmp` target is
+    /// block-edge evidence for `discover`, and this slice resolves calls).
+    /// Falls back to the immediate when the table has nothing to say.
+    fn resolve_reloc_target(
+        &mut self,
+        ins: &Instruction,
+        imm_target: u64,
+        disp_len: u64,
+        count: bool,
+    ) -> u64 {
+        match self.relocs.get(&ins.next_ip().wrapping_sub(disp_len)) {
+            Some(rt) => match rt.addr {
+                Some(a) => {
+                    if count {
+                        self.rep.calls_reloc_resolved += 1;
+                    }
+                    a
+                }
+                // Names a symbol the object does not define: an external call
+                // has no COFF symbol to link, so it keeps the loud bucket it had.
+                None => {
+                    if count {
+                        self.rep.calls_reloc_external += 1;
+                    }
+                    imm_target
+                }
+            },
+            // No relocation: an intra-section target the compiler already
+            // linked into the immediate - the immediate IS the evidence here.
+            None => {
+                if count {
+                    self.rep.calls_reloc_absent += 1;
+                }
+                imm_target
             }
         }
-        let disp = ins.memory_displacement64() as i64;
-        if disp != 0 {
-            let d = self.const_of(disp as u64, Width::W64);
-            v = self.bin(BinOp::Add, v, d);
-        }
-        Some(v)
     }
 
     /// Memory access size -> a modelled width. 128/256-bit accesses (SSE, AVX)
@@ -2069,9 +2199,12 @@ impl<'a> Lifter<'a> {
                 let a = match self.addr_of(ins, 1) {
                     Some(a) => a,
                     None => {
-                        // Usually an address in another section: needs the data
-                        // and symbol model, which is M4/M6 work.
-                        self.gap("lea of an address we cannot name", Ty::u64())
+                        // No relocation names a defined symbol at this
+                        // displacement: an address the pipeline cannot speak
+                        // of. If a relocation IS there, its symbol is the
+                        // refusal's identity - the work item with a name.
+                        let sfx = self.rip_sym(ins).unwrap_or_default();
+                        self.gap(&format!("lea of an address we cannot name{sfx}"), Ty::u64())
                     }
                 };
                 self.write(d, dw, a);
@@ -2095,10 +2228,8 @@ impl<'a> Lifter<'a> {
                 let a = match self.addr_of(ins, 0) {
                     Some(a) => a,
                     None => {
-                        self.gap(
-                            "mov to an address we cannot name (rip-relative data?)",
-                            Ty::u64(),
-                        );
+                        let sfx = self.rip_sym(ins).unwrap_or_default();
+                        self.gap(&format!("mov to an address we cannot name{sfx}"), Ty::u64());
                         return;
                     }
                 };
@@ -2149,7 +2280,11 @@ impl<'a> Lifter<'a> {
                         let a = match self.addr_of(ins, 0) {
                             Some(a) => a,
                             None => {
-                                self.gap("arithmetic on an address we cannot name", Ty::u64());
+                                let sfx = self.rip_sym(ins).unwrap_or_default();
+                                self.gap(
+                                    &format!("arithmetic on an address we cannot name{sfx}"),
+                                    Ty::u64(),
+                                );
                                 return;
                             }
                         };
@@ -2430,6 +2565,24 @@ impl<'a> Lifter<'a> {
                     return;
                 }
                 let t = self.target(ins).unwrap_or(0);
+                // The relocation table speaks at the address of the displacement
+                // field. clang's COFF objects leave the UNRELOCATED next-IP in a
+                // `call`'s rel32 and name the real target in the REL32 relocation
+                // AT THAT FIELD (`callq 0x15` at 0x10, relocation at 0x11 naming
+                // `h` at 0x50), so the immediate is never the callee's address:
+                // reading only `target()` is precisely why `calls: 0 modelled`.
+                // iced_x86 reports a 64-bit-mode direct call as `NearBranch64`
+                // (verified against the decoder on `call_helper.O0.obj`);
+                // the ENCODING is rel32, and a rel32 displacement is the
+                // instruction's last 4 bytes, so the relocation's address is
+                // `next_ip - 4`.
+                let t = match ins.op_kind(0) {
+                    OpKind::NearBranch16 => self.resolve_reloc_target(ins, t, 2, true),
+                    OpKind::NearBranch32 | OpKind::NearBranch64 => {
+                        self.resolve_reloc_target(ins, t, 4, true)
+                    }
+                    _ => t,
+                };
                 // More register arguments than the model has pairs (Windows x64
                 // has four): the 5th+ argument lives on the stack, unmodelled.
                 let over_args = ins.op_count() > 1;
@@ -3121,6 +3274,7 @@ pub fn lift_one_sig(
         names,
         abi,
         &no_callees(),
+        &no_relocs(),
     )
 }
 
@@ -3143,9 +3297,10 @@ pub fn lift_one_sigs(
     names: &HashMap<u64, String>,
     abi: &FnAbi,
     sigs: &CalleeTable,
+    relocs: &RelocMap,
 ) -> (Function, Report) {
     let blocks = split_blocks(plan, start, end);
-    let mut l = Lifter::new_sig(name, start, names, abi, sigs);
+    let mut l = Lifter::new_sig(name, start, names, abi, sigs, relocs);
     let f = l.lift_function(bytes, base, &blocks);
     let rep = l.rep.clone();
     (f, rep)

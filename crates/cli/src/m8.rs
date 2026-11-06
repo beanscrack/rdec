@@ -1403,6 +1403,7 @@ pub fn cmd_cpp(args: &[String]) -> Result<i32, String> {
     // comes from that definition's own declared shape.
     let protos = crate::m4::protos_of(&subjects);
     println!("{}", crate::m4::calls_line(&subjects));
+    println!("{}", crate::m4::relocs_line(&subjects));
 
     for s in &subjects {
         lifted += 1;

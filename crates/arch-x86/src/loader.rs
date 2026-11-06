@@ -46,17 +46,49 @@ pub struct Symbol {
     pub size_source: SizeSource,
     pub typ: u16,
     pub storage_class: u8,
-    /// Symbol-table index, for relocation lookups.
+    /// Index into `Object::symbols`.
     pub index: usize,
+    /// Index into the RAW symbol table, auxiliary records included - which is
+    /// the space `Reloc::symbol` is expressed in: COFF relocation symbol
+    /// indexes count every table entry, so resolving one through `index`
+    /// (main symbols only) lands on the wrong symbol in any object with aux
+    /// records. `llvm-objdump -r` on `arith_basic.O0.obj` resolves
+    /// `.pdata+0x8` to `.xdata`; index-shuffling reads it as `.llvm_addrsig`.
+    pub raw_index: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct Reloc {
-    /// Offset within the section.
+    /// Offset within the section. For a REL32 this is the address of the
+    /// instruction's DISPLACEMENT FIELD, not of the instruction itself: the
+    /// `callq` at 0x10 carries its target in the relocation at 0x11.
     pub address: u64,
     pub typ: u16,
-    /// Index into `Object::symbols`.
+    /// Index into the RAW symbol table (auxiliary records counted) - resolve
+    /// it with `Object::symbol_of`, never as `Object::symbols[i]`.
     pub symbol: usize,
+}
+
+impl Reloc {
+    pub fn kind(&self) -> RelocKind {
+        match self.typ {
+            0 => RelocKind::Absolute,
+            1 => RelocKind::Addr64,
+            2 => RelocKind::Addr32,
+            3 => RelocKind::Addr32NB,
+            4..=9 => RelocKind::Rel32,
+            _ => RelocKind::Other,
+        }
+    }
+
+    /// The relocation's symbol, by name - long (string-table) names resolved
+    /// at parse time, so a decorated C++ name and a 37-character `__xmm@`
+    /// constant read as what they are.
+    pub fn symbol_name<'o>(&self, o: &'o Object) -> &'o str {
+        o.symbol_of(self.symbol)
+            .map(|s| s.name.as_str())
+            .unwrap_or("?")
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -66,6 +98,10 @@ pub struct Object {
     pub sections: Vec<Section>,
     pub symbols: Vec<Symbol>,
     pub time_date_stamp: u32,
+    /// RAW symbol-table index -> index into `symbols`. Auxiliary records map
+    /// to the main symbol they extend, so a relocation index — which counts
+    /// every raw entry — resolves through this and nothing else.
+    raw_symbol: Vec<usize>,
 }
 
 /// `IMAGE_FILE_MACHINE_AMD64`.
@@ -74,21 +110,101 @@ pub const MACHINE_AMD64: u16 = 0x8664;
 pub const STORAGE_EXTERNAL: u8 = 2;
 /// `IMAGE_SYM_CLASS_STATIC`.
 pub const STORAGE_STATIC: u8 = 3;
-/// `IMAGE_REL_AMD64_REL32` - the call/jump relocation.
+/// `IMAGE_REL_AMD64_ADDR64`.
+pub const REL_AMD64_ADDR64: u16 = 1;
+/// `IMAGE_REL_AMD64_ADDR32`.
+pub const REL_AMD64_ADDR32: u16 = 2;
+/// `IMAGE_REL_AMD64_ADDR32NB` - the .pdata relocation. It is 3, not 2:
+/// the first table here had 2, and a parser that swapped the 2/3 pair reads
+/// every `.pdata` entry as ADDR32. `tests/relocs.rs` asserts the numbers
+/// against the spec AND against `llvm-objdump -r` over the corpus, so the
+/// pair cannot silently swap back.
+pub const REL_AMD64_ADDR32NB: u16 = 3;
+/// `IMAGE_REL_AMD64_REL32` - the call/jump relocation, and the one a
+/// RIP-relative data reference carries.
 pub const REL_AMD64_REL32: u16 = 4;
-/// `IMAGE_REL_AMD64_ADDR32NB`.
-pub const REL_AMD64_ADDR32NB: u16 = 2;
 
-pub fn reloc_type_name(t: u16) -> &'static str {
+/// The AMD64 COFF relocation types by their spec names, exactly as
+/// `llvm-objdump -r` prints them (it prints `IMAGE_REL_AMD64_<this>`).
+pub fn reloc_display(t: u16) -> &'static str {
     match t {
         0 => "ABSOLUTE",
         1 => "ADDR64",
-        2 => "ADDR32NB",
-        3 => "ADDR32",
-        4..=7 => "REL32",
-        9 => "SECREL",
-        20 => "ADDR32NB",
+        2 => "ADDR32",
+        3 => "ADDR32NB",
+        4 => "REL32",
+        5 => "REL32_1",
+        6 => "REL32_2",
+        7 => "REL32_3",
+        8 => "REL32_4",
+        9 => "REL32_5",
+        10 => "SECTION",
+        11 => "SECREL",
+        12 => "SECREL7",
+        13 => "TOKEN",
+        14 => "SREL32",
+        15 => "PAIR",
+        16 => "SSPAN32",
         _ => "?",
+    }
+}
+
+/// What a relocation type MEANS to this pipeline. The REL32 family (4..=9)
+/// all address relative to the end of the displacement field, so they all
+/// name a call target / a RIP-relative data target; the offsets differ only
+/// in how many bytes of the instruction the target address skips, and clang
+/// emits plain REL32 for both a `call` and a RIP-relative `lea`/`mov`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelocKind {
+    /// `IMAGE_REL_AMD64_ABSOLUTE`: counted, names no target.
+    Absolute,
+    Addr64,
+    Addr32,
+    Addr32NB,
+    Rel32,
+    /// Defined in the AMD64 spec (SECTION, SECREL, PAIR, ...) or outside the
+    /// spec's range entirely. The pipeline does not consume these, and they
+    /// are COUNTED in `RelocCensus::other` - a skip must be counted to be
+    /// loud, and a counted skip is a work item, not a silent loss.
+    Other,
+}
+
+impl RelocKind {
+    /// True for the REL32 family - the kinds that name the target of a
+    /// displacement field.
+    pub fn is_rel32(self) -> bool {
+        self == RelocKind::Rel32
+    }
+}
+
+/// The relocation census: how many of each kind the loader recognised, and
+/// the raw types it did not consume. Printed by the gates (the `relocs:`
+/// line) so "we parse the container" is a number, not a claim.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RelocCensus {
+    /// Relocations whose type is in the covered set (ABSOLUTE, ADDR64,
+    /// ADDR32, ADDR32NB, the REL32 family).
+    pub parsed: usize,
+    pub rel32: usize,
+    pub addr32nb: usize,
+    pub addr64: usize,
+    pub addr32: usize,
+    pub absolute: usize,
+    /// Type -> count, for every relocation NOT in the covered set.
+    pub other: std::collections::BTreeMap<u16, usize>,
+}
+
+impl std::ops::AddAssign<&RelocCensus> for RelocCensus {
+    fn add_assign(&mut self, o: &RelocCensus) {
+        self.parsed += o.parsed;
+        self.rel32 += o.rel32;
+        self.addr32nb += o.addr32nb;
+        self.addr64 += o.addr64;
+        self.addr32 += o.addr32;
+        self.absolute += o.absolute;
+        for (k, v) in &o.other {
+            *self.other.entry(*k).or_default() += v;
+        }
     }
 }
 
@@ -140,6 +256,12 @@ impl Object {
         self.machine == MACHINE_AMD64
     }
 
+    /// Resolve a RAW symbol-table index (what `Reloc::symbol` holds, what a
+    /// COFF relocation carries) to a parsed symbol.
+    pub fn symbol_of(&self, raw: usize) -> Option<&Symbol> {
+        self.raw_symbol.get(raw).map(|&i| &self.symbols[i])
+    }
+
     pub fn is_code(&self, section: usize) -> bool {
         // CODE (0x20) with EXECUTE (0x20000000).
         let c = self.sections[section].characteristics;
@@ -187,6 +309,67 @@ impl Object {
     /// "no relocation means no call target" argument.
     pub fn total_relocs(&self) -> usize {
         self.sections.iter().map(|s| s.relocations.len()).sum()
+    }
+
+    /// The relocation census over every section: what the covered set parsed
+    /// and what it declined to consume, by raw type. The `relocs:` gate line is
+    /// built from this, so an unparsed type appears as a named, counted gap
+    /// instead of a silent skip.
+    pub fn reloc_census(&self) -> RelocCensus {
+        let mut c = RelocCensus::default();
+        for s in &self.sections {
+            for r in &s.relocations {
+                match r.kind() {
+                    RelocKind::Absolute => {
+                        c.absolute += 1;
+                        c.parsed += 1;
+                    }
+                    RelocKind::Addr64 => {
+                        c.addr64 += 1;
+                        c.parsed += 1;
+                    }
+                    RelocKind::Addr32 => {
+                        c.addr32 += 1;
+                        c.parsed += 1;
+                    }
+                    RelocKind::Addr32NB => {
+                        c.addr32nb += 1;
+                        c.parsed += 1;
+                    }
+                    RelocKind::Rel32 => {
+                        c.rel32 += 1;
+                        c.parsed += 1;
+                    }
+                    RelocKind::Other => {
+                        *c.other.entry(r.typ).or_default() += 1;
+                    }
+                }
+            }
+        }
+        c
+    }
+
+    /// The relocation, if any, attached to `offset` in `section` - the lookup
+    /// that turns a displacement field into the symbol it names.
+    pub fn reloc_at(&self, section: usize, offset: u64) -> Option<&Reloc> {
+        self.sections
+            .get(section)
+            .and_then(|s| s.relocations.iter().find(|r| r.address == offset))
+    }
+
+    /// The address a relocation resolves to in this object's flat per-object
+    /// space, given `base_of` (section index -> that section's base address,
+    /// as every gate builds it). `None` for a symbol the object does not
+    /// define: an external symbol has no address to name, which is a fact
+    /// about the object, not a gap to paper over.
+    pub fn reloc_target(
+        &self,
+        r: &Reloc,
+        base_of: &dyn Fn(usize) -> Option<u64>,
+    ) -> Option<(u64, &str)> {
+        let s = self.symbol_of(r.symbol)?;
+        let base = base_of(s.section?)?;
+        Some((base + s.offset, s.name.as_str()))
     }
 }
 
@@ -245,7 +428,10 @@ pub fn load_bytes(bytes: &[u8], path: &str) -> Result<Object, String> {
         let rel_off = u32le(bytes, h + 24) as usize;
         let nrel = u32le(bytes, h + 32) as usize;
         let chars = u32le(bytes, h + 36);
-        let data = if raw_size == 0 || raw_off >= bytes.len() {
+        // `PointerToRawData == 0` is COFF for "this section has no data in
+        // the file" (`.bss`: SizeOfRawData keeps the virtual size, content is
+        // zero). Indexing the file at 0 would read the file header as content.
+        let data = if raw_size == 0 || raw_off == 0 || raw_off >= bytes.len() {
             Vec::new()
         } else {
             bytes[raw_off..(raw_off + raw_size).min(bytes.len())].to_vec()
@@ -276,6 +462,8 @@ pub fn load_bytes(bytes: &[u8], path: &str) -> Result<Object, String> {
 
     // Symbols, skipping auxiliary entries.
     let mut symbols = Vec::new();
+    // Raw entry index -> parsed symbol index, for relocation resolution.
+    let mut raw_symbol: Vec<usize> = Vec::new();
     let mut pos = symoff;
     // `NumberOfSymbols` counts EVERY entry, auxiliary records included, so the
     // loop bound is entries consumed - not main symbols emitted.
@@ -304,10 +492,13 @@ pub fn load_bytes(bytes: &[u8], path: &str) -> Result<Object, String> {
             typ,
             storage_class: storage,
             index: symbols.len(),
+            raw_index: entries,
         });
+        raw_symbol.extend(std::iter::repeat_n(symbols.len() - 1, 1 + naux));
         entries += 1 + naux;
         pos += 18 * (1 + naux);
     }
+    debug_assert_eq!(raw_symbol.len(), nsyms, "raw symbol map counts every entry");
 
     // Extents: the next symbol in the section, or the section end.
     //
@@ -349,6 +540,7 @@ pub fn load_bytes(bytes: &[u8], path: &str) -> Result<Object, String> {
         sections,
         symbols,
         time_date_stamp: stamp,
+        raw_symbol,
     })
 }
 
@@ -460,5 +652,95 @@ mod tests {
         v[16..18].copy_from_slice(&240u16.to_le_bytes());
         let e = load_bytes(&v, "weird.obj").unwrap_err();
         assert!(e.contains("optional header"), "{e}");
+    }
+
+    /// The relocation-table bounds guard, FIRED: point `NumberOfRelocations`
+    /// at entries the file does not contain and the loader must say so. The
+    /// same guard reads every corpus object's table; one that never fires in
+    /// a test is not a guard, it is a comment.
+    #[test]
+    fn a_relocation_table_running_off_the_end_is_a_loud_error() {
+        let text = vec![0xC3u8; 4];
+        let mut v = text_object(&text, &[("f", 0)]);
+        // Section header 0 starts at 20: PointerToRelocations at +24,
+        // NumberOfRelocations at +32. Claim three records starting four
+        // bytes from the end of the file.
+        let rel = (v.len() - 4) as u32;
+        v[20 + 24..20 + 28].copy_from_slice(&rel.to_le_bytes());
+        v[20 + 32..20 + 34].copy_from_slice(&3u16.to_le_bytes());
+        let e = load_bytes(&v, "relocoff.obj").unwrap_err();
+        assert!(e.contains("relocation table runs off the end"), "{e}");
+    }
+
+    /// COFF's `.bss` convention: `PointerToRawData` is 0 - the section has
+    /// NO data in the file, and its content rule is "zero" - while
+    /// `SizeOfRawData` keeps the virtual size. A loader that indexes the file
+    /// at raw offset 0 reads the FILE HEADER as section content: measured,
+    /// `static_members.O0.obj`'s 4-byte `.bss` came back as `0x00078664` -
+    /// the AMD64 machine word plus the section count - and every T2 run of
+    /// the C++ static member read that constant instead of zero.
+    #[test]
+    fn bss_with_no_raw_data_reads_empty_not_as_the_file_header() {
+        // Two-section object built by hand: `.text` (a code symbol) and
+        // `.bss` with SizeOfRawData 4 and PointerToRawData 0 - exactly the
+        // shape clang's COFF writer emits for a zero-initialised static.
+        let text = vec![0xC3u8; 4];
+        let nsec = 2usize;
+        let nsyms = 3usize; // section symbol + aux + `f`
+        let symoff = 20 + 40 * nsec;
+        let strtab = symoff + 18 * nsyms;
+        let data = strtab + 4;
+        let mut b = Vec::new();
+        b.extend_from_slice(&MACHINE_AMD64.to_le_bytes());
+        b.extend_from_slice(&(nsec as u16).to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes()); // TimeDateStamp
+        b.extend_from_slice(&(symoff as u32).to_le_bytes());
+        b.extend_from_slice(&(nsyms as u32).to_le_bytes());
+        b.extend_from_slice(&0u16.to_le_bytes()); // SizeOfOptionalHeader
+        b.extend_from_slice(&0u16.to_le_bytes()); // Characteristics
+        b.extend_from_slice(b".text\0\0\0");
+        b.extend_from_slice(&(text.len() as u32).to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes()); // VirtualAddress
+        b.extend_from_slice(&(text.len() as u32).to_le_bytes()); // SizeOfRawData
+        b.extend_from_slice(&(data as u32).to_le_bytes()); // PointerToRawData
+        b.extend_from_slice(&[0u8; 12]); // relocs, linenums, counts
+        b.extend_from_slice(&0x6050_0020u32.to_le_bytes()); // CODE | EXECUTE
+        b.extend_from_slice(b".bss\0\0\0\0");
+        b.extend_from_slice(&4u32.to_le_bytes()); // VirtualSize
+        b.extend_from_slice(&0u32.to_le_bytes()); // VirtualAddress
+        b.extend_from_slice(&4u32.to_le_bytes()); // SizeOfRawData: keeps the size
+        b.extend_from_slice(&0u32.to_le_bytes()); // PointerToRawData: ZERO
+        b.extend_from_slice(&[0u8; 12]); // relocs, linenums, counts
+        b.extend_from_slice(&0x0850_0000u32.to_le_bytes()); // UNINITIALIZED DATA
+        b.resize(symoff, 0);
+        // section symbol + aux, then `f`.
+        b.extend_from_slice(&[0u8; 8]); // Name: zeros (section symbol)
+        b.extend_from_slice(&0u32.to_le_bytes()); // Value
+        b.extend_from_slice(&1u16.to_le_bytes()); // SectionNumber: .text
+        b.extend_from_slice(&0u16.to_le_bytes()); // Type
+        b.extend_from_slice(&3u8.to_le_bytes()); // StorageClass: STATIC
+        b.push(1); // NumAux: one section-definition record
+        b.extend_from_slice(&(text.len() as u32).to_le_bytes()); // aux Length
+        b.extend_from_slice(&[0u8; 14]); // aux padding to 18 bytes
+        b.extend_from_slice(b"f\0\0\0\0\0\0\0");
+        b.extend_from_slice(&0u32.to_le_bytes()); // Value
+        b.extend_from_slice(&1u16.to_le_bytes()); // SectionNumber: .text
+        b.extend_from_slice(&0u16.to_le_bytes()); // Type
+        b.extend_from_slice(&2u8.to_le_bytes()); // StorageClass: EXTERNAL
+        b.push(0); // NumAux
+        b.extend_from_slice(&4u32.to_le_bytes()); // string table size
+        b.extend_from_slice(&text);
+        let o = load_bytes(&b, "bss.obj").expect("parses");
+        let bss = o
+            .sections
+            .iter()
+            .find(|s| s.name == ".bss")
+            .expect("the .bss section");
+        assert!(
+            bss.bytes.is_empty(),
+            ".bss read {} bytes of file-header: {:02x?}",
+            bss.bytes.len(),
+            bss.bytes
+        );
     }
 }
