@@ -455,8 +455,8 @@ impl UnwindTable {
     }
 
     /// The chained entries, refused as function starts. The count is part of
-    /// the API contract: `functions().count() + chaining_refusals().len()
-    /// + version_refusals().len()` equals `entry_count()` for every image
+    /// the API contract: `functions().count()` plus `chaining_refusals().len()`
+    /// plus `version_refusals().len()` equals `entry_count()` for every image
     /// this reader accepts.
     pub fn chaining_refusals(&self) -> &[ChainedEntry] {
         &self.chained
