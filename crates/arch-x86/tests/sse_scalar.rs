@@ -360,13 +360,13 @@ fn cvtsi2sd_reads_the_source_at_its_width_as_signed() {
 #[test]
 fn packed_and_ordered_compare_are_refused_by_name() {
     let cases: &[(&str, &[u8])] = &[
-        (
-            "paddd",
-            &[
-                0x66, 0x0F, 0xFE, 0xC1, // paddd  xmm0, xmm1
-                0xC3,
-            ][..],
-        ),
+        // `paddd` MOVED OUT of this table with the M8 packed-ARITHMETIC slice:
+        // the lane-independent packed forms (paddq/paddd/psubq/psubd,
+        // pcmpeqd/pcmpeqq) are per-lane IR over the XMM pair cells, so they are
+        // IR now, not refusals. Positive coverage — per-lane carry/borrow
+        // isolation and the all-ones mask, ground-truthed against llvm-objdump
+        // — is `packed_simd.rs`. The lane-crossing forms below (shufps, andps)
+        // and the ordered compare stay refused by name and stay tested here.
         (
             "shufps",
             &[
@@ -430,7 +430,7 @@ fn census_counts_modelled_and_refused_together() {
         0x66, 0x0F, 0xEF, 0xC0, // pxor   xmm0, xmm0
         0xF2, 0x48, 0x0F, 0x2A, 0xC1, // cvtsi2sd xmm0, rcx
         0xF2, 0x0F, 0x58, 0xC1, // addsd  xmm0, xmm1
-        0x66, 0x0F, 0xFE, 0xC1, // paddd  xmm0, xmm1  (refused)
+        0x0F, 0xC6, 0xC1, 0x00, // shufps xmm0, xmm1, 0  (refused: lane-crossing)
         0xF2, 0x48, 0x0F, 0x2C, 0xC0, // cvttsd2si rax, xmm0
         0xC3, // ret
     ];
@@ -439,13 +439,17 @@ fn census_counts_modelled_and_refused_together() {
     assert_eq!(rep.sse.get("pxor"), Some(&1));
     assert_eq!(rep.sse.get("cvtsi2sd"), Some(&1));
     assert_eq!(rep.sse.get("addsd"), Some(&1));
-    assert_eq!(rep.sse.get("paddd"), Some(&1));
+    assert_eq!(rep.sse.get("shufps"), Some(&1));
     assert_eq!(rep.sse.get("cvttsd2si"), Some(&1));
     assert_eq!(
         rep.sse.values().sum::<u32>(),
         5,
         "five SSE instructions, counted once each"
     );
-    assert_eq!(rep.gaps, 1, "only the packed one is a gap");
+    // `paddd` used to sit in this stream as the refused one; the M8
+    // packed-ARITHMETIC slice models it per lane, so the refused slot is now
+    // `shufps`, a shuffle the lanes cannot express. The census invariant is
+    // unchanged: modelled and refused are counted together, gaps are refusals.
+    assert_eq!(rep.gaps, 1, "only the lane-crossing shuffle is a gap");
     assert_eq!(rep.sse_zeroing, 1, "pxor is the zeroing idiom");
 }

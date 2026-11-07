@@ -25,9 +25,19 @@
 //      machine preserves, zeroing where the machine zeroes. Pinning the
 //      wrong one here would make the decompiler agree with a comment
 //      instead of with silicon, and T2 would be green on a lie.
-//  * everything else packed (paddd, pmovmskb...) stays a loud `Op::Opaque`
-//    naming the exact mnemonic: the refusal census is the next slice's map,
-//    so a folded/renamed gap is a lost map entry.
+//  * lane-independent packed ARITHMETIC, added by the second slice and pinned
+//    by the fixtures at the end of this file: `paddq`/`psubq` (two u64 lanes),
+//    `paddd`/`psubd` (four u32 lanes per 128 bits), `pcmpeqd`/`pcmpeqq` (per
+//    lane equal -> all-ones, else zero). Each lane's answer is a function of
+//    that lane's operands only, so no carry, borrow, or comparison result
+//    crosses a lane -- the fixtures are built from the carry/borrow cases that
+//    make a whole-register model answer a different BYTE.
+//  * everything else packed (the shuffles `pshufd`/`shufps`/`punpck*`, the
+//    multiplies `pmul*`, the shifts `psrad`/`pslld`, pmovmskb, movmskps...)
+//    stays a loud `Op::Opaque` naming the exact mnemonic: the refusal census
+//    is the next slice's map, so a folded/renamed gap is a lost map entry.
+//    Lane crossing is the boundary -- see
+//    `lane_crossing_packed_work_stays_loud_naming_the_mnemonic`.
 use rdec_arch_x86::discover::{discover_all, Code};
 use rdec_arch_x86::lift::lift_one;
 use rdec_core::interp::{run_budget_seed, Outcome};
@@ -509,41 +519,449 @@ fn pand_pandn_por_are_lane_pairs() {
     );
 }
 
-/// The scope boundary is part of the contract: packed arithmetic that is NOT
-/// in the slice must stay a loud gap naming the exact mnemonic verbatim --
-/// the refusal census is the next lane's map, so `paddd` and `movmskps` must
-/// appear by name and nothing may be silently modelled. Ground truth:
+/// The scope boundary is part of the contract: packed work that is NOT
+/// lane-independent -- shuffles, unpacks, multiplies, the shifts by an
+/// immediate, and the mask reads -- must stay a loud gap naming the exact
+/// mnemonic verbatim: the refusal census is the next lane's map, so each
+/// must appear by name and nothing may be silently modelled. These are the
+/// corpus's own loop-body forms (`array_walk.O2` emits all six), which is
+/// why the boundary is drawn at lane crossing and not at "packed": modelling
+/// the lane-independent arithmetic (`paddq`/`paddd`/`psubq`/`psubd`/
+/// `pcmpeqd`/`pcmpeqq`, pinned by the fixtures below) does NOT quiet one of
+/// these six names. Ground truth (`llvm-objdump -d` of these bytes):
 ///
 /// ```text
-/// 0: f3 0f 6f 01     movdqu (%rcx), %xmm0
-/// 4: 66 0f fe c1     paddd  %xmm1, %xmm0
-/// 8: 0f 50 c0        movmskps %xmm0, %eax
-/// b: c3              ret
+/// 0:  66 44 0f 70 df f5     pshufd    $0xf5, %xmm7, %xmm11
+/// 6:  66 41 0f f4 fa        pmuludq   %xmm10, %xmm7
+/// b:  66 41 0f 62 fa        punpckldq %xmm10, %xmm7
+/// 11: 44 0f c6 c9 88        shufps    $0x88, %xmm1, %xmm9
+/// 16: 66 0f 72 e3 03        psrad     $0x3, %xmm3
+/// 1b: 0f 50 c0              movmskps  %xmm0, %eax
+/// 1e: c3                    ret
 /// ```
 #[test]
-fn packed_arithmetic_stays_loud_naming_the_mnemonic() {
+fn lane_crossing_packed_work_stays_loud_naming_the_mnemonic() {
     let bytes: &[u8] = &[
-        0xF3, 0x0F, 0x6F, 0x01, // movdqu (%rcx),%xmm0
-        0x66, 0x0F, 0xFE, 0xC1, // paddd  %xmm1,%xmm0
+        0x66, 0x44, 0x0F, 0x70, 0xDF, 0xF5, // pshufd    $0xf5,%xmm7,%xmm11
+        0x66, 0x41, 0x0F, 0xF4, 0xFA, // pmuludq   %xmm10,%xmm7
+        0x66, 0x41, 0x0F, 0x62, 0xFA, // punpckldq %xmm10,%xmm7
+        0x44, 0x0F, 0xC6, 0xC9, 0x88, // shufps    $0x88,%xmm1,%xmm9
+        0x66, 0x0F, 0x72, 0xE3, 0x03, // psrad     $0x3,%xmm3
         0x0F, 0x50, 0xC0, // movmskps %xmm0,%eax
         0xC3,
     ];
     let (f, rep) = lift(bytes);
     verify_ssa(&f).expect("valid SSA");
     let texts = opaque_texts(&f);
-    assert!(
-        texts.iter().any(|t| t.contains("paddd")),
-        "paddd must be a loud gap naming the mnemonic: {texts:?}"
-    );
-    assert!(
-        texts.iter().any(|t| t.contains("movmskps")),
-        "movmskps must be a loud gap naming the mnemonic: {texts:?}"
-    );
-    // The movdqu LOAD is modelled: the only gaps are the two out-of-scope ops.
+    for nm in [
+        "pshufd",
+        "pmuludq",
+        "punpckldq",
+        "shufps",
+        "psrad",
+        "movmskps",
+    ] {
+        assert!(
+            texts.iter().any(|t| t.contains(nm)),
+            "{nm} must be a loud gap naming the mnemonic: {texts:?}"
+        );
+    }
+    // Every one of the six is a gap: none is folded, renamed, or swallowed.
     assert_eq!(
         texts.len(),
-        2,
-        "exactly paddd and movmskps stay gaps: {texts:?}"
+        6,
+        "exactly the six lane-crossing ops stay gaps: {texts:?}"
     );
-    assert!(rep.gaps >= 2, "the gaps are counted: {}", rep.gaps);
+    assert!(rep.gaps >= 6, "the gaps are counted: {}", rep.gaps);
+}
+
+// ---- M8 second slice: lane-independent packed arithmetic -----------------
+//
+// `paddq`/`paddd`/`psubq`/`psubd`/`pcmpeqd`/`pcmpeqq` are the packed ops whose
+// lanes never talk to each other: every lane's answer is a function of that
+// lane's two operands alone, so the W64 pair expresses them (the u64 ops
+// directly, the u32 ops as the trunc / shift / recombine the fixtures pin by
+// bytes). The fixtures are the carry and borrow cases, not the easy ones: in
+// each pair the operands are chosen so that a whole-register model -- one
+// 128-bit add, one 64-bit add per cell, a mask of 0/1 instead of all-ones --
+// answers a DIFFERENT byte than the hardware. Those are the saboteur models
+// this file names in its doc comment, and each fixture says which byte moves.
+//
+// Ground truth for every fixture is `llvm-objdump -d` of the same bytes
+// (clang 22.1.8 integrated assembler, no -O), quoted verbatim in the comment.
+// The expected answers are hand-computed and spelled as literals, never
+// recomputed by the same expression the lifter emits.
+
+/// Seed the two 16-byte operands of a register-register fixture: A at `SRC`
+/// (loaded into xmm0 first), B at `SRC + 0x10` (loaded into xmm1 second).
+fn seed_pair(a: u128, b: u128) -> Vec<(u64, u8)> {
+    seed16(SRC, &a.to_le_bytes())
+        .into_iter()
+        .chain(seed16(SRC + 0x10, &b.to_le_bytes()))
+        .collect()
+}
+
+/// `paddq %xmm0, %xmm1`: two INDEPENDENT 64-bit adds, and the carry out of
+/// lane 0 goes nowhere. Operands (Intel reading: DEST = xmm1 = B, SRC = xmm0
+/// = A), lanes spelled low-first:
+///   A = [0xFFFFFFFFFFFFFFFF, 0x0000000000000001]
+///   B = [0x0000000000000001, 0x0000000000000002]
+/// The answer is [0x0, 0x3]: lane 0 wraps (all-ones + 1) and lane 1 is 1 + 2.
+/// A model that adds the register as ONE 128-bit integer answers [0x0, 0x4]
+/// -- the lane-0 carry leaks into byte 8, and the assertion names it. Ground
+/// truth:
+///
+/// ```text
+/// 0:  f3 0f 6f 01       movdqu (%rcx), %xmm0
+/// 4:  f3 0f 6f 49 10    movdqu 0x10(%rcx), %xmm1
+/// 9:  66 0f d4 c8       paddq  %xmm0, %xmm1
+/// d:  f3 0f 7f 0a       movdqu %xmm1, (%rdx)
+/// 11: c3                ret
+/// ```
+#[test]
+fn paddq_is_two_independent_u64_adds() {
+    let bytes: &[u8] = &[
+        0xF3, 0x0F, 0x6F, 0x01, // movdqu (%rcx),%xmm0
+        0xF3, 0x0F, 0x6F, 0x49, 0x10, // movdqu 0x10(%rcx),%xmm1
+        0x66, 0x0F, 0xD4, 0xC8, // paddq  %xmm0,%xmm1
+        0xF3, 0x0F, 0x7F, 0x0A, // movdqu %xmm1,(%rdx)
+        0xC3,
+    ];
+    let (f, _rep) = lift(bytes);
+    verify_ssa(&f).expect("valid SSA");
+    let a: u128 = 0x0000_0000_0000_0001_FFFF_FFFF_FFFF_FFFF;
+    let b: u128 = 0x0000_0000_0000_0002_0000_0000_0000_0001;
+    let exec = run(&f, &[SRC, DST, 0, 0], &seed_pair(a, b));
+    assert!(
+        matches!(exec.outcome, Outcome::Ret(_)),
+        "{:?}",
+        exec.outcome
+    );
+    let got = mem16(&exec, DST).expect("16 bytes stored at DST");
+    assert_eq!(
+        u128::from_le_bytes(got),
+        0x0000_0000_0000_0003_0000_0000_0000_0000,
+        "lane 1 must be 1+2 = 3; a 128-bit add leaks lane 0's carry and answers 4 in byte 8"
+    );
+    assert_eq!(opaque_texts(&f), Vec::<String>::new());
+}
+
+/// `paddq 0x40(%rcx), %xmm0`: the memory-source form, which is the form the
+/// corpus witness emits -- `copy_words.O2` adds four `.rdata` vector
+/// constants, all `paddq (%rip), %xmm`. The 16 bytes at the operand address
+/// are the source pair: two W64 loads, lo at addr, hi at addr+8.
+///   A (dest, at SRC)   = [0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF]
+///   B (memory, at SRC+0x40) = [0x1, 0x1]
+/// The answer is all zero: each lane wraps on its own. One 128-bit add
+/// answers [0x0, 0x1] -- the carry out of lane 0 lands in byte 8. Ground
+/// truth:
+///
+/// ```text
+/// 0:  f3 0f 6f 01       movdqu (%rcx), %xmm0
+/// 4:  66 0f d4 41 40    paddq  0x40(%rcx), %xmm0
+/// 9:  f3 0f 7f 02       movdqu %xmm0, (%rdx)
+/// d:  c3                ret
+/// ```
+#[test]
+fn paddq_reads_a_memory_operand_as_a_lane_pair() {
+    let bytes: &[u8] = &[
+        0xF3, 0x0F, 0x6F, 0x01, // movdqu (%rcx),%xmm0
+        0x66, 0x0F, 0xD4, 0x41, 0x40, // paddq  0x40(%rcx),%xmm0
+        0xF3, 0x0F, 0x7F, 0x02, // movdqu %xmm0,(%rdx)
+        0xC3,
+    ];
+    let (f, _rep) = lift(bytes);
+    verify_ssa(&f).expect("valid SSA");
+    let a: u128 = u128::MAX;
+    let b: u128 = 0x0000_0000_0000_0001_0000_0000_0000_0001;
+    let seed: Vec<(u64, u8)> = seed16(SRC, &a.to_le_bytes())
+        .into_iter()
+        .chain(seed16(SRC + 0x40, &b.to_le_bytes()))
+        .collect();
+    let exec = run(&f, &[SRC, DST, 0, 0], &seed);
+    assert!(
+        matches!(exec.outcome, Outcome::Ret(_)),
+        "{:?}",
+        exec.outcome
+    );
+    let got = mem16(&exec, DST).expect("16 bytes stored at DST");
+    assert_eq!(
+        u128::from_le_bytes(got),
+        0x0000_0000_0000_0000_0000_0000_0000_0000,
+        "both lanes wrap to zero; a 128-bit add answers 1 in byte 8"
+    );
+    assert_eq!(opaque_texts(&f), Vec::<String>::new());
+}
+
+/// `paddd %xmm0, %xmm1`: FOUR independent 32-bit adds. Lanes (a0..a3) are
+/// spelled low-first inside each cell:
+///   A = [0xFFFFFFFF, 0x00000001, 0x00000003, 0x00000002]
+///   B = [0x00000001, 0xFFFFFFFF, 0x00000005, 0x00000004]
+/// The answer is [0, 0, 8, 6]: lane 0 wraps, and lane 1 (1 + all-ones) wraps
+/// too, with NO carry into lane 2. Model the cell as one 64-bit add and lane 1
+/// answers 1 -- byte 4 is where the two models disagree (0x00 vs 0x01). The
+/// high cell is the control: its two lanes add without a carry, so both
+/// models agree there and the fixture proves the red is lane 1, not the cell.
+/// Ground truth:
+///
+/// ```text
+/// 0:  f3 0f 6f 01       movdqu (%rcx), %xmm0
+/// 4:  f3 0f 6f 49 10    movdqu 0x10(%rcx), %xmm1
+/// 9:  66 0f fe c8       paddd  %xmm0, %xmm1
+/// d:  f3 0f 7f 0a       movdqu %xmm1, (%rdx)
+/// 11: c3                ret
+/// ```
+#[test]
+fn paddd_is_four_independent_u32_adds() {
+    let bytes: &[u8] = &[
+        0xF3, 0x0F, 0x6F, 0x01, // movdqu (%rcx),%xmm0
+        0xF3, 0x0F, 0x6F, 0x49, 0x10, // movdqu 0x10(%rcx),%xmm1
+        0x66, 0x0F, 0xFE, 0xC8, // paddd  %xmm0,%xmm1
+        0xF3, 0x0F, 0x7F, 0x0A, // movdqu %xmm1,(%rdx)
+        0xC3,
+    ];
+    let (f, _rep) = lift(bytes);
+    verify_ssa(&f).expect("valid SSA");
+    let a: u128 = 0x0000_0002_0000_0003_0000_0001_FFFF_FFFF;
+    let b: u128 = 0x0000_0004_0000_0005_FFFF_FFFF_0000_0001;
+    let exec = run(&f, &[SRC, DST, 0, 0], &seed_pair(a, b));
+    assert!(
+        matches!(exec.outcome, Outcome::Ret(_)),
+        "{:?}",
+        exec.outcome
+    );
+    let got = mem16(&exec, DST).expect("16 bytes stored at DST");
+    assert_eq!(
+        u128::from_le_bytes(got),
+        0x0000_0006_0000_0008_0000_0000_0000_0000,
+        "lane 1 must wrap to 0; a 64-bit add of the cell answers 1 and moves byte 4"
+    );
+    assert_eq!(opaque_texts(&f), Vec::<String>::new());
+}
+
+/// `psubq %xmm0, %xmm1`: two INDEPENDENT 64-bit subs, borrow stays in its
+/// lane. DEST = xmm1 = B, SRC = xmm0 = A:
+///   A = [0x0000000000000001, 0x0000000000000001]
+///   B = [0x0000000000000000, 0x1234567890ABCDEF]
+/// The answer is [0xFFFFFFFFFFFFFFFF, 0x1234567890ABCDEE]: lane 0 borrows
+/// (0 - 1), lane 1 is a plain -1. A 128-bit sub answers ...CDED in the high
+/// lane, because lane 0's borrow crossed. Ground truth:
+///
+/// ```text
+/// 0:  f3 0f 6f 01       movdqu (%rcx), %xmm0
+/// 4:  f3 0f 6f 49 10    movdqu 0x10(%rcx), %xmm1
+/// 9:  66 0f fb c8       psubq  %xmm0, %xmm1
+/// d:  f3 0f 7f 0a       movdqu %xmm1, (%rdx)
+/// 11: c3                ret
+/// ```
+#[test]
+fn psubq_borrow_stays_in_its_lane() {
+    let bytes: &[u8] = &[
+        0xF3, 0x0F, 0x6F, 0x01, // movdqu (%rcx),%xmm0
+        0xF3, 0x0F, 0x6F, 0x49, 0x10, // movdqu 0x10(%rcx),%xmm1
+        0x66, 0x0F, 0xFB, 0xC8, // psubq  %xmm0,%xmm1
+        0xF3, 0x0F, 0x7F, 0x0A, // movdqu %xmm1,(%rdx)
+        0xC3,
+    ];
+    let (f, _rep) = lift(bytes);
+    verify_ssa(&f).expect("valid SSA");
+    let a: u128 = 0x0000_0000_0000_0001_0000_0000_0000_0001;
+    let b: u128 = 0x1234_5678_90AB_CDEF_0000_0000_0000_0000;
+    let exec = run(&f, &[SRC, DST, 0, 0], &seed_pair(a, b));
+    assert!(
+        matches!(exec.outcome, Outcome::Ret(_)),
+        "{:?}",
+        exec.outcome
+    );
+    let got = mem16(&exec, DST).expect("16 bytes stored at DST");
+    assert_eq!(
+        u128::from_le_bytes(got),
+        0x1234_5678_90AB_CDEE_FFFF_FFFF_FFFF_FFFF,
+        "the low lane's borrow must not reach the high lane (a 128-bit sub answers ...CDED)"
+    );
+    assert_eq!(opaque_texts(&f), Vec::<String>::new());
+}
+
+/// `psubd %xmm0, %xmm1`: FOUR independent 32-bit subs, and this fixture is
+/// the one a "sub = add of the negation" model must survive -- negating a
+/// 64-bit cell and adding, without truncating each lane, propagates the
+/// borrow exactly like a 64-bit subtract. DEST = xmm1 = B, SRC = xmm0 = A:
+///   A = [0x00000001, 0x00000000, 0x80000001, 0x00000000]
+///   B = [0x00000000, 0x00000001, 0x80000000, 0x12345678]
+/// The answer is [0xFFFFFFFF, 0x00000001, 0xFFFFFFFF, 0x12345678]. A 64-bit
+/// (or negate-and-add, untruncated) model answers lane 1 = 0x00000000 (byte 4)
+/// and lane 3 = 0x12345677 (byte 12): two lanes show the crossing, one per
+/// cell, so a fix that only truncates the low cell stays red. Ground truth:
+///
+/// ```text
+/// 0:  f3 0f 6f 01       movdqu (%rcx), %xmm0
+/// 4:  f3 0f 6f 49 10    movdqu 0x10(%rcx), %xmm1
+/// 9:  66 0f fa c8       psubd  %xmm0, %xmm1
+/// d:  f3 0f 7f 0a       movdqu %xmm1, (%rdx)
+/// 11: c3                ret
+/// ```
+#[test]
+fn psubd_borrow_never_crosses_a_lane() {
+    let bytes: &[u8] = &[
+        0xF3, 0x0F, 0x6F, 0x01, // movdqu (%rcx),%xmm0
+        0xF3, 0x0F, 0x6F, 0x49, 0x10, // movdqu 0x10(%rcx),%xmm1
+        0x66, 0x0F, 0xFA, 0xC8, // psubd  %xmm0,%xmm1
+        0xF3, 0x0F, 0x7F, 0x0A, // movdqu %xmm1,(%rdx)
+        0xC3,
+    ];
+    let (f, _rep) = lift(bytes);
+    verify_ssa(&f).expect("valid SSA");
+    let a: u128 = 0x0000_0000_8000_0001_0000_0000_0000_0001;
+    let b: u128 = 0x1234_5678_8000_0000_0000_0001_0000_0000;
+    let exec = run(&f, &[SRC, DST, 0, 0], &seed_pair(a, b));
+    assert!(
+        matches!(exec.outcome, Outcome::Ret(_)),
+        "{:?}",
+        exec.outcome
+    );
+    let got = mem16(&exec, DST).expect("16 bytes stored at DST");
+    assert_eq!(
+        u128::from_le_bytes(got),
+        0x1234_5678_FFFF_FFFF_0000_0001_FFFF_FFFF,
+        "lane 1 must be 1 and lane 3 must be 0x12345678: a model that subtracts the cell answers 0 and 0x12345677 (bytes 4 and 12)"
+    );
+    assert_eq!(opaque_texts(&f), Vec::<String>::new());
+}
+
+/// `pcmpeqd %xmm0, %xmm1`: per 32-bit lane, equal -> all-ones, else zero. The
+/// mask is the assertion -- a cast of the comparison to 0/1 is the same
+/// boolean and the wrong bytes. DEST = xmm1 = B, SRC = xmm0 = A:
+///   A = [0x00000007, 0x00010000, 0xDEADBEEF, 0x5A5A5A5A]
+///   B = [0x00000007, 0x00000001, 0xDEADBEEF, 0x5A5A5A5A]
+/// Lanes 0, 2, 3 are equal, lane 1 is not, so the answer is
+/// [0xFFFFFFFF, 0x00000000, 0xFFFFFFFF, 0xFFFFFFFF]. Two saboteurs die here:
+/// a 0/1 mask answers 1 where the hardware answers all-ones (bytes 0-3), and
+/// a compare of the whole 64-bit CELL answers zero for the entire low cell,
+/// because its two lanes are unequal as a pair (bytes 0-3 again, and the
+/// fixture's high cell is all-ones while its low cell is not, so a model that
+/// treats the cells alike also moves). Ground truth:
+///
+/// ```text
+/// 0:  f3 0f 6f 01       movdqu (%rcx), %xmm0
+/// 4:  f3 0f 6f 49 10    movdqu 0x10(%rcx), %xmm1
+/// 9:  66 0f 76 c8       pcmpeqd %xmm0, %xmm1
+/// d:  f3 0f 7f 0a       movdqu %xmm1, (%rdx)
+/// 11: c3                ret
+/// ```
+#[test]
+fn pcmpeqd_answers_an_all_ones_lane_mask() {
+    let bytes: &[u8] = &[
+        0xF3, 0x0F, 0x6F, 0x01, // movdqu (%rcx),%xmm0
+        0xF3, 0x0F, 0x6F, 0x49, 0x10, // movdqu 0x10(%rcx),%xmm1
+        0x66, 0x0F, 0x76, 0xC8, // pcmpeqd %xmm0,%xmm1
+        0xF3, 0x0F, 0x7F, 0x0A, // movdqu %xmm1,(%rdx)
+        0xC3,
+    ];
+    let (f, _rep) = lift(bytes);
+    verify_ssa(&f).expect("valid SSA");
+    let a: u128 = 0x5A5A_5A5A_DEAD_BEEF_0001_0000_0000_0007;
+    let b: u128 = 0x5A5A_5A5A_DEAD_BEEF_0000_0001_0000_0007;
+    let exec = run(&f, &[SRC, DST, 0, 0], &seed_pair(a, b));
+    assert!(
+        matches!(exec.outcome, Outcome::Ret(_)),
+        "{:?}",
+        exec.outcome
+    );
+    let got = mem16(&exec, DST).expect("16 bytes stored at DST");
+    assert_eq!(
+        u128::from_le_bytes(got),
+        0xFFFF_FFFF_FFFF_FFFF_0000_0000_FFFF_FFFF,
+        "equal lanes are ALL ONES and lane 1 (unequal) is zero: 0x00000000FFFFFFFF in the low cell, all-ones in the high cell"
+    );
+    assert_eq!(opaque_texts(&f), Vec::<String>::new());
+}
+
+/// `pcmpeqq %xmm0, %xmm1`: the 64-lane sibling (SSE2, `66 0f 38 29 /r`).
+///   A = [0x0000000000000005, 0x1122334455667788]
+///   B = [0x0000000000000005, 0x1122334455667789]
+/// Lane 0 is equal, lane 1 differs, so the answer is the lane-asymmetric
+/// [0xFFFFFFFFFFFFFFFF, 0x0]: a model that compares the whole 128 bits answers
+/// zero in BOTH lanes and dies on bytes 0-7. Ground truth:
+///
+/// ```text
+/// 0:  f3 0f 6f 01       movdqu (%rcx), %xmm0
+/// 4:  f3 0f 6f 49 10    movdqu 0x10(%rcx), %xmm1
+/// 9:  66 0f 38 29 c8    pcmpeqq %xmm0, %xmm1
+/// e:  f3 0f 7f 0a       movdqu %xmm1, (%rdx)
+/// 12: c3                ret
+/// ```
+#[test]
+fn pcmpeqq_answers_an_all_ones_lane_mask() {
+    let bytes: &[u8] = &[
+        0xF3, 0x0F, 0x6F, 0x01, // movdqu (%rcx),%xmm0
+        0xF3, 0x0F, 0x6F, 0x49, 0x10, // movdqu 0x10(%rcx),%xmm1
+        0x66, 0x0F, 0x38, 0x29, 0xC8, // pcmpeqq %xmm0,%xmm1
+        0xF3, 0x0F, 0x7F, 0x0A, // movdqu %xmm1,(%rdx)
+        0xC3,
+    ];
+    let (f, _rep) = lift(bytes);
+    verify_ssa(&f).expect("valid SSA");
+    let a: u128 = 0x1122_3344_5566_7788_0000_0000_0000_0005;
+    let b: u128 = 0x1122_3344_5566_7789_0000_0000_0000_0005;
+    let exec = run(&f, &[SRC, DST, 0, 0], &seed_pair(a, b));
+    assert!(
+        matches!(exec.outcome, Outcome::Ret(_)),
+        "{:?}",
+        exec.outcome
+    );
+    let got = mem16(&exec, DST).expect("16 bytes stored at DST");
+    assert_eq!(
+        u128::from_le_bytes(got),
+        0x0000_0000_0000_0000_FFFF_FFFF_FFFF_FFFF,
+        "lane 0 is all-ones and lane 1 is zero: a 128-bit compare answers zero in both"
+    );
+    assert_eq!(opaque_texts(&f), Vec::<String>::new());
+}
+
+/// `pcmpeqd 0x40(%rcx), %xmm0`: the memory-source form of the mask op, where
+/// the DESTINATION is the register the listing prints second (Intel `DEST =
+/// xmm0`). A = the register, B = the 16 bytes at SRC+0x40:
+///   A = [0x11111111, 0x22222222, 0x33333333, 0x44444444]
+///   B = [0x11111111, 0x22222222, 0x33333334, 0x44444444]
+/// The answer is [all-ones, all-ones, 0, all-ones]: the mask is
+/// lane-asymmetric ACROSS the cells (low cell all-ones, high cell
+/// 0xFFFFFFFF00000000), so the hi half of the memory operand must be the
+/// bytes at addr+8 -- read lo twice, or ignore the high cell, and bytes
+/// 8..16 move. Ground truth:
+///
+/// ```text
+/// 0:  f3 0f 6f 01       movdqu (%rcx), %xmm0
+/// 4:  66 0f 76 41 40    pcmpeqd 0x40(%rcx), %xmm0
+/// 9:  f3 0f 7f 02       movdqu %xmm0, (%rdx)
+/// d:  c3                ret
+/// ```
+#[test]
+fn pcmpeqd_reads_a_memory_operand_as_a_lane_pair() {
+    let bytes: &[u8] = &[
+        0xF3, 0x0F, 0x6F, 0x01, // movdqu (%rcx),%xmm0
+        0x66, 0x0F, 0x76, 0x41, 0x40, // pcmpeqd 0x40(%rcx),%xmm0
+        0xF3, 0x0F, 0x7F, 0x02, // movdqu %xmm0,(%rdx)
+        0xC3,
+    ];
+    let (f, _rep) = lift(bytes);
+    verify_ssa(&f).expect("valid SSA");
+    let a: u128 = 0x4444_4444_3333_3333_2222_2222_1111_1111;
+    let b: u128 = 0x4444_4444_3333_3334_2222_2222_1111_1111;
+    let seed: Vec<(u64, u8)> = seed16(SRC, &a.to_le_bytes())
+        .into_iter()
+        .chain(seed16(SRC + 0x40, &b.to_le_bytes()))
+        .collect();
+    let exec = run(&f, &[SRC, DST, 0, 0], &seed);
+    assert!(
+        matches!(exec.outcome, Outcome::Ret(_)),
+        "{:?}",
+        exec.outcome
+    );
+    let got = mem16(&exec, DST).expect("16 bytes stored at DST");
+    assert_eq!(
+        u128::from_le_bytes(got),
+        0xFFFF_FFFF_0000_0000_FFFF_FFFF_FFFF_FFFF,
+        "only lane 2 differs, so the low cell is all-ones and the high cell is 0xFFFFFFFF00000000"
+    );
+    assert_eq!(opaque_texts(&f), Vec::<String>::new());
 }

@@ -28,7 +28,11 @@
 //!     is two W64 loads (lo at addr, hi at addr+8), a store is two stores, and
 //!     the lane-independent bitwise set (`pxor`/`pand`/`pandn`/`por`) is two
 //!     independent W64 ops - none of it is lane-crossing, so the W64 lane
-//!     model expresses all of it exactly. The pair's rule for scalar ops is
+//!     model expresses all of it exactly. The same rule reaches the packed
+//!     ARITHMETIC whose lanes never talk: `paddq`/`psubq` are two u64 lane
+//!     ops, `paddd`/`psubd` are two W32 lane ops per cell (each op typed at its
+//!     LANE's width, so the carry or borrow has no wider cell to travel in),
+//!     and `pcmpeqd`/`pcmpeqq` answer all-ones / zero per lane. The pair's rule for scalar ops is
 //!     the hardware's, per form, never a simplification: the scalar STORE
 //!     (`movsd m64, xmm`) writes 8 bytes and leaves the register's high cell
 //!     exactly as it was; the register/memory LOAD (`movsd xmm, ...`,
@@ -36,7 +40,8 @@
 //!     merge forms), and the write names that zero; the merge arithmetic
 //!     (`addsd`-family, `cvtsi2sd`-family) writes the low cell and preserves
 //!     the high one. The ops that cross lanes (`shufps`, `punpck*`,
-//!     `pshufd`), the packed arithmetic (`paddd`, `paddq`, `pmul*`), the
+//!     `pshufd`), the packed arithmetic that is not lane-independent
+//!     (`pmul*`, the `psl*`/`psr*` shifts, saturation), the
 //!     mask reads (`movmskps`) and the conversions between packed shapes
 //!     (`cvtp*`) STAY refused by name, with the mnemonic and the address, and
 //!     counted: the refusal census is the next slice's map. A model that
@@ -87,8 +92,8 @@ use std::collections::{HashMap, HashSet};
 
 use iced_x86::{Decoder, Instruction, Mnemonic, OpKind, Register};
 use rdec_core::ir::{
-    BbId, BinOp, Callee, CastKind, FBinOp, Flag, FlagsOp, Function, Instr, Op, Terminator, UnOp,
-    VId,
+    BbId, BinOp, Callee, CastKind, FBinOp, Flag, FlagsOp, Function, Instr, IntCmp, Op, Terminator,
+    UnOp, VId,
 };
 use rdec_core::ty::{FWidth, Ty, Width};
 
@@ -285,6 +290,26 @@ const GRPS: [Grp; 48] = [
 
 fn ty_u(w: Width) -> Ty {
     Ty::uint(w)
+}
+
+/// The packed arithmetic this lifter models as pure IR over the XMM pair, and
+/// the LANE WIDTH each one runs at. The two u64 forms are two lane ops of the
+/// pair; the two u32 forms are two lane ops PER CELL at W32, so the lane's own
+/// add/sub truncation is what stops a carry or borrow crossing (`Lifter::cell32`);
+/// the compares answer all-ones / zero per lane (`Lifter::mask_at`).
+///
+/// What is deliberately NOT here: the 8- and 16-bit lanes (`paddb`, `paddw`,
+/// `psubw`...), the saturating forms, the multiplies, the shifts, the
+/// comparisons other than EQ, and every shuffle/unpack — all stay loud
+/// `Op::Opaque` gaps naming the mnemonic, because a half-modelled lane width is
+/// the silent kind of miscompile and the census is the next slice's map.
+enum PackedArith {
+    Add64,
+    Sub64,
+    Eq64,
+    Add32,
+    Sub32,
+    Eq32,
 }
 
 /// The Windows x86-64 integer argument registers, indexed by DECLARED
@@ -1851,6 +1876,133 @@ impl<'a> Lifter<'a> {
         self.rep.sse_packed += 1;
     }
 
+    /// The 16 bytes at `a` read as a lane pair (lo at addr, hi at addr+8):
+    /// the LOAD half of `load16`, spelled once so a packed op that takes its
+    /// source from memory reads exactly the pair a register destination holds.
+    fn load16_at(&mut self, a: VId) -> (VId, VId) {
+        let at = self.addr();
+        let t = Ty::u64();
+        let lo = self.f.emit(self.cur, Op::Load(t.clone(), a), t.clone(), at);
+        let e8 = self.const_of(8, Width::W64);
+        let a8 = self.bin(BinOp::Add, a, e8);
+        let hi = self.f.emit(self.cur, Op::Load(t, a8), Ty::u64(), at);
+        (lo, hi)
+    }
+
+    /// A packed SSE operand as a lane pair: a register's two cells, or the 16
+    /// bytes at a memory operand. `None` means the operand is a kind this
+    /// model cannot read (an unresolvable RIP displacement, a broadcast) and
+    /// the CALLER makes that loud — the model does not guess at a constant it
+    /// cannot name.
+    fn packed_pair(&mut self, ins: &Instruction, i: u32) -> Option<(VId, VId)> {
+        match ins.op_kind(i) {
+            OpKind::Register => {
+                let s = self.xmm_op(ins, i)?;
+                // Both reads before any emit: `emit` appends to the block that
+                // `read64`'s live-in machinery also touches.
+                let lo = self.xmm(s);
+                let hi = self.xmm_hi(s);
+                Some((lo, hi))
+            }
+            OpKind::Memory => {
+                let a = self.addr_of(ins, i)?;
+                Some(self.load16_at(a))
+            }
+            _ => None,
+        }
+    }
+
+    /// The u32 lane `k` (0 = low) of a W64 cell, typed W32. Lane 1 shifts the
+    /// cell up first — a shift, not a byte read, because the lane lives in a
+    /// register — and the count is a W64 constant so the `Shr` pair agrees on
+    /// a width (the verifier's mixed-width rule, and x86's own shift-count
+    /// convention in `Mnemonic::Shl | Mnemonic::Shr | Mnemonic::Sar`).
+    fn lane32(&mut self, v: VId, k: u8) -> VId {
+        let at = if k == 0 {
+            v
+        } else {
+            let s = self.const_of(32, Width::W64);
+            self.bin(BinOp::Shr, v, s)
+        };
+        self.cast(CastKind::Trunc, at, Width::W32)
+    }
+
+    /// Two W32 lane values back into one W64 cell: `(hi << 32) | lo`, each
+    /// lane zero-extended first so the two lanes share no bit on the way.
+    fn join32(&mut self, lo: VId, hi: VId) -> VId {
+        let lo64 = self.cast(CastKind::ZExt, lo, Width::W64);
+        let hi64 = self.cast(CastKind::ZExt, hi, Width::W64);
+        let s = self.const_of(32, Width::W64);
+        let up = self.bin(BinOp::Shl, hi64, s);
+        self.bin(BinOp::Or, lo64, up)
+    }
+
+    /// Apply `f` to the two u32 lanes of a cell pair and join the answers.
+    /// This is where "lane-independent" is a property of the IR and not of a
+    /// comment: `f` sees W32-typed values only, so the add carry / sub borrow
+    /// it produces is a 32-bit one — the interpreter truncates the lane's own
+    /// answer and the C prints `uint32_t` — and it cannot reach the next lane.
+    /// Modelling the op at W64 and masking after is the same bytes on the easy
+    /// operands and a different BYTE on the carry cases; `packed_simd.rs`'s
+    /// fixtures are those cases, and the saboteur model is in that file.
+    fn cell32<F>(&mut self, a: VId, b: VId, f: F) -> VId
+    where
+        F: Fn(&mut Self, VId, VId) -> VId,
+    {
+        let (a0, a1) = (self.lane32(a, 0), self.lane32(a, 1));
+        let (b0, b1) = (self.lane32(b, 0), self.lane32(b, 1));
+        let r0 = f(self, a0, b0);
+        let r1 = f(self, a1, b1);
+        self.join32(r0, r1)
+    }
+
+    /// `a == b` -> `Ty::Bool`, at the operands' width. Signedness is a
+    /// property of the predicate (`IntCmp::Eq` has none), so W32 lanes and W64
+    /// lanes both read their own bits.
+    fn cmp_eq(&mut self, a: VId, b: VId) -> VId {
+        self.f
+            .emit(self.cur, Op::Cmp(IntCmp::Eq, a, b), Ty::Bool, self.addr())
+    }
+
+    /// The lane mask `PCMPEQ*` writes: ALL ONES for equal, zero for unequal.
+    /// The Bool -> integer spelling is the codebase's own — `setcc` builds
+    /// `Select(cond, 1, 0)` at the destination width — with the machine's arm:
+    /// all-ones, not 1. `w` is the lane width (`W32` for `pcmpeqd`, `W64` for
+    /// `pcmpeqq`), so the mask, the comparison and the join all agree on it.
+    fn mask_at(&mut self, c: VId, w: Width) -> VId {
+        let bits = w.bits();
+        let ones = if bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        };
+        let t = ty_u(w);
+        let ones = self
+            .f
+            .emit(self.cur, Op::Const(ones), t.clone(), self.addr());
+        let zero = self.f.emit(self.cur, Op::Const(0), t.clone(), self.addr());
+        self.f
+            .emit(self.cur, Op::Select(c, ones, zero), t, self.addr())
+    }
+
+    /// The lane-independent packed arithmetic, by canonical name. The lane
+    /// WIDTH is part of the answer: `paddd` is four u32 lanes and `paddq` two
+    /// u64 lanes, and reading one as the other is the miscompile the fixtures
+    /// name. `paddb`/`paddw` and the saturating forms are NOT here — 8- and
+    /// 16-bit lanes need their own lane helpers, and refusing them by name
+    /// keeps them in the census as the work item they are.
+    fn packed_arith(nm: &str) -> Option<PackedArith> {
+        Some(match nm {
+            "paddq" => PackedArith::Add64,
+            "psubq" => PackedArith::Sub64,
+            "pcmpeqq" => PackedArith::Eq64,
+            "paddd" => PackedArith::Add32,
+            "psubd" => PackedArith::Sub32,
+            "pcmpeqd" => PackedArith::Eq32,
+            _ => return None,
+        })
+    }
+
     /// The operand is `XMMn`; that is the whole question, so this is the only
     /// place that asks it.
     fn xmm_op(&self, ins: &Instruction, i: u32) -> Option<u8> {
@@ -2030,6 +2182,76 @@ impl<'a> Lifter<'a> {
                 nm,
                 "a 128-bit bitwise op with a source this model cannot read",
             );
+            return;
+        }
+        // ---- lane-independent packed arithmetic, one lane at a time --------
+        //
+        // `paddq`/`psubq` are two u64 lanes; `paddd`/`psubd` are four u32 lanes
+        // per 128 bits (two per cell); `pcmpeqd`/`pcmpeqq` answer all-ones /
+        // zero per lane. Every one of them is LANE-INDEPENDENT — a lane's
+        // answer is a function of that lane's two operands only — so the pair
+        // of W64 cells expresses it exactly, and the rule that keeps the model
+        // honest is that each lane op is typed at the LANE's width: a W32
+        // `Add`/`Sub` truncates to 32 bits in the interpreter and prints as
+        // `uint32_t` in the C, so the carry (add) and the borrow (sub) die
+        // inside the lane. Spelling them at W64 and masking afterwards is the
+        // same bytes on friendly operands and a different byte on the carry
+        // cases, which is what `packed_simd.rs` pins with operands chosen for
+        // exactly that disagreement.
+        //
+        // The DESTINATION is the register the AT&T listing prints second
+        // (Intel's first), read and written as a pair like every other packed
+        // op; the source is a register or 16 bytes of memory — `paddq (%rip),
+        // %xmm` over a `.rdata` vector constant is the form the corpus's
+        // vectorised witness emits. EFLAGS untouched, as for every SSE op:
+        // giving a later `jz` flags the machine left stale is the miscompile.
+        if let Some(op) = Self::packed_arith(nm) {
+            let Some(d) = self.xmm_op(ins, 0) else {
+                self.sse_gap(nm, "no XMM register destination");
+                return;
+            };
+            let Some((sl, sh)) = self.packed_pair(ins, 1) else {
+                self.sse_gap(
+                    nm,
+                    "a packed source this model cannot read (memory it cannot address)",
+                );
+                return;
+            };
+            // Reads before the emits below, per the rule in `sse`'s scalar arm.
+            let (dl, dh) = (self.xmm(d), self.xmm_hi(d));
+            let (lo, hi) = match op {
+                PackedArith::Add64 => (self.bin(BinOp::Add, dl, sl), self.bin(BinOp::Add, dh, sh)),
+                PackedArith::Sub64 => (self.bin(BinOp::Sub, dl, sl), self.bin(BinOp::Sub, dh, sh)),
+                PackedArith::Eq64 => {
+                    let e = self.cmp_eq(dl, sl);
+                    let lo = self.mask_at(e, Width::W64);
+                    let e = self.cmp_eq(dh, sh);
+                    let hi = self.mask_at(e, Width::W64);
+                    (lo, hi)
+                }
+                PackedArith::Add32 => {
+                    let lo = self.cell32(dl, sl, |s, x, y| s.bin(BinOp::Add, x, y));
+                    let hi = self.cell32(dh, sh, |s, x, y| s.bin(BinOp::Add, x, y));
+                    (lo, hi)
+                }
+                PackedArith::Sub32 => {
+                    let lo = self.cell32(dl, sl, |s, x, y| s.bin(BinOp::Sub, x, y));
+                    let hi = self.cell32(dh, sh, |s, x, y| s.bin(BinOp::Sub, x, y));
+                    (lo, hi)
+                }
+                PackedArith::Eq32 => {
+                    let eq = |s: &mut Self, x, y| {
+                        let c = s.cmp_eq(x, y);
+                        s.mask_at(c, Width::W32)
+                    };
+                    let lo = self.cell32(dl, sl, eq);
+                    let hi = self.cell32(dh, sh, eq);
+                    (lo, hi)
+                }
+            };
+            self.set_xmm(d, lo);
+            self.set_xmm_hi(d, hi);
+            self.rep.sse_packed += 1;
             return;
         }
         // ---- scalar arithmetic --------------------------------------------
@@ -2547,6 +2769,7 @@ impl<'a> Lifter<'a> {
                 | "por"
                 | "pcmpgtd"
                 | "pcmpeqd"
+                | "pcmpeqq"
                 | "pslld"
                 | "psrld"
                 | "psrad"

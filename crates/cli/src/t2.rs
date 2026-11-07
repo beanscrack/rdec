@@ -1654,18 +1654,34 @@ pub fn cmd_t2(args: &[String]) -> Result<i32, String> {
             ));
             continue;
         };
-        let seed: Vec<(u64, u8)> = wtab[*v]
+        // The SAME byte image all three legs must share: the object
+        // `.data`/`.rdata` chunks first (the machine exe loads them as
+        // sections; the C harness byte-copies them into `rdec_mem`), then
+        // the window vectors (last: the window is the authoritatively
+        // per-vector seeded bytes). An IR leg that seeds only the window
+        // tests the interpreter's read-zero-on-unseeded rule, not the
+        // machine: on the first paddq commit this leg printed 24 named
+        // mismatches, every one `copy_words.O2`, every one `machine = IR
+        // + 1` — that function's answer arrives as `paddq (%rip),%xmm`
+        // against `.rdata` vectors, so IR added 0 where the machine added
+        // the real constants. The model was right; the seed was thin.
+        let mut seed: Vec<(u64, u8)> = data_chunks
             .iter()
-            .enumerate()
-            .flat_map(|(wi, w)| {
-                (0..8u64).map(move |bi| {
-                    (
-                        WIN_ADDR + wi as u64 * 8 + bi,
-                        ((w >> (8 * bi)) & 0xff) as u8,
-                    )
-                })
+            .flat_map(|(a, bytes)| {
+                bytes
+                    .iter()
+                    .enumerate()
+                    .map(move |(i, b)| (a + i as u64, *b))
             })
             .collect();
+        seed.extend(wtab[*v].iter().enumerate().flat_map(|(wi, w)| {
+            (0..8u64).map(move |bi| {
+                (
+                    WIN_ADDR + wi as u64 * 8 + bi,
+                    ((w >> (8 * bi)) & 0xff) as u8,
+                )
+            })
+        }));
         let ex = rdec_core::interp::run_budget_seed(
             &subs[*k].s.f,
             &[WIN_ADDR, vecs[*v][1], vecs[*v][2], vecs[*v][3]],
