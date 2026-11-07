@@ -23,6 +23,7 @@ pub mod passes;
 pub mod structure;
 pub mod tv;
 pub mod ty;
+pub mod tyinfer;
 pub mod verify;
 pub mod width;
 
