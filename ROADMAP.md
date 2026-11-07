@@ -2060,3 +2060,23 @@ wrote exactly HI: a test written to pass, caught by sabotage. Strengthened: the
 destination high half is seeded with a 0xA5 sentinel the program cannot carry,
 the same sabotage now reddens it with `Some([136,...,255]) != Some([165 x 8])`,
 and the lesson is a comment in the fixture. Nine tests, all restored green.
+
+## M7 slice 2 lands: `.pdata` reader, and one v2 entry refuses ITSELF, not the table
+
+`crates/arch-x86/src/pdata.rs` parses the EXCEPTION directory as RUNTIME_FUNCTION +
+UNWIND_INFO (v1 code arrays: frame/epilog descriptions, x12 magic), with a hard table
+contract (sorted, EndAddress inside .text, 4-byte-aligned UnwindData, size%12) refused
+as structural defects. Chaining and unknown UNWIND_INFO *versions* are per-entry
+refusals: named, COUNTED (`chaining_refusals()` / `version_refusals()`), code array
+never read. The API invariant `functions + chaining + version == entry_count` is
+asserted on synthetic fixtures AND on the real linked image, where it is the
+product: **m7.exe = 336 entries = 328 functions + 4 chained (0xbc52, 0xbf38, 0xc713,
+0xc86c — export-thunk blocks) + 4 version-2 (0xe8e0, 0xe9f0, 0xefb0, 0xf3f0 —
+CET-hardened CRT thunks)**. The first cut made v2 a whole-table refusal; the real
+image showed what that costs — one CRT thunk would throw away the 332 true starts of
+a symbol-free EXE (llvm-nm: `no symbols` is pinned; `.pdata` IS the start source).
+`rdec pe-functions m7.exe` exits 0, prints the 8 refusals verbatim, and recites
+328 + 4032/12 + 4 + 4. Sabotage (silent v2 drop) reddens the unit census and the
+real-image cross-check. The probe artifact is REPRODUCIBLE (recipe in this file;
+rebuilt byte-identical at 111,104) and the real-image leg self-skips LOUDLY when it
+is absent. Floors: workspace 42 test groups green, fmt/clippy clean.

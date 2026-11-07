@@ -86,6 +86,7 @@ fn main() {
             }
         },
         "pe-info" => cmd_pe_info(&args),
+        "pe-functions" => cmd_pe_functions(&args),
         "fuzz" => match fuzz::cmd_fuzz(&args) {
             Ok(rc) => rc,
             Err(e) => {
@@ -137,6 +138,12 @@ fn print_help() {
          \x20                                   entry RVA, subsystem, section table
          \x20                                   (name/vaddr/vsize/rawptr/rawsize/flags);
          \x20                                   refuses non-PE by field, exit 2
+         \x20 pe-functions <exe>            M7: .pdata SEH unwind table as the
+         \x20                                   symbol-free function-start source:
+         \x20                                   begin..end/unwind/flags/first_code
+         \x20                                   per RUNTIME_FUNCTION, flags and
+         \x20                                   first-code census, chaining refusals
+         \x20                                   counted and named; exit 2 on refusal
          \x20 status                          roadmap section 9's table, from commands\n\
          \n\
          coming next (M1): disasm <obj> [symbol]"
@@ -849,6 +856,100 @@ fn cmd_pe_info(args: &[String]) -> i32 {
     if !later.is_empty() {
         println!("  loaded, not yet read: {}", later.join("; "));
     }
+    0
+}
+
+/// `rdec pe-functions <exe>` — M7 slice 2 made visible: the `.pdata` SEH
+/// unwind table harvested as the symbol-free function-start source.
+///
+/// Exit codes follow `pe-info`: **0** on a read table, **2** on a refusal —
+/// and the refusal text is `UnwindTable::read`'s verbatim, naming field,
+/// entry (index + BeginAddress), got/expected, offset and file length, the
+/// same text `tests/pdata_fixtures.rs` asserts on. Chaining refusals do NOT
+/// change the exit code: the table as a whole parsed, and every chained
+/// entry is printed LOUD on its own line and counted in the summary — the
+/// count is the anti-silent-drop guarantee (functions + refusals == dir/12).
+fn cmd_pe_functions(args: &[String]) -> i32 {
+    use rdec_arch_x86::pdata::UnwindTable;
+    use rdec_arch_x86::pe::PeImage;
+    let Some(path) = args.get(1) else {
+        eprintln!("pe-functions: usage: rdec pe-functions <exe>");
+        return 2;
+    };
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("pe-functions: {path}: {e}");
+            return 2;
+        }
+    };
+    let img = match PeImage::load(&bytes, path) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("{e}");
+            return 2;
+        }
+    };
+    let t = match UnwindTable::read(&img) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{e}");
+            return 2;
+        }
+    };
+    println!(
+        "{}: EXCEPTION dir rva {:#x} size {:#x} = {} RUNTIME_FUNCTION entries",
+        img.path,
+        t.dir_rva,
+        t.dir_size,
+        t.entry_count()
+    );
+    println!(
+        "  {:<28} {:<12} {:<7} first_code",
+        "begin_va..end_va", "unwind_va", "flags"
+    );
+    for e in t.entries() {
+        println!(
+            "  {:#x}..{:#x}  {:#x}  {:#x}  {}",
+            img.va(e.begin_rva),
+            img.va(e.end_rva),
+            img.va(e.unwind_rva),
+            e.flags,
+            e.first_code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        );
+    }
+    let flags: Vec<String> = t
+        .flags_census()
+        .iter()
+        .map(|(f, n)| format!("{f:#x}:{n}"))
+        .collect();
+    println!("  census flags: {}", flags.join(" "));
+    let codes: Vec<String> = t
+        .first_code_census()
+        .iter()
+        .map(|(c, n)| match c {
+            Some(c) => format!("code {c}:{n}"),
+            None => format!("no-codes:{n}"),
+        })
+        .collect();
+    println!("  census first-code: {}", codes.join(" "));
+    // LOUD, per entry: a chained entry is refused as a function start, and
+    // the print is what makes "N functions" auditable against M/12.
+    for c in t.chaining_refusals() {
+        println!("  CHAINED REFUSAL: {}", c.message());
+    }
+    for v in t.version_refusals() {
+        println!("  VERSION REFUSAL: {}", v.message(&img));
+    }
+    println!(
+        "{} functions, .pdata {}/12 entries, chaining refusals {}, version refusals {}",
+        t.entries().len(),
+        t.dir_size,
+        t.chaining_refusals().len(),
+        t.version_refusals().len()
+    );
     0
 }
 
