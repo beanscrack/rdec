@@ -1095,8 +1095,23 @@ impl<'a> Interp<'a> {
             BinOp::Or => x | y,
             BinOp::Xor => x ^ y,
             BinOp::Shl => shift_left(x, y, w),
-            BinOp::Shr => w.trunc(w.trunc(x, false) >> (y.min(128) as u32), false),
-            BinOp::Sar => w.trunc((xs >> (y.min(128) as u32)) as u64, false),
+            BinOp::Shr => {
+                // The machine masks the shift count (5 bits for 8/16/32-bit
+                // operands, 6 for 64). The interpreter is public: passes-
+                // fused and fuzz-built IR present counts directly, and the
+                // old `y.min(128)` was UB for a u64 in 64..=128 — debug
+                // panics, RELEASE WRAPS (found by the P-track suite
+                // `interp_arith_reference.rs`, 2026-11-06). Masking here is
+                // identity on every lifted count (the lifter masks), so the
+                // corpus floors cannot move; it makes the arms TOTAL and
+                // machine-faithful for IR that bypasses the lifter.
+                let n = (y & if w == Width::W64 { 63 } else { 31 }) as u32;
+                w.trunc(w.trunc(x, false) >> n, false)
+            }
+            BinOp::Sar => {
+                let n = (y & if w == Width::W64 { 63 } else { 31 }) as u32;
+                w.trunc((xs >> n) as u64, false)
+            }
             BinOp::RotL => {
                 let b = w.bits().max(1);
                 let n = (y % b as u64) as u32;
@@ -1359,14 +1374,19 @@ fn parity(res: u64) -> bool {
     (res as u8).count_ones().is_multiple_of(2)
 }
 
-/// Shift-left defined for every count (docs/ir-semantics.md): counts at or
-/// beyond the width produce zero, which is what the masked hardware does for the
-/// legal range and a total definition for the rest.
+/// Shift-left defined for every count by the machine's own masking rule
+/// (docs/ir-semantics.md: "Shift-count masking is hardware, not taste").
+/// The old "counts at or beyond the width produce zero" was NOT what the
+/// masked hardware does for raw counts: `1 << 32` at W32 masks to `<< 0`
+/// and yields 1, not 0. The lifter pre-masks (`count_for`), so this arm is
+/// identity for every lifted count; it is total and machine-faithful for
+/// IR built directly (passes fusion, fuzz).
 fn shift_left(x: u64, count: u64, w: Width) -> u64 {
-    if count >= 64 {
-        return 0;
-    }
-    w.trunc(x << (count as u32), false)
+    // Machine masking, same rule as Shr/Sar (see the note there): the old
+    // `count >= 64 -> 0` disagreed with the machine for a raw count of
+    // 32..63 at width 32 (x86 masks to 5 bits: `1 << 32` at W32 is `1 << 0`).
+    let n = (count & if w == Width::W64 { 63 } else { 31 }) as u32;
+    w.trunc(((x as u128) << n) as u64, false)
 }
 
 trait TrailingOnes0 {

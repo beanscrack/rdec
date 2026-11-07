@@ -1352,16 +1352,21 @@ lift.rs crates/arch-x86/src/discover.rs` returns 0 — that is the evidence for 
 | M8 step 1-2 C++ through the pipeline | `rdec cpp --corpus` | **RED by design, improving** — lifted 78, valid 78/78, emitted C 62, refused 16; clang -Werror OK | refusals -> 0 |
 | M8 step 3 C++ value-verified | `rdec t2 --cpp` | **GREEN as a sample** (row above) | — |
 | M8 remainder | — | **NOT DONE** — packed SIMD (refused by name: `paddd/paddq/psubd/pmuludq/pcmpeqd/shufps`, mask `andps/orps`, GPR `movd/movq`), vtable dispatch and virtual calls. Measured: this clang build names ZERO vftable symbols in `.obj`, so vtable identity needs `.rdata` + REL32 relocation recovery | relocation reader, then vtable identity, then `call [this+k]` |
-| M5 control-flow structuring | — | **NOT STARTED** — no if/while/switch recovery: output is goto-style with `(void)&&label` anchors. The roadmap's own estimate is 4-5 weeks. It is also what closes M1 (jump tables) | starts with the 2 jump-table sites |
-| M6 readability + type recovery | — | **NOT STARTED** — includes the Ghidra baseline comparison | — |
-| M7 whole binary | — | **NOT STARTED** — library signatures, SEH, cold fragments; ELF support | — |
-| M9 production | — | **NOT STARTED** — fuzzing at scale, performance budgets, the analyst loop | — |
-| P track (proof) | — | **NOT STARTED** — the formal/proof track has no measured section | — |
+| M5 control-flow structuring | `e0dafc6` | **LANDED** — if/while/switch recovery; jump-table switch sites close M1's last gap; M6 readability on top: 75 goto / 202 labels (from 123/217) | remaining fall-through gotos are back edges + multi-parent joins |
+| M6 readability + type recovery | `47b9076` `bfe8156` | **PARTIAL** — early-return printing, layout-then-prune, return-tail materialization (refusals 29→0); type recovery + Ghidra baseline NOT STARTED | type recovery next; Ghidra baseline is a user install decision |
+| M7 whole binary | `75e655c` | **PARTIAL** — PE32+ loader + `pe-info` on a real linked EXE; `.pdata` unwind reader in flight; ELF support not started | frame-model interpretation, `.reloc`, imports, CRT sigs |
+| M9 production | `289645b` `c08a894` | **PARTIAL** — fuzzing lane (0 crashes/0 hangs over 20k-input censuses ×3 seeds), nightly hardening workflow, release parity, panic-site ratchet, pass-pipeline + verify_ssa linear-time; the analyst loop is not built | analyst loop; fuzz generator extension to shift ops with raw counts (the P-track defect's domain) |
+| P track (proof) | seed | **SEEDED** — the oracle gets its own oracle: `interp_arith_reference.rs`, an independent machine-semantics reference over the 9 liftable integer BinOps (boundary set + 3000 deterministic cases per op×width, both `Sx` displays, raw shift counts). First run found two real defects, both fixed in the interpreter: `Shr`/`Sar` UB for counts 64..=128 (debug panic, RELEASE WRAP) and `shift_left` disagreeing with the machine's count masking at raw 32..63 (W32) | extend as lift sites land (MulHi/UDiv/Rot); C-emitter equivalence proofs |
 
-The honest headline: the decompiler has three closed structural gates (decode, lift,
-SSA), a differential that proves returned values on 64/141 C functions and 27/78 C++
-functions with zero mismatches, and no structuring pass — so what it emits is correct
-where it is correct, and unreadable everywhere.
+The honest headline (updated 2026-11-07, floors above): closed structural gates
+(decode, lift, SSA — verify_ssa linear-time), a differential that proves returned
+values on the full emitted corpus (1796 comparisons, 0 mismatches, caller-buffer
+memory 384/384) and 856 C++ vectors, control-flow structuring landed (75 goto /
+202 labels across 97 emitted functions), a PE32+ loader reading a real linked
+EXE, and a proof track seeded on the interpreter itself. What remains: type
+recovery, whole-binary discovery, packed arithmetic + vtables, and the analyst
+loop — correctness is measured everywhere it claims; the gaps are named, counted,
+and printed.
 
 ### M8 step 4 - the float ABI, measured (`b60538e`, `0b4b2dd`)
 
