@@ -2080,3 +2080,23 @@ a symbol-free EXE (llvm-nm: `no symbols` is pinned; `.pdata` IS the start source
 real-image cross-check. The probe artifact is REPRODUCIBLE (recipe in this file;
 rebuilt byte-identical at 111,104) and the real-image leg self-skips LOUDLY when it
 is absent. Floors: workspace 42 test groups green, fmt/clippy clean.
+
+## M7 slice 2 landed: .pdata reader + `rdec pe-functions` (CI green 5m18s)
+
+pe.rs PeImage + pdata.rs: EXCEPTION directory table, RUNTIME_FUNCTION -> v1 
+UNWIND_INFO code arrays (frames/epilogues/x12 magic), full table contract 
+(sorted, EndAddress in .text, 4-aligned UnwindData, size%12 -> structural REFUSAL).
+KEY LESSON (measured): VERSION and CHAINING refusals are PER ENTRY - one v2 CRT 
+thunk forbids the WHOLE TABLE. m7.exe = 336 entries = 328 functions + 4 chained 
+(0xbc52/0xbf38/0xc713/0xc86c, export blocks sharing extended info) + 4 v2 
+(0xe8e0/0xe9f0/0xefb0/0xf3f0, CET CRT thunks) - census asserted as a partition on 
+synthetic AND real images; the real leg cross-checks an independent raw-byte walk 
+(same indices are exact) and LOUD-skips when the probe is absent. llvm-nm: the 
+linked EXE is symbol-free - .pdata IS the function-start source, pinned. 
+Reproducible probe: clang -O1 main.c{int main(){return (int)f(7);}} + 
+corpus/src/arith_basic.c, linked via clang/MSVC-link -> 111,104 bytes, rebuild 
+verified byte-identical this slice. CI-only clippy escapes (1.99 doc lints) stay 
+fix-forward: first red 33s doc_lazy_continuation on a doc line starting with +.
+
+NEXT: discover speaking .pdata (start seeds from the table), .reloc, imports/IAT 
+(named boundary + refusal), CRT library signatures; then M6 type recovery.
