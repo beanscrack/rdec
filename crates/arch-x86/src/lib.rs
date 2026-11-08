@@ -12,3 +12,4 @@ pub mod lift;
 pub mod loader;
 pub mod pdata;
 pub mod pe;
+pub mod reloc;

@@ -1008,9 +1008,23 @@ pub fn cmd_lift(args: &[String]) -> Result<i32, String> {
 /// version-refused `.pdata` entries are NOT seeds — they stay counted, the
 /// same partition `pe-functions` prints.
 ///
-/// The v1 sweep runs over `.text` only. Functions seeded outside `.text`
-/// (none in the probe) are printed, not claimed, so the coverage number is
-/// the size of exactly one range the same way `objdump-check` pins objects.
+/// The second seed source is `.reloc` (`reloc.rs`): a base relocation records
+/// a place the image embeds an address, and an address in the image that lands
+/// on code is a function start the image names. Measured on `m7.exe`: 47
+/// `DIR64` sites hold a `.text` address, 38 distinct ones. A relocation whose
+/// TARGET is not code is a boundary and stays loud — named by RVA (the import
+/// directory is not read by this slice, so no callee name is invented) and
+/// counted as a gap, never silently walked past. A relocation site inside
+/// `.text` is printed as its own census line: on an MSVC image there are none
+/// (code is position-independent there), so the number being 0 is a fact, not
+/// an absence of checking.
+///
+/// The v1 sweep runs over `.text` only. Seeds that land outside `.text`
+/// (an executable section the sweep does not cover, an address in no section)
+/// are PRINTED, not claimed, and counted, so the coverage number is the size of
+/// exactly one range the same way `objdump-check` pins objects. A run that
+/// discovers 0 functions prints `VERDICT: FAIL` and exits 1: every number this
+/// command prints is a claim, and 0 discovered functions makes them all void.
 pub fn cmd_pe_discover(args: &[String]) -> Result<i32, String> {
     let path = match args.get(1) {
         Some(p) => p.clone(),
@@ -1045,11 +1059,17 @@ pub fn cmd_pe_discover(args: &[String]) -> Result<i32, String> {
         match rdec_arch_x86::pdata::UnwindTable::read(&img) {
             Ok(t) => {
                 entries.extend(t.functions().map(|(begin, _end)| img.va(begin)));
+                // `seeded` counts the addresses actually PUSHED as seeds, not the entries
+                // that parsed: seed a refusal anywhere in this command and this number rises
+                // while the parsed count stays put. That gap is the leak detector.
+                let seeded = entries.len();
                 census = format!(
-                    ".pdata: {} function seeds, {} chained refusals, {} version refusals",
+                    ".pdata: {} function seeds, {} chained refusals, {} version refusals \
+                     (seeded {seeded} of {} entries; a refused entry is NEVER a seed)",
                     t.functions().count(),
                     t.chaining_refusals().len(),
-                    t.version_refusals().len()
+                    t.version_refusals().len(),
+                    t.entry_count()
                 );
             }
             Err(e) => census = format!(".pdata read refused: {e} — entry point only"),
@@ -1057,9 +1077,165 @@ pub fn cmd_pe_discover(args: &[String]) -> Result<i32, String> {
     } else {
         census = "no .pdata directory — entry point only".to_string();
     }
+    let pdata_seeds: std::collections::BTreeSet<u64> = entries.iter().copied().collect();
     let entry_in_text = text_start <= img.entry_va() && img.entry_va() < text_end;
     if entry_in_text {
         entries.push(img.entry_va());
+    }
+
+    // `.reloc`: every address the image embeds, and where it points. Loud on
+    // both outcomes — a missing table is a fact about the image (fixed base),
+    // and a refused table is a fact about this reader.
+    let reloc_census;
+    let mut reloc_detail: Vec<String> = Vec::new();
+    let mut boundary_gaps: usize = 0;
+    let mut reloc_targets_in_text = 0usize;
+    match rdec_arch_x86::reloc::BaseRelocs::read(&img) {
+        Ok(r) => {
+            let c = r.census();
+            let types: Vec<String> = r
+                .relocs_by_type()
+                .iter()
+                .map(|(k, n)| format!("{}:{n}", rdec_arch_x86::reloc::type_name(*k)))
+                .collect();
+            reloc_census = format!(
+                ".reloc: {} blocks, {} entries [{}] sum(SizeOfBlock) {:#x} == dir size {:#x}; partition {}+{}+{}+{}+{} == {} balanced: {}",
+                r.block_count(),
+                r.entry_count(),
+                types.join(" "),
+                r.sum_block_sizes(),
+                r.dir_size,
+                c.padding,
+                c.absolute,
+                c.relative,
+                c.unreadable,
+                c.refused_kind,
+                c.entries,
+                c.balanced()
+            );
+            let (targets, unresolved) = r.targets(&img);
+            let mut reloc_detail_boundary: Vec<String> = Vec::new();
+            let mut data_pointers = 0usize;
+            let mut new_seeds: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+            for t in &targets {
+                let va = img.va(t.target_rva);
+                let site_va = img.va(t.site_rva);
+                let site_in_text = text_start <= site_va && site_va < text_end;
+                if text_start <= va && va < text_end {
+                    reloc_targets_in_text += 1;
+                    new_seeds.insert(va);
+                } else if site_in_text {
+                    // A relocation SITE inside code whose target is not code:
+                    // the IAT/indirect-call shape. Named by RVA, counted as a
+                    // gap, and given NO callee name — the import directory is
+                    // not read by this slice, so "the callee is X" would be an
+                    // invention.
+                    boundary_gaps += 1;
+                    let where_ = match img.section_of(t.target_rva) {
+                        Some(s) => format!("section {} ({})", s.index, s.name),
+                        None => "NO section".to_string(),
+                    };
+                    reloc_detail_boundary.push(format!(
+                        "  boundary: {} relocation at site {site_va:#x} (inside .text) names {va:#x} in {where_} — an indirect call/jmp through an address the image embeds: counted as a gap, callee NOT invented (the import directory is not read by this slice)",
+                        rdec_arch_x86::reloc::type_name(t.kind)
+                    ));
+                } else {
+                    // A data-to-data pointer: the image embeds an address in a
+                    // vtable/table. It is a fact about the data, NOT a code
+                    // boundary, and counting it as a gap would inflate the gap
+                    // census with events that are not gaps. Census only.
+                    data_pointers += 1;
+                }
+            }
+            // Detail lines are capped: a real image has hundreds of boundaries
+            // and a gate reads the census, not a wall of text. The count is the
+            // claim; the lines are the witnesses, and they name the RVA.
+            let shown = 8.min(reloc_detail_boundary.len());
+            for line in reloc_detail_boundary.iter().take(shown) {
+                reloc_detail.push(line.clone());
+            }
+            if reloc_detail_boundary.len() > shown {
+                reloc_detail.push(format!(
+                    "  ... {} more boundary relocations (every one is counted in the gap census)",
+                    reloc_detail_boundary.len() - shown
+                ));
+            }
+            let extra: Vec<u64> = new_seeds
+                .iter()
+                .copied()
+                .filter(|va| !pdata_seeds.contains(va))
+                .collect();
+            entries.extend(extra.iter().copied());
+            let distinct = new_seeds.len();
+            reloc_detail.push(format!(
+                "  .reloc targets: {reloc_targets_in_text} name an address in .text ({distinct} distinct), {} of them seeded with .reloc-only provenance; {boundary_gaps} have a SITE in .text and a target outside it (counted as gaps); {data_pointers} are data-to-data pointers (census, not gaps); {} name an address this reader refuses to name",
+                extra.len(),
+                unresolved.len()
+            ));
+            if !extra.is_empty() {
+                let named: Vec<String> =
+                    extra.iter().take(12).map(|va| format!("{va:#x}")).collect();
+                let more = extra.len().saturating_sub(named.len());
+                reloc_detail.push(format!(
+                    "  .reloc-only function starts (provenance = .reloc, NOT .pdata): {}{}",
+                    named.join(" "),
+                    if more > 0 {
+                        format!(" (+{more} more)")
+                    } else {
+                        String::new()
+                    }
+                ));
+            }
+            for u in unresolved.iter().take(10) {
+                reloc_detail.push(format!(
+                    "  unresolved: {} at site {:#x} — {}",
+                    rdec_arch_x86::reloc::type_name(u.kind),
+                    img.va(u.site_rva),
+                    u.why
+                ));
+            }
+            for (i, msg) in r.refusals().into_iter().take(10) {
+                reloc_detail.push(format!("  reloc entry refusal {i}: {msg}"));
+            }
+            let in_text_sites: Vec<String> = r
+                .entries()
+                .iter()
+                // ABSOLUTE padding patches NOTHING (width 0), so it has no
+                // site: counting it as "a relocation site inside .text" would
+                // report a boundary-shaped event at a byte the loader ignores.
+                .filter(|e| rdec_arch_x86::reloc::patch_width(e.kind) != Some(0))
+                .filter(|e| {
+                    let va = img.va(e.site_rva);
+                    text_start <= va && va < text_end
+                })
+                .take(6)
+                .map(|e| {
+                    format!(
+                        "{} at {:#x}",
+                        rdec_arch_x86::reloc::type_name(e.kind),
+                        img.va(e.site_rva)
+                    )
+                })
+                .collect();
+            let sites: usize = r
+                .entries()
+                .iter()
+                .filter(|e| rdec_arch_x86::reloc::patch_width(e.kind) != Some(0))
+                .filter(|e| {
+                    let va = img.va(e.site_rva);
+                    text_start <= va && va < text_end
+                })
+                .count();
+            reloc_detail.push(format!(
+                "  .reloc sites inside .text: {sites}{}",
+                if in_text_sites.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", in_text_sites.join(", "))
+                }
+            ));
+        }
+        Err(e) => reloc_census = format!(".reloc read refused: {e} — no relocation evidence"),
     }
     entries.sort_unstable();
     entries.dedup();
@@ -1076,6 +1252,10 @@ pub fn cmd_pe_discover(args: &[String]) -> Result<i32, String> {
 
     println!("{path}: PE32+ image, base {:#x}", img.image_base);
     println!("  seeds: {census}");
+    println!("  {reloc_census}");
+    for line in &reloc_detail {
+        println!("{line}");
+    }
     println!(
         "  {} entry seeds, entry point {:#x} ({})",
         entries.len(),
@@ -1087,12 +1267,24 @@ pub fn cmd_pe_discover(args: &[String]) -> Result<i32, String> {
         }
     );
     println!(
-        "  .text {text_start:#x}..{text_end:#x} ({} bytes): functions {},          blocks {}, insns {}, covered {} bytes",
+        "  .text {text_start:#x}..{text_end:#x} ({} bytes covered, VirtualSize {:#x}): functions {}, blocks {}, insns {}, covered {} bytes",
+        text_end - text_start,
         text.virtual_size,
         plan.functions.len(),
         plan.blocks.len(),
         plan.insns.len(),
         plan.covered_bytes()
+    );
+    // The coverage number is the claim this command exists to make, so print it
+    // as a fraction of the one range the sweep owns.
+    let span = text_end - text_start;
+    println!(
+        "  coverage: {:.2}% of the {span} .text bytes the sweep owns",
+        if span == 0 {
+            0.0
+        } else {
+            100.0 * plan.covered_bytes() as f64 / span as f64
+        }
     );
     let mut gap_line = String::new();
     for (name, g) in [
@@ -1111,25 +1303,36 @@ pub fn cmd_pe_discover(args: &[String]) -> Result<i32, String> {
             gap_line.push_str(&format!("{name}:{n} "));
         }
     }
+    // `.reloc` boundaries: a relocation that names a non-code address is a
+    // boundary the sweep cannot cross, and the count is part of the claim.
+    if boundary_gaps > 0 {
+        gap_line.push_str(&format!("reloc-boundary:{boundary_gaps} "));
+    }
     println!(
-        "  gaps: {}",
+        "  gaps: {} ({} reloc boundaries counted with them)",
         if gap_line.is_empty() {
             "none".to_string()
         } else {
             gap_line.trim_end().to_string()
-        }
+        },
+        boundary_gaps
     );
     println!(
         "  overlap_free: {}",
         rdec_arch_x86::discover::overlap_free(&plan.insns)
     );
-    let outside: Vec<u64> = plan
-        .functions
+    // Seeds that did not land in the one range the sweep owns: printed, counted,
+    // NOT claimed. Measured here over the seed list, not over `plan.functions`,
+    // because the sweep never reaches outside its ranges — the old filter read
+    // the plan, so this branch could not fire and a seed outside `.text` vanished.
+    let outside: Vec<u64> = entries
         .iter()
-        .filter(|f| !(text_start <= **f && **f < text_end))
+        .filter(|va| !(text_start <= **va && **va < text_end))
         .copied()
         .collect();
-    if !outside.is_empty() {
+    if outside.is_empty() {
+        println!("  seeds outside .text: 0");
+    } else {
         println!(
             "  {} seeds landed outside .text (not claimed):",
             outside.len()
@@ -1138,5 +1341,24 @@ pub fn cmd_pe_discover(args: &[String]) -> Result<i32, String> {
             println!("    {f:#x}");
         }
     }
+    // Non-vacuity: every number above is a claim about discovered code, and a
+    // run that discovered none has made no claim at all. This repo has been
+    // burned twice by a gate that passed on 0.
+    if plan.functions.is_empty() {
+        println!(
+            "  VERDICT: FAIL — 0 functions discovered from {} seeds over {} .text bytes: the coverage numbers above are void",
+            entries.len(),
+            span
+        );
+        return Ok(1);
+    }
+    println!(
+        "  VERDICT: OK — {} functions, {} .text bytes covered, {} gaps ({} descent + {} reloc boundary)",
+        plan.functions.len(),
+        plan.covered_bytes(),
+        plan.gaps.len() + boundary_gaps,
+        plan.gaps.len(),
+        boundary_gaps
+    );
     Ok(0)
 }

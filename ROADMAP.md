@@ -1357,7 +1357,7 @@ the date and the tree are in the heading: a row is a measurement with an expiry.
 | M8 remainder | — | **NOT DONE** — packed SIMD (refused by name: `paddd/paddq/psubd/pmuludq/pcmpeqd/shufps`, mask `andps/orps`, GPR `movd/movq`), vtable dispatch and virtual calls. Measured: this clang build names ZERO vftable symbols in `.obj`, so vtable identity needs `.rdata` + REL32 relocation recovery | relocation reader, then vtable identity, then `call [this+k]` |
 | M5 control-flow structuring | `e0dafc6` | **LANDED** — if/while/switch recovery; jump-table switch sites close M1's last gap; M6 readability on top: 75 goto / 202 labels (from 123/217) | remaining fall-through gotos are back edges + multi-parent joins |
 | M6 readability + type recovery | `47b9076` `bfe8156` | **PARTIAL** — early-return printing, layout-then-prune, return-tail materialization (refusals 29→0); type recovery + Ghidra baseline NOT STARTED | type recovery next; Ghidra baseline is a user install decision |
-| M7 whole binary | `75e655c` | **PARTIAL** — PE32+ loader + `pe-info` on a real linked EXE; `.pdata` unwind reader in flight; ELF support not started | frame-model interpretation, `.reloc`, imports, CRT sigs |
+| M7 whole binary | `rdec pe-discover <exe>` (+ `pe-info`) | **GATE EXISTS (2026-11-08)** — on the real linked image: 418 functions, 56266/61431 .text bytes covered = **91.59%**, `overlap_free: true`, VERDICT line printing **213 gaps (213 descent + 0 reloc boundary)**; a 0-function run exits 1 with its coverage declared void. Seeds from three named sources with per-source provenance: `.pdata` (328 of 336 entries seeded, 4 chained + 4 version-2 refused and COUNTED — the seed census is the witness, measured: seeding a refused entry does not move the function count, because the linear sweep decodes with the same engine a seed uses), the entry point, and `.reloc` DIR64 code targets (47 targets in `.text`, 38 distinct, 7 `.reloc`-only with printed provenance). `.reloc` reader (`crates/arch-x86/src/reloc.rs`) asserts a PARTITION — padding + absolute + relative + unreadable-site + refused-kind == entries — cross-checked against a python raw-byte walk sharing no code (6 blocks, 782 entries = 3 ABSOLUTE + 779 DIR64, `sum(SizeOfBlock) == dir size`). NOT DONE: imports/IAT unread (160 indirect-call gaps stay anonymous, `is this gap an import?` unmeasured), PE32 has no `.reloc` leg (refused by name), the half-address relocation family is named not paired, ELF not started, frame-model interpretation not started | imports/IAT, then CRT signatures; the 7 `.reloc`-only starts are addresses, not verified bodies |
 | M9 production | `289645b` `c08a894` | **PARTIAL** — fuzzing lane (0 crashes/0 hangs over 20k-input censuses ×3 seeds), nightly hardening workflow, release parity, panic-site ratchet, pass-pipeline + verify_ssa linear-time; the analyst loop is not built | analyst loop; fuzz generator extension to shift ops with raw counts (the P-track defect's domain) |
 | P track (proof) | seed | **EXTENDED 2026-11-08** — the oracle has its own oracle: `interp_arith_reference.rs`, an independent machine-semantics reference, now over the 9 original liftable BinOps **plus the accumulator ops that landed**: `UDiv/URem/SDiv/SRem` at all four widths and `MulHi/MulSmul` at W64 (boundary set + 3000 deterministic cases per op x width, both `Sx` displays, raw shift counts, zero-divisor fault pinned). The multiply-high reference is a LIMB DECOMPOSITION, so interpreter (`u128`), table (limbs) and the shipped C helper are three implementations; `mulhi_helpers.rs` is the C-leg (PRELUDE helpers vs `__int128` over 300+ vectors, compiled with the floor gate's own flags, and the emitter's W64-emits / W32-refuses claim). First run found two real defects, both fixed in the interpreter: `Shr`/`Sar` UB for counts 64..=128 (debug panic, RELEASE WRAP) and `shift_left` disagreeing with the machine's count masking at raw 32..63 (W32) | extend for `RotL/RotR` as sites land; C-emitter equivalence proofs beyond the multiply-high leg |
 
@@ -2328,3 +2328,75 @@ count is 53 — to LANDED with corpus witnesses and a named remaining gap: the C
 corpus is still all-zero on this line, because its functions are leaf arithmetic
 and the demangler's noreturn knowledge has no corpus site to land on. The M4 row
 is re-read at 156/125/27.
+## M7 slice 3/4 lands: `.reloc` base relocations, and `rdec pe-discover` becomes a gate
+
+`crates/arch-x86/src/reloc.rs` reads IMAGE_DIRECTORY_ENTRY_BASERELOC: PageRVA/SizeOfBlock blocks,
+16-bit entries (type<<12 | offset), EVERY winnt.h AMD64 nibble 0..15 NAMED (8 is the hole winnt.h
+itself leaves), ABSOLUTE padding COUNTED, never dropped. Totality is a PARTITION -
+padding + absolute + relative + unreadable-site + refused-kind == entries - asserted on a
+three-block hermetic image and on the real image, where it cross-checks a RAW-BYTE WALK written in
+python that shares no code with the reader (6 blocks, 782 entries = 3 ABSOLUTE + 779 DIR64,
+per-block counts, sum(SizeOfBlock) 0x64c == dir size). Refusals name field/got/expected/offset:
+blocks past EOF, SizeOfBlock < 8, SizeOfBlock past the table end, (SizeOfBlock-8) not a multiple of
+2, blocks not ascending by PageRVA (the pair is named), PageRVA not 64KiB-aligned, an entry whose
+end passes its own block. Targets: DIR64 reads the 8 bytes at the site (value - ImageBase must be a
+readable 32-bit RVA, else `unreadable_site`), REL32 is site+4+signed-addend; the half-address family
+(HIGH/LOW/HIGHLOW/HIGHADJ/RELOC64/HIGHADJ_1/HIGHADJ_2) and the foreign-arch kinds are REFUSED BY
+NAME - this reader pairs no halves, so a name is the honest floor and a value would be a guess.
+MEASURED, and it corrects the brief three times: (1) `llvm-objdump -R` prints NOTHING for a PE
+image (LLVM reads it as COFFObjectFile) - the oracle here is `dumpbin /RELOCATIONS` + the raw walk;
+(2) the brief's `size % 8` directory rule REFUSES m7.exe (0x64c % 8 = 4): the stride is the 2-byte
+ENTRY, the 8-byte header bound belongs to SizeOfBlock PER BLOCK (S3 below reddens if %8 returns);
+(3) PageRVA is the page a block PATCHES, not the page it sits in (m7 blocks ascend 0x15000 ->
+0x1c000 inside one 0x64c-byte table; fixture block 2 sits at table rva 0x301c patching page 0x3000).
+And the offset-outside-page rule is a HOLE in the brief: a 16-bit offset cannot exceed 0xFFF, so the
+reachable defect is an offset in the page whose END passes its own block - pinned that way.
+m7.exe measured: ZERO relocation sites inside .text - MSVC keeps .text position-independent, every
+site is in .rdata/.data. The 47 DIR64 relocations that NAME .text code address 38 distinct
+addresses; 31 are .pdata starts and **7 are not: 0x15a8, 0x15ac, 0x1f20, 0x1fa8, 0x3e40, 0x8c14,
+0xa9d8**. The other 732 DIR64 are data-to-data pointers (vtables): census, NOT gaps - counting them
+as gaps would bury the boundaries that are real.
+pe-discover now seeds from three sources and says which is which: `.pdata` parsed starts (census
+prints `seeded 2 of 4 entries; a refused entry is NEVER a seed` - counting ADDRESSES PUSHED, so
+seeding a refusal moves the number while the parsed count sits still), the entry point (inside
+.text only; outside it is named and not seeded), and `.reloc` code targets, printed with their own
+provenance line so the `.pdata` census stays the `.pdata` census. A relocation whose SITE is in
+.text and whose target is not is the IAT/indirect-call shape: named by site + target + target
+section, counted as a gap, `callee NOT invented` (the import directory is not read by this slice).
+ABSOLUTE padding has no site (width 0) and is excluded from the site census - counting it invented
+a boundary-shaped event at a byte the loader ignores. m7.exe: 418 functions, 56266/61431 = 91.59%
+coverage, 213 gaps (53 indirect-branch + 160 indirect-call, ZERO of them reloc boundaries - MSVC
+puts every site in .rdata/.data), overlap_free, exit 0 (413 functions / 56191 bytes before the
+`.reloc` leg; +7 seeds). The VERDICT line now prints `213 gaps (213 descent + 0 reloc boundary)`: it
+shipped counting ONLY the reloc boundaries, so a census of 213 printed a verdict of 0 gaps -
+the quiet-zero class this repo has been burned by, caught by reading the run's own output.
+THE GATE (crates/cli/tests/pe_discover.rs, 7 tests, hand-built PE32+ in pe_fixtures style): the
+non-vacuity floor is asserted TWICE - the test demands functions > 0, and a 0-function run must
+exit NONZERO with its coverage numbers declared void (the fixture strips .pdata, .reloc and parks
+the entry point in .data). LEAK LESSON, measured, not assumed: seeding a chained refusal did NOT
+move the function count - the linear sweep decodes with the SAME engine a seed uses, so a decodable
+refused address is a function with or without the leak. The count is the wrong witness; the seed
+census is the right one, and that is what is pinned (S4 turns it `seeded 3 of 4`, red). A refused
+`.reloc` table costs only itself (functions 3, VERDICT OK, the refusal names SizeOfBlock 6, block 0).
+Sabotages, all applied one site at a time, quoted, restored green: S1 census drops padding ->
+`the_entry_census_is_a_partition_and_counts_padding` red on `balanced(): false`; S2 SizeOfBlock
+bound loosened by 6 -> subtract-with-overflow at reloc.rs:422, the refusal test red; S3 directory
+stride back to %8 -> the real-image leg red, m7.exe refused by a rule a healthy image cannot pass;
+S4 chained refusal pushed as a seed -> census red; S5 vacuity gate disabled -> `a 0-function
+discovery must exit nonzero: exit=0` red.
+Floors re-measured in-lane (un-piped): fmt 0, clippy -D warnings 0, workspace **45 suites / 390
+tests / 0 failed** (floor 43/364 - the delta is exactly the two new files), ratchet 0 with all five
+baselines untouched (core 1, arch-x86 7, demangle 1, verify 4, cli 14 - this slice adds NO panic
+site), selftest 0, objdump-check 0 (140 symbols / 140 exact boundary matches / 0 refusals / 0
+mismatches), discover 0 (136 objects, 140 functions, coverage 6764/6764 = 100.00%), lift 0 (140 /
+140 valid IR / 103 clean), c 0 (98 emitted, 42 refused, 0 invalid, clang -Werror OK), t2 compared
+1820 / match 1820 / mismatch 0 / fault 4, memory 408/408/0, IR leg 408/408/0 - byte-identical to
+the floor. COFF objects still go through the object loader and the loader's PE refusal is untouched
+test-wise.
+NOT PROVEN: imports/IAT (a boundary names an RVA, never a callee - next slice, and this census is
+its map); PE32 (magic 0x10b) has no `.reloc` leg because pe.rs refuses it BY NAME; the 16-bit
+half-address types are named, not paired; the 7 `.reloc`-only starts are addresses the image names,
+not verified function bodies (0x15ac is 4 bytes behind 0x15a8: at least one is not a start - the
+sweep decides, and its verdict is coverage, not a proof); the m7.exe legs skip LOUDLY when the probe
+is absent from the reaped temp dir.
+
