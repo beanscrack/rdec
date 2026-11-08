@@ -1344,7 +1344,8 @@ the date and the tree are in the heading: a row is a measurement with an expiry.
 | M1 step 1 decode/load | `rdec objdump-check --corpus` | **GREEN** — 124/124 boundary agreement | closed |
 | M1 step 2 discovery | `rdec discover --corpus` | **GREEN — closed** (re-read 2026-11-08; this row said RED at 97.88% while section `:1562` had already recorded the closure, so the row was the stale one): 136 objects, 140 symbol-table functions, **0 missing, 0 extra starts**, coverage **6764/6764 non-padding code bytes = 100.00%**, uncovered 0 bytes in 0 runs, jump tables **2 recovered from relocations (12 slots, 12 targets, 0 unresolved)**, gaps none, exit 0. The 126 bytes in 2 runs that held M1 open were the 2 switch bodies reached only through a jump table, closed by target resolution (`f2fe789`). The 99.5% threshold was never moved to fit a measurement. | closed |
 | M2 step 1 lifter | `rdec lift --corpus` | **CLOSED — recorded late.** Criterion was "every lifted function is valid IR"; it printed `FAIL: 40 lifted functions are not valid IR` at step 1, and now prints `141 functions lifted, 141 pass verify_ssa`, exit 0. It became true at `aa0d8e7` (M3 step 1) and the roadmap never said so. | closed |
-| M2 instruction breadth, MSVC leg | `rdec msvc-gates --limit 40` | **MOVING — measured 2026-11-08.** The leg now emits **121 of 134** lifted (the row written earlier today: 118 emitted / 16 refused), census keys 6 → **5**: the class `inc/dec on an unmodelled destination` (3 sites, **all `incl (%rcx)`, all in MSVC objects** — clang lowers the same C as `addl $1, (%rcx)`, which was already modelled, so a clang-only census calls this arm dead code, and llvm-objdump prints it as `incl`: the same AT&T-name trap that nearly census'd `cwde` to zero) is gone. The arm loads the cell, adds/subtracts 1, stores the SAME address expression back, and sets `FlagsOp::Inc/Dec`; `addr_of` returns `Some` only for an operand it can express, so `inc dword [rip+0]` with no relocation stays REFUSED (fixture-pinned) instead of loading from an invented address. Silicon-pinned fixtures (`inc_mem_probe.c`): cell 9→10 via `[rcx+8]`, dec 9→8, 0x7FFFFFFF→0x80000000 with OF set. | the leg's coverage stays measured, not adopted as the M1 floor; next class `flag setting with an unmodelled first operand` (3 sites, `array_walk.O2 @ 0x2f`) |
+| M2 instruction breadth, MSVC leg | `rdec msvc-gates --limit 40` | **MOVING — measured 2026-11-08.** The leg now emits **121 of 134** lifted (the row written earlier today: 118 emitted / 16 refused), census keys 6 → **5**: the class `inc/dec on an unmodelled destination` (3 sites, **all `incl (%rcx)`, all in MSVC objects** — clang lowers the same C as `addl $1, (%rcx)`, which was already modelled, so a clang-only census calls this arm dead code, and llvm-objdump prints it as `incl`: the same AT&T-name trap that nearly census'd `cwde` to zero) is gone. The arm loads the cell, adds/subtracts 1, stores the SAME address expression back, and sets `FlagsOp::Inc/Dec`; `addr_of` returns `Some` only for an operand it can express, so `inc dword [rip+0]` with no relocation stays REFUSED (fixture-pinned) instead of loading from an invented address. Silicon-pinned fixtures (`inc_mem_probe.c`): cell 9→10 via `[rcx+8]`, dec 9→8, 0x7FFFFFFF→0x80000000 with OF set. | the leg's coverage stays measured, not adopted as the M1 floor; and a class can be fully modelled with ZERO movement in this number — emission is per function, the census records one refusal per function, so a class's head count is its site count in the disassembly, never its record count (this slice: 34 memory-`cmp` sites, 3 records, 121 → 121) |
+| M2 memory-destination `cmp`/`test`, and RIP displacements | `acc_forms.rs` (9 fixtures incl. a silicon direction pair), `msvc-gates` census key | **ARM LANDED + SHARED-HELPER DEFECT FIXED + MISDIAGNOSED KEY RENAMED — measured 2026-11-08.** (a) `cmp`/`test` with a MEMORY destination (`cmpl %eax,(%rcx)`, `testb $1,(%rcx)`) loads the cell and compares **in Intel's order**, which is AT&T's last operand; the direction is pinned by a silicon pair (cell 5 vs eax 7 → CF=1 answers 13; cell 7 vs eax 5 → CF=0 answers 7 — F1 alone does NOT pin it, an `r − m` model answers 5 there), plus ZF/OF/byte-`test`/base+disp cases. Swapping `a`/`b` reddens this fixture AND the pre-existing `cdq_leaves_flags_alone`. These functions also assert `emit_c` succeeds (`cmp`/`test` define their flags, so a refusal means the arm lost the value). (b) `addr_of`/`rip_sym` resolved RIP displacements as `next_ip − 4` — right only when the disp32 is the instruction's LAST field. `cmpl $0x2, (%rip)` = `83 3D <disp32> <imm8>` has a trailing immediate: the field spans 2..6, the arithmetic lands at 4, the table keys 2 → the relocation was MISSED. Instrumented proof: `ZZ gap at 0x2f len=7 kind=Memory base=RIP hits=["0x31"]`. Covers `81 /7 id`, `C6 /0 ib`, `F6 /7 ib`, … Now resolved by scanning the instruction's span (the rule `reloc_on` already used); `RelocMap`'s doc corrected. (c) With (b) fixed the site STILL refuses, and the honest text now says why: the relocation names `g_count` with **no address** — the leg's map places CODE sections only, so a compare against a static in `.data` has no cell. New key `flag setting against a cell whose relocation names no address` (3 records moved to it; the old key asserted absent so the misdiagnosis cannot creep back). Census keys stay 5, records 13, emitted 121 of 134 | decide where data symbols live in the per-object space (M1/M4 scoping) → these 3 leg records become emissions; the clip rule for census keys is now shared between the two gates |
 | CF across `inc`/`dec` (SS1.2 item 3) | fixture `acc_forms.rs`, `c --corpus` refusal census | **NAMED GAP, BOUNDED BY A REFUSAL — found by this slice's fixture, and the boundary is the result.** x86 PRESERVES CF across `inc`/`dec`; measured on this host: `stc` then `inc [rcx+8]` then `setc` answers **12** (cell 10 + CF 1), the `clc` variant **6**, `dec` **10**, and OF on `0x7FFFFFFF + 1` gives **0x80000002**. This model leaves CF **undefined** there: the raw IR faults `UndefFlag(CF)`, the post-pass interpreter answers 0, and the emitter **refuses the whole function** naming the gap (`opaque: CF after inc/dec needs the previous flags as an operand (SS1.2 item 3)`, measured at 0x19) — so no emitted C carries a silent 0, and T2 can never compare a wrong CF against C, because a function that reads CF after `inc`/`dec` never emits. Sabotage proves the bound: spelling `inc`'s flags as `FlagsOp::Add` (the `add $1` temptation, which DEFINES CF=0) makes the function emit, and the fixture's leak assertion fires. Pre-existing (the register form has the same path); this slice inherits it and pins it, and cannot close it | thread the previous flags in as an operand (SS1.2 item 3); then the fixture's F1 answers silicon's 12 |
 | M3 step 1 SSA | `rdec lift --corpus` | **GREEN** — 141/141 valid IR; strict interpreter: 0 uses of a value never defined | closed |
 | M3 step 2 block splitting | `rdec lift --corpus` | **GREEN** — loops lift; Exits 64 -> 27, clean functions 63 -> 85 | closed |
@@ -2998,3 +2999,151 @@ fixture is claimed for it. (3) The 3 sites live in functions that emit, so their
 values reach the emitted C; they are covered by leg-level emission, not by a
 per-site differential. (4) `stc`/`clc` remain unmodelled: if a corpus ever grows a
 site, the census will name it.
+## 14. 2026-11-08 — M2: `cmp`/`test` with a memory destination, and a
+## shared-helper off-by-two that had been hiding behind it
+
+Triggered by the M2 row's "next class": `flag setting with an unmodelled first
+operand`, 3 census records on the MSVC leg. It turned out to be three separate
+things wearing one name, and the census text was pointing at the one that was
+already fine.
+
+### 14.1 The census under-reports a per-instruction class, badly
+
+Counting memory-destination `cmp` sites in the leg's disassembly, with AT&T names
+(the Intel-name census is the trap this file has now recorded three times —
+`cwde`/`cwtl`, `inc`/`incl`):
+
+```text
+34  cmp sites with a memory destination
+    cmpl %eax,0x20(%rsp)   x13
+    cmpl %eax,(%rsp)       x8
+    cmpl $0x0,0x20(%rsp)   x3
+    ... imm and equal-width forms
+```
+
+The leg's census printed **3**. Not a bug: the census records the FIRST refusal
+per function, and a function with thirteen memory compares that also contains a
+call-clobber refusal is one record of "clobbered by call". Consequence for how
+rows are read: **a class can be modelled end to end and move the leg's headline
+by zero**, because emission is per function and the census is per function. The
+head count for a class is its site count in the disassembly, never its census
+record count.
+
+### 14.2 The arm, and the direction pin
+
+`crates/arch-x86/src/lift.rs`, `Mnemonic::Cmp | Mnemonic::Test`: when
+`src(ins, 0, w)` finds no register, the arm now tries `addr_of(ins, 0)` and loads
+the cell. The order is the entire claim — Intel's first operand is AT&T's LAST,
+and `cmp m, r` computes **m − r**, so the load is the LEFT operand of the flag
+op. Swapping computes r − m, flips CF/SF/OF, and sends every `ja`/`jb`/`setb`
+downstream to the mirror image.
+
+Silicon pair that pins the direction (`cmp_mem_probe.c`, returning `flag*8 + cell`
+so one run answers the flag AND proves the cell read was the memory one):
+
+```text
+F1  [rcx]=5,  eax=7,   cmp [rcx],eax, setb  -> 13   CF=1  (5 below 7)
+F2  [rcx]=7,  eax=5,   cmp [rcx],eax, setb  ->  7   CF=0  (7 not below 5)
+F3  [rcx]=7,  eax=7,   cmp [rcx],eax, sete  -> 15   ZF=1
+F4  [rcx]=0x7FFFFFFF, eax=-1,  seto         -> 0x80000007  OF=1
+F5  cell 3, test [rcx],1, sete               ->  3   ZF=0
+F6  cell 2, test [rcx],1, sete               -> 10   ZF=1
+F7  [rcx+8]=5, eax=9,  cmp [rcx+8],eax,setb -> 13   base+disp
+```
+
+F1 alone does NOT pin the direction (an `r − m` model gives CF=0 → 5, and F1's
+cell 5 would answer… 5). F1+F2 together do, and both are in the fixture.
+Sabotage, run through the real binary: swapping `a`/`b` in `FlagsOp::Sub` reddens
+the new fixture (F1 answers 5, silicon says 13) **and** independently reddens the
+pre-existing `cdq_leaves_flags_alone` — one semantic break, two fixtures.
+
+Fixture hygiene worth keeping: F5/F6 use a DWORD store, not the byte store the
+probe used, because the shared read-back (`mov edx,[rcx]`) reads 4 bytes and
+silicon's high bytes were **stale stack** (0x15fe03) — a fixture must not bake a
+garbage byte into an expectation. `cmp`/`test` define their flags, so these
+functions also assert `emit_c(...).is_ok()`: a refusal here would mean the arm
+lost the value (contrast §13, where the CF gap makes the emitter refuse on
+purpose).
+
+### 14.3 A shared-helper off-by-two: `next_ip - 4`
+
+Fixing the arm did not move the leg, so one real object was instrumented
+(`array_walk.O2.obj :: f @ 0x2f`, `cmpl $0x2, (%rip)`):
+
+```text
+ZZ gap at 0x2f len=7 kind=Memory base=RIP hits=["0x31"]
+```
+
+The operand kind is Memory, the base is RIP, the relocation is in the map, inside
+the instruction's span — and `addr_of` still returned None. `addr_of` and
+`rip_sym` were computing the displacement field as `next_ip - 4`, which is right
+only when the disp32 is the instruction's LAST field. `83 3D <disp32> <imm8>` has
+an **immediate after** the displacement: the field spans offsets 2..6 of a 7-byte
+instruction, `next_ip - 4` = 4 lands INSIDE it, and the table keys the field's
+first byte (2). The same assumption covers `81 /7 <disp32> <imm32>`,
+`C6 /0 <disp32> <imm8>`, `F6 /7 <disp32> <imm8>` — a whole encoding family, in a
+helper used by every RIP-relative `lea`/`mov`/`cmp`/`test`.
+
+Fix: `rip_reloc` resolves by SCANNING the instruction's own span, the rule
+`reloc_on` already used for branch targets ("scan the span, which keeps every
+encoding width the same question"). A span carrying two distinct targets is
+refused, not guessed. `RelocMap`'s doc corrected: it keys the field's FIRST byte;
+call/jump displacements really are last, RIP displacements are not.
+
+Fixture: `a_rip_destination_resolves_when_the_displacement_is_not_the_last_field`
+supplies the relocation at offset 2 and requires the load to be built at the
+target (0x1000 = `Const(4096)` in the IR dump — the only way that constant enters
+the IR is the relocation). The arithmetic version fails it with a gap.
+
+### 14.4 What the 3 records actually are: an address-space gap, not a lifter gap
+
+With the span fix in, the site still refuses — for the reason the probe was built
+to find: the relocation names `g_count` and carries **no address**. The leg's
+relocation map places CODE sections (`idx_of`/`base_of` are built over code
+sections), so a compare against a static in `.data` has a target with no cell.
+
+The census called that "flag setting with an unmodelled first operand", which
+points the work queue at the lifter, which models this operand correctly. The
+refusal now splits the two causes:
+
+```text
+flag setting against a cell whose relocation names no address   (relocation present, addr None)
+flag setting with an unmodelled first operand                   (form genuinely inexpressible)
+```
+
+Fixture `a_relocation_that_names_no_address_says_so_instead_of_blaming_the_operand`
+asserts the new text PRESENT and the old text ABSENT, so the misdiagnosis cannot
+quietly come back. All 3 leg records moved to the new key: the leg prints
+
+```text
+refusal records: 13 in 13 refused functions, 5 census keys
+      4  clobbered by call
+      3  flag setting against a cell whose relocation…
+      3  tail call to 'ext'
+      2  lea of an address we cannot name
+      1  call to 'ext'
+```
+
+and the emitted count stays **121 of 134** — honest, per §14.1: `array_walk.O2 ::
+f` also refuses on `live-in Rdi` and a conditional branch, so this class was
+never the binding constraint on that function's emission. Closing the class
+requires deciding where data symbols live in the per-object address space
+(an M1/M4 scoping call), not a lifter arm.
+
+### 14.5 One clip rule
+
+The new key is longer than 46 chars, which put the leg's raw `&low[..46]` under
+load — the same defect that invented `__Imag` in §12, plus a UTF-8 panic risk on a
+multi-byte character straddling byte 46. The leg now shares `m4::clip` (announced
+cut, word-boundary break, char-boundary-safe), pinned by
+`a_long_census_key_announces_its_cut_and_breaks_on_a_word`. The first attempt at
+this patch dropped `census_key`'s colon-cut and the pre-existing key test caught
+it in the same run.
+
+### 14.6 State
+
+`acc_forms` 17 tests; `rdec-cli` bin 50; full suite 51 suites / 0 failed;
+fmt and `clippy -D warnings` clean. Legs: clang `c --corpus` 156 lifted /
+129 emitted / 27 refused / 0 invalid (unchanged — the clang corpus has no
+memory-destination `cmp` with these shapes); MSVC 121 of 134 emitted, 13 refused,
+5 census keys with the class renamed. Floor tuple in the commit message.

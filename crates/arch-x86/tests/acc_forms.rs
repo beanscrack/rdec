@@ -35,7 +35,9 @@
 //! flag-clearing answers 0 for every vector and the fixture goes red on the
 //! `al = 1` legs.
 use rdec_arch_x86::discover::{discover_all, Code};
-use rdec_arch_x86::lift::{lift_one, Report};
+use rdec_arch_x86::lift::{
+    lift_one, lift_one_sigs, no_tables, CalleeTable, FnAbi, RelocMap, RelocTarget, Report,
+};
 use rdec_core::emit_c::emit_c;
 use rdec_core::interp::{run_budget, Fault, Outcome};
 use rdec_core::ir::Function;
@@ -770,5 +772,299 @@ fn inc_on_an_unnameable_rip_relative_cell_stays_refused() {
             .any(|t| t.contains("inc/dec on an unmodelled destination")),
         "the refusal must NAME itself, not a generic gap: {:?}",
         opaque_texts(&f)
+    );
+}
+
+/// A flag-setting op whose DESTINATION is memory: `cmpl %eax,(%rcx)`,
+/// `testb $1,(%rcx)`.
+///
+/// Census first, AT&T names: 34 `cmp` sites with a memory destination over
+/// `corpus/msvc/obj` (`cmpl %eax,0x20(%rsp)` x13, `cmpl %eax,(%rsp)` x8,
+/// `cmpl $0x0,0x20(%rsp)` x3, plus imm/equal-width forms). The leg's census showed
+/// only 3 - it records the FIRST refusal per function, and most of these functions
+/// refuse for a different reason first. The modelled arm is therefore worth far
+/// more than the census line suggested, and the census line is why: a per-function
+/// census under-reports a class that appears many times per function.
+///
+/// THE ORDER IS THE CLAIM. Intel's first operand is AT&T's LAST, and `cmp m, r`
+/// computes m - r, so the memory load must be the LEFT operand of the flag op.
+/// Swapping operands computes r - m: CF, SF and OF all flip, and every `ja`/`jb`/
+/// `setb` downstream walks the mirror image. F1/F2 are the silicon pair that pins
+/// the direction (cell 5 vs eax 7 -> CF=1; cell 7 vs eax 5 -> CF=0). Everything is
+/// measured on this host, `cmp_mem_probe.c`, returning `flag*8 + cell` so one run
+/// answers the flag and proves the memory cell was the one read:
+///
+/// ```text
+/// F1  [rcx]=5,  eax=7,   cmp [rcx],eax, setb  -> 13          CF=1  (5 below 7)
+/// F2  [rcx]=7,  eax=5,   cmp [rcx],eax, setb  ->  7          CF=0  (7 not below 5)
+/// F3  [rcx]=7,  eax=7,   cmp [rcx],eax, sete  -> 15          ZF=1
+/// F4  [rcx]=0x7FFFFFFF, eax=-1, seto          -> 0x80000007  OF=1 (pos - neg = neg)
+/// F5  [rcx]=3,  test [rcx],1, sete            ->  3          ZF=0 (3&1 = 1)
+/// F6  [rcx]=2,  test [rcx],1, sete            -> 10          ZF=1 (2&1 = 0)
+/// F7  [rcx+8]=5, eax=9,  cmp [rcx+8],eax,setb -> 13          base+disp address
+/// ```
+#[test]
+fn cmp_and_test_with_a_memory_destination_compare_the_cell_in_order() {
+    fn body(store: &[&[u8]], cc: &[u8], tail: &[&[u8]]) -> Vec<u8> {
+        let mut v = vec![0x48u8, 0x83, 0xEC, 0x20]; // sub rsp,0x20 - entry [rsp] is
+                                                    // the return address, never a cell
+        for s in store {
+            v.extend_from_slice(s);
+        }
+        v.extend_from_slice(&[0x48, 0x89, 0xE1]); // mov rcx,rsp
+        for t in tail {
+            v.extend_from_slice(t);
+        }
+        v.extend_from_slice(cc); // <setcc> al
+        v.extend_from_slice(&[0x0F, 0xB6, 0xC0, 0xC1, 0xE0, 0x03]); // movzx eax,al; shl eax,3
+        v.extend_from_slice(&[0x8B, 0x11, 0x01, 0xD0]); // mov edx,[rcx]; add eax,edx
+        v.extend_from_slice(&[0x48, 0x83, 0xC4, 0x20, 0xC3]); // add rsp,0x20; ret
+        v
+    }
+    fn st32(v: u32) -> Vec<u8> {
+        let b = v.to_le_bytes();
+        vec![0xC7, 0x04, 0x24, b[0], b[1], b[2], b[3]] // mov dword [rsp], v
+    }
+    fn eax(v: u32) -> Vec<u8> {
+        let b = v.to_le_bytes();
+        vec![0xB8, b[0], b[1], b[2], b[3]] // mov eax, v
+    }
+    const CMP_EAX: &[u8] = &[0x39, 0x01]; // cmp [rcx], eax  -> [rcx] - eax
+    const SETB: &[u8] = &[0x0F, 0x92, 0xC0];
+    const SETE: &[u8] = &[0x0F, 0x94, 0xC0];
+    const SETO: &[u8] = &[0x0F, 0x90, 0xC0];
+
+    let cases: Vec<(Vec<u8>, u64, &str)> = vec![
+        (
+            body(&[&st32(5)], SETB, &[&eax(7), CMP_EAX]),
+            13,
+            "F1: cell 5 vs eax 7 borrows, CF=1",
+        ),
+        (
+            body(&[&st32(7)], SETB, &[&eax(5), CMP_EAX]),
+            7,
+            "F2: cell 7 vs eax 5 does NOT borrow - the direction F1 alone cannot pin",
+        ),
+        (
+            body(&[&st32(7)], SETE, &[&eax(7), CMP_EAX]),
+            15,
+            "F3: equal, ZF=1",
+        ),
+        (
+            body(&[&st32(0x7FFF_FFFF)], SETO, &[&eax(0xFFFF_FFFF), CMP_EAX]),
+            0x8000_0007,
+            "F4: 0x7FFFFFFF - (-1) = 0x80000000, OF=1",
+        ),
+        (
+            body(
+                // A DWORD store, not a byte store: the fixture reads the cell back
+                // with `mov edx,[rcx]` (4 bytes), and silicon's high bytes were
+                // STALE STACK (0x15fe03) that this file refuses to bake into an
+                // expectation. The low byte - the one `test byte [rcx],1` reads -
+                // is identical, so the flag answer silicon measured still applies.
+                &[&st32(3)[..]],
+                SETE,
+                &[&[0xF6, 0x01, 0x01][..]], // test byte [rcx], 1
+            ),
+            3,
+            "F5: 3 & 1 = 1, ZF=0",
+        ),
+        (
+            body(&[&st32(2)[..]], SETE, &[&[0xF6, 0x01, 0x01][..]]), // test byte [rcx], 1
+            10,
+            "F6: 2 & 1 = 0, ZF=1 - the same test bit, opposite answer",
+        ),
+        (
+            body(
+                &[
+                    // Cell written at BOTH slots: the shared read-back (`mov
+                    // edx,[rcx]`) reads offset 0, while the comparison under test
+                    // reads `[rcx+8]`. Both hold 5, so the cell in the expected
+                    // value is the cell the disp8 form compared.
+                    &[0xC7, 0x04, 0x24, 0x05, 0x00, 0x00, 0x00][..], // [rsp] = 5
+                    &[
+                        0x48, 0xC7, 0x44, 0x24, 0x08, 0x05, 0x00, 0x00, 0x00, // [rsp+8] = 5
+                    ][..],
+                ],
+                SETB,
+                &[
+                    &[0xB8, 0x09, 0x00, 0x00, 0x00][..], // mov eax, 9
+                    &[0x39, 0x41, 0x08][..],             // cmp [rcx+8], eax
+                ],
+            ),
+            13,
+            "F7: base+disp destination, cell 5 vs eax 9",
+        ),
+    ];
+
+    for (bytes, want, why) in cases {
+        let (f, rep) = lift(&bytes);
+        verify_ssa(&f).expect("valid SSA");
+        assert_eq!(
+            rep.gaps,
+            0,
+            "{why}: memory cmp/test is modelled; opaque texts: {:?}",
+            opaque_texts(&f)
+        );
+        match answer(&f, &[0, 0, 0, 0]) {
+            Outcome::Ret(v) => {
+                assert_eq!(v.bits(), want, "{why}: silicon value from cmp_mem_probe.c")
+            }
+            other => panic!("{why}: unexpected {other:?}"),
+        }
+        // cmp/test define every flag they are read for, so these functions EMIT:
+        // unlike the `inc`/`dec` CF case, nothing here is left undefined, and a
+        // refusal at this point would mean the arm lost the value.
+        if let Err(rs) = emit_c(&f) {
+            panic!("{why}: a memory cmp/test with defined flags REFUSED: {rs:?}");
+        }
+    }
+}
+
+/// A memory-destination compare whose address cannot be named stays REFUSED:
+/// `83 3D 00 00 00 00 00` is `cmpl $0x0,[rip+0]`, and this harness has no
+/// relocation table, so there is no cell to compare. Refusing is the honest
+/// answer; comparing against an invented address would silently decide a branch
+/// from memory the object never declared.
+#[test]
+fn cmp_against_an_unnameable_rip_relative_cell_stays_refused() {
+    let bytes: &[u8] = &[0x83, 0x3D, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC3];
+    let (f, rep) = lift(bytes);
+    assert!(
+        rep.gaps > 0,
+        "a RIP-relative cmp with no relocation must stay refused; opaque texts: {:?}",
+        opaque_texts(&f)
+    );
+    assert!(
+        opaque_texts(&f)
+            .iter()
+            .any(|t| t.contains("flag setting with an unmodelled first operand")),
+        "the refusal must NAME itself: {:?}",
+        opaque_texts(&f)
+    );
+}
+
+/// A RIP-relative destination whose displacement is NOT the instruction's last
+/// field: `83 3D <disp32> <imm8>` is `cmpl $0x2, (%rip)` — an 8-bit immediate
+/// FOLLOWS the displacement. Resolving by `next_ip - 4` (the arithmetic the
+/// lifter used, correct for `39 0D <disp32>` where the disp32 really is last)
+/// lands at offset 4, INSIDE a field that spans 2..6, while the table keys the
+/// field's first byte (2): the relocation is missed and the site refuses.
+///
+/// Real witness: `corpus/msvc/obj/array_walk.O2.obj :: f @ 0x2f`. The same
+/// assumption covers `81 /7 <disp32> <imm32>`, `C6 /0 <disp32> <imm8>`,
+/// `F6 /7 <disp32> <imm8>` — a whole encoding family, in a shared helper.
+///
+/// This test supplies the relocation at offset 2 and requires the load to be
+/// built AT THE TARGET ADDRESS (0x1000), not refused: the arithmetic version
+/// fails it with a gap, and the leg's refusal census goes back up when it does.
+#[test]
+fn a_rip_destination_resolves_when_the_displacement_is_not_the_last_field() {
+    let bytes: &[u8] = &[0x83, 0x3D, 0x00, 0x00, 0x00, 0x00, 0x02, 0xC3];
+    let mut relocs: RelocMap = RelocMap::new();
+    relocs.insert(
+        2u64,
+        RelocTarget {
+            sym: "g_count".to_string(),
+            addr: Some(0x1000),
+        },
+    );
+    let owned = bytes.to_vec();
+    let ranges = [Code {
+        base: 0,
+        bytes: owned.as_slice(),
+    }];
+    let mut seeds: std::collections::HashMap<usize, (Vec<u64>, Vec<u64>)> =
+        std::collections::HashMap::new();
+    seeds.insert(0, (vec![0u64; 4], vec![]));
+    let plan = discover_all(&ranges, &seeds);
+    let start = plan.functions[0];
+    let (f, rep) = lift_one_sigs(
+        "f",
+        &owned,
+        0,
+        start,
+        owned.len() as u64,
+        &plan,
+        &std::collections::HashMap::new(),
+        &FnAbi::integer(),
+        &CalleeTable::new(),
+        &relocs,
+        &no_tables(),
+    );
+    assert_eq!(
+        rep.gaps,
+        0,
+        "the cell's address IS in the relocation table; opaque texts: {:?}",
+        opaque_texts(&f)
+    );
+    // 0x1000 = 4096: the ONLY way that constant enters the IR is the relocation
+    // target, so finding it in the dump proves the cmp loaded THE CELL at the
+    // address the table names (the arithmetic version refuses this function and
+    // the dump has no constant at all).
+    let dump = format!("{:?}", f);
+    assert!(
+        dump.contains("Const(4096)"),
+        "the load address must be the relocation's target 0x1000; IR dump: {dump}"
+    );
+}
+
+/// The refusal must name the SHORTAGE, not guess at the operand kind.
+///
+/// `83 3D <disp32> <imm8>` = `cmpl $0x2, (%rip)` with a relocation that NAMES a
+/// symbol but carries no address. That is the exact measured shape of the MSVC
+/// leg's three remaining `flag setting` records: the leg's relocation map places
+/// CODE sections, so a compare against a static in `.data` has a target with no
+/// address. Calling that "an unmodelled first operand" sends the work queue to
+/// the lifter, which already models the operand fine; the missing piece is an
+/// address-space decision (where do data symbols live), which is a different
+/// milestone's question.
+#[test]
+fn a_relocation_that_names_no_address_says_so_instead_of_blaming_the_operand() {
+    let bytes: &[u8] = &[0x83, 0x3D, 0x00, 0x00, 0x00, 0x00, 0x02, 0xC3];
+    let mut relocs: RelocMap = RelocMap::new();
+    relocs.insert(
+        2u64,
+        RelocTarget {
+            sym: "g_count".to_string(),
+            addr: None, // names a symbol; the model has no address for it
+        },
+    );
+    let owned = bytes.to_vec();
+    let ranges = [Code {
+        base: 0,
+        bytes: owned.as_slice(),
+    }];
+    let mut seeds: std::collections::HashMap<usize, (Vec<u64>, Vec<u64>)> =
+        std::collections::HashMap::new();
+    seeds.insert(0, (vec![0u64; 4], vec![]));
+    let plan = discover_all(&ranges, &seeds);
+    let start = plan.functions[0];
+    let (f, rep) = lift_one_sigs(
+        "f",
+        &owned,
+        0,
+        start,
+        owned.len() as u64,
+        &plan,
+        &std::collections::HashMap::new(),
+        &FnAbi::integer(),
+        &CalleeTable::new(),
+        &relocs,
+        &no_tables(),
+    );
+    assert!(rep.gaps > 0, "an address-less target stays refused");
+    let texts = opaque_texts(&f);
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.contains("flag setting against a cell whose relocation names no address")),
+        "the refusal must name the missing address, not the operand kind: {texts:?}"
+    );
+    assert!(
+        !texts
+            .iter()
+            .any(|t| t.contains("flag setting with an unmodelled first operand")),
+        "the old key blamed the lifter for an address-space gap: {texts:?}"
     );
 }

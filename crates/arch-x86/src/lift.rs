@@ -546,9 +546,11 @@ pub struct RelocTarget {
 }
 
 /// Relocations keyed by the address of the displacement field they apply to,
-/// in the same per-object virtual space as `names`. A direct `call` and a
-/// RIP-relative `lea`/`mov` both resolve through this: their displacement is
-/// the last 4 bytes of the instruction, so the key is `next_ip - 4`.
+/// in the same per-object virtual space as `names` - keyed at the field's FIRST
+/// byte. A direct `call`/`jmp` displacement really is the instruction's last
+/// field, so those resolve by arithmetic (`next_ip - disp_len`). A RIP-relative
+/// displacement is NOT: `cmpl $0x2, (%rip)` puts an `imm8` after the disp32, so
+/// those resolve by scanning the instruction's span - see `rip_reloc`.
 pub type RelocMap = HashMap<u64, RelocTarget>;
 
 /// An empty map: no displacement has a relocation, which is the model exactly
@@ -1612,10 +1614,11 @@ impl<'a> Lifter<'a> {
         }
         let base = ins.memory_base();
         if base == Register::RIP {
-            // The RIP-relative disp32 is the last field of the instruction, so
-            // the relocation's address is `next_ip - 4`.
-            let at = ins.next_ip().wrapping_sub(4);
-            match self.relocs.get(&at).and_then(|rt| rt.addr) {
+            // Resolved by SCANNING the instruction's span (`rip_reloc`), not by
+            // `next_ip - 4`: that arithmetic assumes the disp32 is the last field
+            // and is false for every RIP form with a trailing immediate
+            // (`cmpl $0x2, (%rip)` = `83 3D <disp32> <imm8>`).
+            match self.rip_reloc(ins).and_then(|rt| rt.addr) {
                 Some(a) => {
                     self.rep.rip_named += 1;
                     Some(self.const_of(a, Width::W64))
@@ -1662,12 +1665,46 @@ impl<'a> Lifter<'a> {
             .cloned()
     }
 
+    /// The relocation carrying THIS instruction's RIP-relative displacement.
+    ///
+    /// NOT `next_ip - 4`. That arithmetic is right only when the disp32 is the
+    /// instruction's LAST field: true for `39 0D <disp32>` (`cmpl (%rip), %ecx`),
+    /// FALSE for every RIP form with a trailing immediate -
+    /// `83 3D <disp32> <imm8>` (`cmpl $0x2, (%rip)`), `81 /7 <disp32> <imm32>`,
+    /// `C6 /0 <disp32> <imm8>`, `F6 /7 <disp32> <imm8>`. Measured:
+    /// `corpus/msvc/obj/array_walk.O2.obj :: f @ 0x2f` is `cmpl $0x2, (%rip)`;
+    /// its disp32 occupies offsets 2..6 of an 8-byte instruction, so `next_ip - 4`
+    /// = 4 lands INSIDE the field while the table keys the field's FIRST byte (2),
+    /// and the site refused as "flag setting with an unmodelled first operand" even
+    /// after the memory-destination arm had landed. One off-by-two, in a shared
+    /// helper, for a whole encoding family.
+    ///
+    /// The rule is the one `reloc_on` already uses for branch targets: scan the
+    /// instruction's OWN span, which keeps every encoding width the same question.
+    /// A span carrying TWO distinct relocation targets is not guessed - the model
+    /// cannot say which field the RIP base means - so it refuses and the caller's
+    /// text names the arm (`lea of an address we cannot name`, ...).
+    fn rip_reloc(&self, ins: &Instruction) -> Option<RelocTarget> {
+        let a = self.addr();
+        let mut found: Option<RelocTarget> = None;
+        for k in 0..ins.len() as u64 {
+            if let Some(rt) = self.relocs.get(&(a + k)) {
+                match &found {
+                    // The same target recorded at two offsets (a padded field) is
+                    // one answer, not a conflict.
+                    Some(prev) if prev.sym == rt.sym && prev.addr == rt.addr => {}
+                    Some(_) => return None,
+                    None => found = Some(rt.clone()),
+                }
+            }
+        }
+        found
+    }
+
     /// The symbol named by the RIP-relative relocation on this instruction,
     /// for refusal text: `": h"`, or `""` when no relocation is there at all.
     fn rip_sym(&self, ins: &Instruction) -> Option<String> {
-        self.relocs
-            .get(&ins.next_ip().wrapping_sub(4))
-            .map(|rt| format!(": {}", rt.sym))
+        self.rip_reloc(ins).map(|rt| format!(": {}", rt.sym))
     }
 
     /// Resolve a direct branch target from the relocation at its displacement
@@ -3460,11 +3497,68 @@ impl<'a> Lifter<'a> {
                 let w2 = self.op_w(ins);
                 let lhs = match self.src(ins, 0, w2) {
                     Some(v) => v,
-                    None => {
-                        self.gap("flag setting with an unmodelled first operand", ty_u(w2));
-                        self.clear_flags();
-                        return;
-                    }
+                    None => match self.addr_of(ins, 0) {
+                        // A flag-setting op whose DESTINATION is memory:
+                        // `cmpl %eax,(%rcx)`, `testb $1,(%rcx)` - Intel's first
+                        // operand, which llvm-objdump's AT&T output prints LAST,
+                        // so an Intel-order grep finds none of these (the same
+                        // name trap as `cwde` and `incl`). Measured census over
+                        // `corpus/msvc/obj`: 34 `cmp` sites with a memory
+                        // destination (`cmpl %eax,0x20(%rsp)` x13,
+                        // `cmpl %eax,(%rsp)` x8, `cmpl $0x0,0x20(%rsp)` x3, ...),
+                        // the reason the leg's census printed only 3 - the census
+                        // records the FIRST refusal per function, and most of
+                        // these functions refuse for a different reason first.
+                        //
+                        // The load is the cell the machine compares, and the
+                        // ORDER is the whole claim: `cmp m, r` computes m - r, so
+                        // the load must be the LEFT operand of the flag op.
+                        // Swapping operands - the tempting simplification -
+                        // computes r - m and flips CF/SF/OF, taking every `ja`
+                        // and `setb` downstream to the mirror image. Silicon
+                        // pins the pair: cell 5 vs eax 7 answers CF=1, cell 7 vs
+                        // eax 5 answers CF=0 (`cmp_mem_probe.c`, F1=13, F2=7).
+                        //
+                        // `addr_of` again refuses what it cannot express (RIP
+                        // with no relocation, no base), so an unaddressable
+                        // destination stays refused rather than comparing an
+                        // invented cell.
+                        Some(a) => {
+                            let t = ty_u(w2);
+                            self.f
+                                .emit(self.cur, Op::Load(t.clone(), a), t, self.addr())
+                        }
+                        None => {
+                            // Two DIFFERENT shortages live behind `addr_of`
+                            // returning None, and the census must not call them
+                            // one thing:
+                            //   * the addressing form is genuinely not expressible
+                            //     (no base, or RIP with no relocation at all), and
+                            //   * the relocation IS there and names a symbol, but
+                            //     the model has no address for that target - the
+                            //     leg's relocation map places CODE sections, so a
+                            //     compare against a static in `.data`/`.bss` has a
+                            //     target with no address.
+                            // Measured on `array_walk.O2.obj :: f @ 0x2f`
+                            // (`cmpl $0x2, (%rip)`): op_kind(0)=Memory,
+                            // memory_base=RIP, the map holds a relocation at 0x31
+                            // inside the 7-byte span - and its `addr` is None. The
+                            // old key called that "an unmodelled first operand",
+                            // which points the work queue at the lifter when the
+                            // missing piece is an address-space decision.
+                            let named_no_address = self.rip_reloc(ins).is_some();
+                            self.gap(
+                                if named_no_address {
+                                    "flag setting against a cell whose relocation names no address"
+                                } else {
+                                    "flag setting with an unmodelled first operand"
+                                },
+                                ty_u(w2),
+                            );
+                            self.clear_flags();
+                            return;
+                        }
+                    },
                 };
                 let rhs = match self.src(ins, 1, w2) {
                     Some(v) => v,

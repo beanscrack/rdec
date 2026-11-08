@@ -264,7 +264,7 @@ pub(crate) fn clean(f: &mut Function) {
 /// names a symbol that does not exist, and every distinct target whose first 40
 /// characters agree lands in ONE bucket, so the count is a count of prefixes.
 /// A clip that is announced with an ellipsis cannot do either silently.
-fn clip(s: &str, n: usize) -> String {
+pub fn clip(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
         return s.to_string();
     }

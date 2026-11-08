@@ -928,7 +928,11 @@ pub fn census_key(r: &Refusal) -> String {
     }
     let low = s.to_lowercase();
     let cut = low.find(':').unwrap_or(low.len());
-    low[..cut.min(46)].trim().to_string()
+    // One clip rule for the whole repo (crate::m4::clip): it announces a cut with a
+    // visible ellipsis, breaks on a word, and slices on a char boundary - a raw
+    // `&low[..46]` silently invented `__Imag`-style fragments and panics on a
+    // multi-byte character straddling byte 46.
+    crate::m4::clip(low[..cut].trim(), 46)
 }
 
 pub fn fnv1a64(bytes: &[u8]) -> u64 {
@@ -1114,6 +1118,33 @@ mod tests {
                 src.display()
             );
         }
+    }
+
+    #[test]
+    fn a_long_census_key_announces_its_cut_and_breaks_on_a_word() {
+        // The leg's keys got LONGER when the refusal started naming the real
+        // shortage ("flag setting against a cell whose relocation names no
+        // address"), which put the 46-char clip under load. A key that is cut must
+        // SAY it is cut and must not end mid-identifier: the clang gate invented
+        // `__Imag` out of `__ImageBase` exactly this way.
+        let k = census_key(&Refusal {
+            at: 0,
+            reason: "opaque: flag setting against a cell whose relocation names no address"
+                .to_string(),
+        });
+        assert!(
+            k.ends_with('\u{2026}'),
+            "a cut key must announce the cut: {k:?}"
+        );
+        let body = k.trim_end_matches('…');
+        assert!(
+            body.ends_with("relocation"),
+            "cut at a word boundary: {k:?}"
+        );
+        assert!(
+            !body.ends_with(char::is_whitespace),
+            "no trailing space before the cut: {k:?}"
+        );
     }
 
     #[test]
