@@ -30,7 +30,7 @@
 //! sound and useless; the counts show which it is).
 
 use crate::m4;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use rdec_core::ir::Function;
 use rdec_core::ty::{FWidth, Sx, Ty, Width};
@@ -280,6 +280,129 @@ fn cpp_parity(f: &Function, name: &str, c: &mut Census) {
     }
 }
 
+/// The family key of a printed LIE line: `subject|kind`.
+///
+/// It is DERIVED from the scorer's own text on purpose: a second, parallel
+/// bookkeeping counter is the shape that silently stops counting. The five
+/// classes are the five the scorer can print; anything else maps to
+/// `UNMAPPED(...)`, which matches no baseline row, so a NEW lie class reddens
+/// the ratchet instead of hiding in an unmapped string.
+fn lie_family(text: &str) -> String {
+    let (who, tail) = match text.split_once(':') {
+        Some((w, t)) => (w.trim(), t.trim()),
+        None => (text.trim(), ""),
+    };
+    let who = who.replace(" (ret)", "");
+    let kind = if tail.starts_with("prints ") {
+        "signedness"
+    } else if tail.starts_with("reads ") {
+        "width"
+    } else if tail.starts_with("pointer claim") {
+        "pointer"
+    } else if tail.starts_with("float claim") {
+        "float"
+    } else if tail.starts_with("return claim") {
+        "void-return"
+    } else {
+        return format!("UNMAPPED({tail})");
+    };
+    format!("{who}|{kind}")
+}
+
+/// Read a `subject|kind COUNT` baseline (blank and `#` lines ignored).
+fn load_types_baseline(path: &str) -> Result<BTreeMap<String, usize>, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+    let mut out: BTreeMap<String, usize> = BTreeMap::new();
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let mut cols = t.split_whitespace();
+        let (Some(key), Some(cnt)) = (cols.next(), cols.next()) else {
+            return Err(format!("{path}: baseline row too short: {line}"));
+        };
+        let Ok(n) = cnt.parse::<usize>() else {
+            return Err(format!("{path}: baseline count is not a number: {line}"));
+        };
+        if cols.next().is_some() {
+            return Err(format!("{path}: extra columns in baseline row: {line}"));
+        }
+        out.insert(key.to_string(), n);
+    }
+    if out.is_empty() {
+        return Err(format!(
+            "{path}: baseline is empty (a gate that checks nothing must not pass)"
+        ));
+    }
+    Ok(out)
+}
+
+/// Compare a census's lie families with the baseline. Fails on a RISE (new
+/// over-truth claims), on a FALL (the commit must lower the baseline in the same
+/// change, the `.gate/unwrap-baseline` rule) and on any family with no row.
+fn ratchet_problems(got: &BTreeMap<String, usize>, want: &BTreeMap<String, usize>) -> Vec<String> {
+    let mut p = Vec::new();
+    for (k, w) in want.iter() {
+        match got.get(k) {
+            None => p.push(format!(
+                "{k}: baseline allows {w}, census has 0 — lower the baseline in this commit"
+            )),
+            Some(g) if g > w => p.push(format!(
+                "{k}: {} claims, baseline allows {w} — NEW over-truth claims",
+                g
+            )),
+            Some(g) if g < w => p.push(format!(
+                "{k}: {} claims, baseline allows {w} — lower the baseline in this commit",
+                g
+            )),
+            Some(_) => {}
+        }
+    }
+    for (k, g) in got.iter() {
+        if !want.contains_key(k) {
+            p.push(format!(
+                "{k}: {g} claims and NO baseline row — a new lie family: fix the pass, or name it in the baseline in this commit"
+            ));
+        }
+    }
+    p
+}
+
+fn families_of(lies: &[String]) -> BTreeMap<String, usize> {
+    let mut m: BTreeMap<String, usize> = BTreeMap::new();
+    for l in lies.iter() {
+        *m.entry(lie_family(l)).or_insert(0) += 1;
+    }
+    m
+}
+
+/// `types --corpus --baseline [PATH]`: the CI form of this gate. The census
+/// printed is the SAME census, and the scorer is untouched — what the baseline
+/// changes is the exit code: a green run is "the census equals the named, known
+/// lies exactly". `rdec types --corpus` on its own keeps reporting the raw
+/// verdict (exit 1 while any lie stands).
+fn baseline_arg(args: &[String]) -> Option<String> {
+    let i = args.iter().position(|a| a == "--baseline")?;
+    match args.get(i + 1) {
+        Some(p) if !p.starts_with("--") => Some(p.clone()),
+        _ => Some(".gate/types-baseline".to_string()),
+    }
+}
+
+/// The object-file arguments of `types`: every positional, minus a
+/// `--baseline PATH` value (which is a baseline file, not an object).
+fn object_args(args: &[String]) -> Vec<String> {
+    let bl_value_index = args.iter().position(|a| a == "--baseline").map(|i| i + 1);
+    args.iter()
+        .enumerate()
+        .skip(1)
+        .filter(|(i, a)| !a.starts_with("--") && bl_value_index != Some(*i))
+        .map(|(_, a)| a.clone())
+        .collect()
+}
+
 pub fn cmd_types(args: &[String]) -> i32 {
     if let Some(pos) = args.iter().position(|a| a == "--explain") {
         return cmd_explain(args.get(pos + 1));
@@ -309,11 +432,12 @@ pub fn cmd_types(args: &[String]) -> i32 {
             }
         }
     }
-    for a in args.iter().skip(1) {
-        if !a.starts_with("--") {
-            files.push(a.clone());
-        }
-    }
+    // The positional args are objects; a `--baseline PATH` value is NOT (measured: the
+    // first version skipped the flag's own index, so `.gate/types-baseline` went to
+    // the COFF loader and the CI form died with "object with a 28515-byte optional
+    // header", exit 2). Pinned by baseline_arg_split_pins_the_baseline_path_value.
+    let baseline = baseline_arg(args);
+    files.extend(object_args(args));
     if files.is_empty() {
         eprintln!("usage: rdec types --corpus");
         return 2;
@@ -399,6 +523,38 @@ pub fn cmd_types(args: &[String]) -> i32 {
         }
     );
     let red = c.sx_lie + c.w_lie + c.ptr_lie + c.flt_lie + c.void_lie;
+    if let Some(path) = baseline.as_deref() {
+        // The CI form: print the census, then ratchet it against the named, known
+        // lies. The scorer is untouched — every LIE line above is printed, and a
+        // rise OR a fall in any family is red, exactly like `.gate/unwrap-baseline`.
+        let want = match load_types_baseline(path) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("{e}");
+                return 2;
+            }
+        };
+        let got = families_of(&c.lies);
+        for (k, v) in got.iter() {
+            println!(
+                "  family {k} = {v} (baseline {})",
+                want.get(k).copied().unwrap_or(0)
+            );
+        }
+        let problems = ratchet_problems(&got, &want);
+        for p in problems.iter() {
+            println!("  RATCHET: {p}");
+        }
+        if problems.is_empty() {
+            println!("gate: types BASELINE GREEN ({red} named over-truth claims, 0 new, {path})");
+            return 0;
+        }
+        println!(
+            "gate: types BASELINE RED ({} ratchet problems; raw census red = {red})",
+            problems.len()
+        );
+        return 1;
+    }
     if red > 0 {
         println!("gate: types RED ({red} over-truth claims)");
         return 1;
@@ -444,8 +600,13 @@ fn cmd_explain(target: Option<&String>) -> i32 {
         if cols.len() < 3 || cols[0] != target {
             continue;
         }
-        if opt_wanted.is_some() && cols[1] != opt_wanted.as_deref().unwrap() {
-            continue;
+        // The old spelling guarded an `as_deref()` unwrap by hand with
+        // `opt_wanted.is_some()`, which is exactly the shape the panic-site ratchet
+        // exists to remove. Bind the value instead of asserting it is there.
+        if let Some(ow) = opt_wanted.as_deref() {
+            if cols[1] != ow {
+                continue;
+            }
         }
         let subjects = match m4::lift_all(&[cols[2].to_string()]) {
             Ok(s) => s,
@@ -1134,23 +1295,213 @@ pub fn types_selftest() -> i32 {
         "{}  admin: recovery sites (172) pinned",
         if sites { "ok   " } else { "FAIL " }
     );
+    // The CI form of the corpus gate (`types --corpus --baseline`) reads this file,
+    // so the battery pins it the way it pins its own size: a baseline that does not
+    // parse, is empty, or names a family the scorer cannot print turns the CI step
+    // into a printout that cannot go red.
+    let baseline_ok = match load_types_baseline(".gate/types-baseline") {
+        Ok(w) => w.keys().all(|k| !k.starts_with("UNMAPPED(")),
+        Err(e) => {
+            println!("(types baseline: {e})");
+            false
+        }
+    };
+    println!(
+        "{}  register: types baseline parses and names printable families",
+        if baseline_ok { "ok   " } else { "FAIL " }
+    );
 
     let n = oks.iter().filter(|(_, ok)| *ok).count();
     println!(
-        "fact-rule probes: {n}/{} ok (battery {}), register {}/{}",
+        "fact-rule probes: {n}/{} ok (battery {}), register {}/4",
         tyinfer::PROBE_RULES_TOTAL,
         oks.len(),
-        usize::from(claims) + usize::from(battery) + usize::from(sites),
-        3
+        usize::from(claims) + usize::from(battery) + usize::from(sites) + usize::from(baseline_ok),
     );
     let red = oks.iter().filter(|(_, ok)| !*ok).count()
         + usize::from(!claims)
         + usize::from(!battery)
-        + usize::from(!sites);
+        + usize::from(!sites)
+        + usize::from(!baseline_ok);
     if red > 0 || n < tyinfer::PROBE_RULES_TOTAL {
         println!("gate: selftest RED ({red} failed lines)");
         return 1;
     }
     println!("gate: selftest GREEN");
     0
+}
+
+#[cfg(test)]
+mod baseline_ratchet_tests {
+    // The CI step runs `types --corpus --baseline`, so the ratchet is the step that
+    // can go red. A ratchet that cannot go red is a comment. Each case below is run
+    // against the real comparator, and the two direction cases (RISE, FALL) are the
+    // ones that make it a ratchet rather than a printout.
+    use super::{
+        baseline_arg, families_of, lie_family, load_types_baseline, object_args, ratchet_problems,
+    };
+    use std::collections::BTreeMap;
+
+    fn map(pairs: &[(&str, usize)]) -> BTreeMap<String, usize> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), *v))
+            .collect::<BTreeMap<String, usize>>()
+    }
+
+    #[test]
+    fn every_lie_class_maps_to_a_family() {
+        // The five the scorer can print, plus the (ret) tag the scorer appends.
+        assert_eq!(
+            lie_family("gcd_loop#p0: prints signed over declared unsigned"),
+            "gcd_loop#p0|signedness"
+        );
+        assert_eq!(
+            lie_family("f (ret): reads w64 over declared w32"),
+            "f|width"
+        );
+        assert_eq!(
+            lie_family("f#p1: pointer claim over declared int"),
+            "f#p1|pointer"
+        );
+        assert_eq!(
+            lie_family("f#p2: float claim F64 over declared f32"),
+            "f#p2|float"
+        );
+        assert_eq!(
+            lie_family("carry_chain: return claim over declared void"),
+            "carry_chain|void-return"
+        );
+    }
+
+    #[test]
+    fn an_unmapped_lie_text_cannot_match_a_baseline_row() {
+        // A new lie CLASS has to be loud: the family it lands in is `UNMAPPED`, and
+        // no baseline can name it in advance, so the ratchet goes red on the shape.
+        // The census here has no carry_chain lie at all, so the comparator reports
+        // BOTH problems: the unnamed new family, and the family the baseline still
+        // allows 4 of. One red line per defect, not one per census.
+        let got = families_of(&["weird: did something new".to_string()]);
+        assert!(got.contains_key("UNMAPPED(did something new)"));
+        let problems = ratchet_problems(&got, &map(&[("carry_chain|void-return", 4)]));
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.starts_with("UNMAPPED(did something new)")
+                    && p.contains("NO baseline row")),
+            "{problems:?}"
+        );
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("carry_chain|void-return") && p.contains("census has 0")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn exact_match_is_green() {
+        let got = families_of(&vec![
+            "carry_chain: return claim over declared void"
+                .to_string();
+            4
+        ]);
+        assert_eq!(got.get("carry_chain|void-return"), Some(&4));
+        assert!(ratchet_problems(&got, &map(&[("carry_chain|void-return", 4)])).is_empty());
+    }
+
+    #[test]
+    fn a_rise_is_red() {
+        // The sabotage direction: one more void-return lie than the baseline names.
+        let got = families_of(&vec![
+            "carry_chain: return claim over declared void"
+                .to_string();
+            5
+        ]);
+        let problems = ratchet_problems(&got, &map(&[("carry_chain|void-return", 4)]));
+        assert_eq!(problems.len(), 1, "a rise must be red, got {problems:?}");
+        assert!(
+            problems[0].contains("NEW over-truth claims"),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_fall_is_red_too() {
+        // Fixed the family? The commit lowers the baseline in the same change —
+        // otherwise a silent drift turns a census into a memory.
+        let got = families_of(&vec![
+            "carry_chain: return claim over declared void"
+                .to_string();
+            3
+        ]);
+        let problems = ratchet_problems(&got, &map(&[("carry_chain|void-return", 4)]));
+        assert_eq!(problems.len(), 1, "a fall must be red, got {problems:?}");
+        assert!(problems[0].contains("lower the baseline"), "{problems:?}");
+        // And a family that went fully clean has no census line at all.
+        let clean = families_of(&[]);
+        let problems = ratchet_problems(&clean, &map(&[("carry_chain|void-return", 4)]));
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("census has 0"), "{problems:?}");
+    }
+
+    #[test]
+    fn a_new_family_with_no_row_is_red() {
+        let got = families_of(&[
+            "carry_chain: return claim over declared void".to_string(),
+            "cmov_loop#p0: prints unsigned over declared signed".to_string(),
+        ]);
+        let problems = ratchet_problems(&got, &map(&[("carry_chain|void-return", 1)]));
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("NO baseline row"), "{problems:?}");
+    }
+
+    #[test]
+    fn a_missing_or_empty_baseline_is_an_error() {
+        let dir = std::env::temp_dir().join("rdec-types-baseline-ratchet");
+        std::fs::create_dir_all(&dir).expect("temp dir for a unit test");
+        let missing = dir.join("definitely-not-here.tsv");
+        assert!(load_types_baseline(missing.to_str().expect("utf-8 path")).is_err());
+        let empty = dir.join("empty-baseline");
+        std::fs::write(&empty, "# only comments, so it checks nothing\n").expect("write");
+        let err = load_types_baseline(empty.to_str().expect("utf-8 path")).err();
+        assert!(
+            err.as_deref().map(|e| e.contains("empty")).unwrap_or(false),
+            "an empty baseline must be an error, got {err:?}"
+        );
+        let malformed = dir.join("bad-baseline");
+        std::fs::write(&malformed, "carry_chain|void-return four\n").expect("write");
+        assert!(load_types_baseline(malformed.to_str().expect("utf-8 path")).is_err());
+    }
+
+    #[test]
+    fn baseline_arg_split_pins_the_baseline_path_value() {
+        // Red-first, measured: the first wiring skipped the FLAG's index instead of
+        // its VALUE's, so `.gate/types-baseline` was handed to the lifter as an object
+        // and the CI form died with "object with a 28515-byte optional header", exit 2.
+        let argv = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
+        let ci = argv(&["types", "--corpus", "--baseline", ".gate/types-baseline"]);
+        assert_eq!(
+            object_args(&ci),
+            Vec::<String>::new(),
+            "the baseline path is not an object"
+        );
+        assert_eq!(
+            baseline_arg(&ci).as_deref(),
+            Some(".gate/types-baseline"),
+            "an explicit --baseline PATH is honoured"
+        );
+        // A bare `--baseline` takes the default path and adds no object either.
+        let bare = argv(&["types", "--corpus", "--baseline"]);
+        assert_eq!(baseline_arg(&bare).as_deref(), Some(".gate/types-baseline"));
+        assert_eq!(object_args(&bare), Vec::<String>::new());
+        // No flag at all: no baseline, and the positional objects survive in order.
+        let plain = argv(&["types", "--corpus", "a.obj", "b.obj"]);
+        assert_eq!(baseline_arg(&plain), None);
+        assert_eq!(
+            object_args(&plain),
+            vec!["a.obj".to_string(), "b.obj".to_string()]
+        );
+    }
 }

@@ -1,0 +1,23 @@
+# `rdec types --corpus --baseline` — the KNOWN over-truth claims of M6 type
+# recovery, counted per `subject|kind` family. The families and the counts are
+# produced by the scorer in `crates/cli/src/m6.rs` against `corpus/truth.tsv`
+# (measured 2026-11-08 in lane m6e at the merge of master d295999).
+#
+# Same rule as `.gate/unwrap-baseline`: a RISE is a red build (the pass invented a
+# claim it cannot witness), a FALL is red too (lower the number in this same
+# commit, so the census on disk cannot drift from the census in the code), and a
+# lie family with no row here is red by definition. `crates/cli/src/m6.rs`'s
+# `baseline_ratchet_tests` pins all four directions.
+#
+# The 4 rows below are ONE family: the `carry_chain` void-return lies (O0, O1, O2,
+# Oz — one per opt level; the file stem is the truth key, the function is `f`).
+# `corpus/src/carry_chain.c` declares
+# `void f(unsigned long a, unsigned long b, unsigned long *lo, unsigned long *hi)`;
+# in all four opt levels the tail reloads a spilled slot into RAX and the LIFTER
+# records `Return(value)` for a function that returns nothing. The type
+# pass then faithfully reports a claim over the RAX cell — the lie is in the IR
+# shape, and its owner is the lifter's void-return model, not type recovery. The
+# fix that closes this family is a lifter change (record a void return when the
+# tail value is a spilled slot with no reader, and have `verify` bound it); the fix
+# that is NOT allowed is a scorer that stops looking at declared-void sites.
+carry_chain|void-return 4

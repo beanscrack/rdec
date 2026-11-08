@@ -851,7 +851,13 @@ impl<'a> Emitter<'a> {
                 // int -> float conversion (cvtsi2sd from a signed source) emitted C that
                 // did not compile. No corpus function hits it, which is exactly why the
                 // hermetic test in crates/arch-x86/tests/float_abi.rs exists.
-                let s = "int64_t".to_string();
+                // The source's OWN signed type, at the width the interpreter
+                // truncates at: `(int64_t)` of a 32-bit `0xCB01F9D0` sign-extends to
+                // +3.4e9 where the machine reads -889000000 — the cast width is
+                // part of the conversion.
+                let s = c_ty(&src)
+                    .filter(|s| s.starts_with("int"))
+                    .unwrap_or_else(|| "int64_t".to_string());
                 match to {
                     Ty::Float { w: FWidth::F32 } => format!("(float)(({s})({x}))"),
                     _ => format!("(double)(({s})({x}))"),

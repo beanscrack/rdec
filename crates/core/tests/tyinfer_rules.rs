@@ -324,7 +324,7 @@ fn a_stored_width_bounds_the_stored_value() {
     // `mov dword [rbp-8], ecx` at -O0: the home is 4 bytes, and nothing wider
     // can reach an answer through it.
     let (mut f, c) = cells(2);
-    let (p, q) = (c[0], c[1]);
+    let p = c[0];
     let r = rsp(&mut f);
     let off = k(&mut f, (-8i64) as u64, Width::W64);
     let slot = bin(&mut f, BinOp::Add, Width::W64, r, off);

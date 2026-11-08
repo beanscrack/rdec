@@ -1841,6 +1841,45 @@ impl<'a> Lifter<'a> {
         self.set_xmm_hi(i, z);
     }
 
+    /// Splice `bits` (32/64 bits) into the low cell of lane `lane`: the
+    /// destination register is NOT zeroed, its untouched lane survive —
+    /// that merge rule is what a scalar write is on silicon. The arithmetic
+    /// is lane-exact, not a lane-swap:
+    ///
+    /// - movq xmm, r64: 16 ones = `lo&~mask | bits<<0`
+    /// - pinsrd xmm, r32, imm: 0xfffffff = 32 ones = `lo&~(mask<<0) | zext32<<0`
+    ///
+    /// movq's mask IS all 64 low bits, so the `>>shift`/`<<shift` is 0 there
+    /// and the arm's rule drops out of the arithmetic. No model cell is
+    /// faked; every lane is a W64 cell, and the shift moves mask and value
+    /// together.
+    fn splice_lane(&mut self, d: u8, bits: VId, lane: u32, wide: bool) {
+        let z32;
+        let (mask, val) = if wide {
+            (
+                self.const_of(u64::MAX, Width::W64),
+                self.narrow(bits, Width::W64),
+            )
+        } else {
+            let lo = self.narrow(bits, Width::W32);
+            z32 = self.cast(CastKind::ZExt, lo, Width::W64);
+            (self.const_of(0xffff_ffff, Width::W64), z32)
+        };
+        let ones = self.const_of(u64::MAX, Width::W64);
+        let inv = self.bin(BinOp::Xor, mask, ones);
+        if lane == 0 {
+            let lo = self.xmm(d);
+            let keep = self.bin(BinOp::And, lo, inv);
+            let new_l = self.bin(BinOp::Or, keep, val);
+            self.set_xmm(d, new_l);
+        } else {
+            let hi = self.xmm_hi(d);
+            let keep = self.bin(BinOp::And, hi, inv);
+            let new_h = self.bin(BinOp::Or, keep, val);
+            self.set_xmm_hi(d, new_h);
+        }
+    }
+
     /// Load 16 bytes at `a` into the pair (lo cell, hi cell): two W64 loads,
     /// lo at addr and hi at addr+8 - little-endian lane order, which is what
     /// the hardware's byte order is. The model does not charge for alignment:
@@ -2458,11 +2497,6 @@ impl<'a> Lifter<'a> {
             "movd" | "movq" => {
                 let n = if nm == "movd" { Width::W32 } else { Width::W64 };
                 if let Some(d) = self.xmm_op(ins, 0) {
-                    // gpr/memory -> xmm. The low 32/64 bits land in the low
-                    // cell and the rest of the register is zeroed: ZExt to the
-                    // cell width is the 63:32 half, and the explicit high-cell
-                    // zero below is the 127:64 half (Intel: the destination is
-                    // zero-extended to the full 128 bits).
                     let v = match self.src(ins, 1, n) {
                         Some(v) => v,
                         None => {
@@ -2470,9 +2504,21 @@ impl<'a> Lifter<'a> {
                             return;
                         }
                     };
-                    let up = self.cast(CastKind::ZExt, v, Width::W64);
-                    self.set_xmm(d, up);
-                    self.zero_xmm_hi(d);
+                    if nm == "movq" {
+                        // `movq xmm, r/m64` MERGES: the low 64 bits are
+                        // written, the destination's high lane survives
+                        // (Intel Vol.2A). This is the toolchain's
+                        // int-to-XMM-pair move.
+                        self.splice_lane(d, v, 0, true);
+                    } else {
+                        // `movd xmm, r/m32` zero-extends to the full 128
+                        // bits: ZExt to cell width is the 63:32 half, the
+                        // explicit high-cell zero is the 127:64 half.
+                        let up = self.cast(CastKind::ZExt, v, Width::W64);
+                        self.set_xmm(d, up);
+                        self.zero_xmm_hi(d);
+                    }
+                    self.rep.sse_packed += 1;
                     return;
                 }
                 if let Some(s) = self.xmm_op(ins, 1) {
@@ -2506,7 +2552,11 @@ impl<'a> Lifter<'a> {
         }
         // ---- conversions --------------------------------------------------
         if nm == "cvtsi2sd" || nm == "cvtsi2ss" {
-            let fw = if nm == "cvtsi2sd" { F64 } else { F32 };
+            let (fw, is64) = if nm == "cvtsi2sd" {
+                (F64, true)
+            } else {
+                (F32, false)
+            };
             let Some(d) = self.xmm_op(ins, 0) else {
                 self.sse_gap(nm, "no XMM destination");
                 return;
@@ -2542,6 +2592,17 @@ impl<'a> Lifter<'a> {
                     return;
                 }
             };
+            // `cvtsi2ss` with a 64-bit source is the SSSE3 `cvtsi2ssq`
+            // extension: the model speaks SSE1-plus, so the 64-bit source
+            // form is refused as a named gap, exactly like the `sd`-named
+            // 64-bit MOV forms. The 32-bit source keeps the rule above.
+            if !is64 && sw == Width::W64 {
+                self.sse_gap(
+                    nm,
+                    "cvtsi2ss is SSE1 32-bit: REX.W source is cvtsi2ssq (SSSE3)",
+                );
+                return;
+            }
             let sv = self.cast_ty(CastKind::Bitcast, v, Ty::int(sw, rdec_core::ty::Sx::Signed));
             let f = self.cast_ty(CastKind::SIToFp, sv, Ty::Float { w: fw });
             let bits = self.fbits(f);
@@ -2597,6 +2658,26 @@ impl<'a> Lifter<'a> {
             let r = self.cast_ty(k, v, Ty::Float { w: to });
             let bits = self.fbits(r);
             self.set_xmm(d, bits);
+            return;
+        }
+        if nm == "punpcklqdq" {
+            // The lane-pair packing,Dst = (lo lane of Dst, lo lane of src):
+            // the low 64 bits of the dest stay, the low 64 bits of the source
+            // move to the high lane. This is also the standard
+            // float->int/reinterpret trick's second half: the pair's halves
+            // are model cells in their own right, and "lane" talks about
+            // memory-address lanes, not bytes.
+            let Some(d) = self.xmm_op(ins, 0) else {
+                self.sse_gap(nm, "no XMM destination");
+                return;
+            };
+            let Some(s) = self.xmm_op(ins, 1) else {
+                self.sse_gap(nm, "punpcklqdq needs an XMM source");
+                return;
+            };
+            let slo = self.xmm(s);
+            self.set_xmm_hi(d, slo);
+            self.rep.sse_packed += 1;
             return;
         }
         if matches!(nm, "cvtsd2si" | "cvtss2si") {
@@ -2694,6 +2775,7 @@ impl<'a> Lifter<'a> {
                 | "movq"
                 | "movups"
                 | "movupd"
+                | "punpcklqdq"
                 | "addsd"
                 | "subsd"
                 | "mulsd"

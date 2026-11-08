@@ -89,6 +89,13 @@ fn main() {
         },
         "pe-info" => cmd_pe_info(&args),
         "pe-functions" => cmd_pe_functions(&args),
+        "pe-discover" => match m1::cmd_pe_discover(&args) {
+            Ok(rc) => rc,
+            Err(e) => {
+                eprintln!("{e}");
+                2
+            }
+        },
         "fuzz" => match fuzz::cmd_fuzz(&args) {
             Ok(rc) => rc,
             Err(e) => {
@@ -124,6 +131,8 @@ fn print_help() {
          \x20 demangle --cpp                  M8 gate: MSVC C++ names vs llvm-nm\n\
          \x20 types --corpus                  M6 gate: recovered signatures vs corpus/truth.tsv;\n\
          \x20   [--explain NAME]                claims printed with their machine-fact witnesses\n\
+         \x20   [--baseline PATH]               CI form: same census, exit code ratcheted\n\
+         \x20                                   against the named known lies (.gate/types-baseline)\n\
          \x20 types --selftest                  the forcing drill: rule probes + register/admin gates\n\
          \x20 cpp --corpus                    M8 gate: the C++ corpus through the C\n\
          \x20                                   pipeline - demangled names, emitted C,\n\

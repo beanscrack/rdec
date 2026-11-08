@@ -718,9 +718,7 @@ impl<'a> Hole<'a> {
         // Union rule: a slot written as float and as int is a union, not a
         // signature.
         if let Some(k) = self.value_slot.get(&seed) {
-            if self.slots.get(k).map(|s| s.conflicted()).unwrap_or(false)
-                && claim.flt.is_some()
-            {
+            if self.slots.get(k).map(|s| s.conflicted()).unwrap_or(false) && claim.flt.is_some() {
                 claim.flt = None;
                 claim.slot_conflict = true;
             }

@@ -996,3 +996,147 @@ pub fn cmd_lift(args: &[String]) -> Result<i32, String> {
         Ok(1)
     }
 }
+
+/// Discover a whole PE32+ image, not one object section — the M7 step that
+/// makes `discover` speak linked binaries.
+///
+/// An object seeds descent from exports and relocations; a linked image has
+/// neither (the probe EXE prints `no symbols` under `llvm-nm`). The image's
+/// own function-start evidence is its `.pdata` unwind table: the linker's
+/// record of every function that has a teardown, plus the entry point (DLL
+/// and EXE entry code has no unwind entry by convention). Chained and
+/// version-refused `.pdata` entries are NOT seeds — they stay counted, the
+/// same partition `pe-functions` prints.
+///
+/// The v1 sweep runs over `.text` only. Functions seeded outside `.text`
+/// (none in the probe) are printed, not claimed, so the coverage number is
+/// the size of exactly one range the same way `objdump-check` pins objects.
+pub fn cmd_pe_discover(args: &[String]) -> Result<i32, String> {
+    let path = match args.get(1) {
+        Some(p) => p.clone(),
+        None => return Err("usage: rdec pe-discover <image.exe|image.dll>".to_string()),
+    };
+    let bytes = std::fs::read(&path).map_err(|e| format!("{path}: {e}"))?;
+    let img = rdec_arch_x86::pe::PeImage::load(&bytes, &path)?;
+    let text = img
+        .section_named(".text")
+        .ok_or_else(|| format!("{path}: image has no .text section"))?;
+    let text_start = img.va(text.virtual_address);
+    // The sweep covers what the loader read: raw bytes past virtual_size are
+    // alignment padding, and `read_at` refuses past raw_data. The printed
+    // `.text ..` span is that covered window, not the section header's number.
+    let text_len = std::cmp::min(text.virtual_size, text.size_of_raw_data) as usize;
+    let text_bytes = img
+        .read_at(text.virtual_address, text_len)
+        .map_err(|e| format!("{path}: .text: {e}"))?;
+    let text_end = text_start + text_bytes.len() as u64;
+
+    // Seed source: the EXCEPTION directory (`.pdata` is its section), read
+    // the way `pe-functions` reads it. No `has_pdata` helper exists; the
+    // directory is the fact.
+    let pdata = img
+        .data_directories
+        .iter()
+        .find(|d| d.name == "EXCEPTION" && d.rva != 0 && d.size >= 12);
+
+    let mut entries: Vec<u64> = Vec::new();
+    let census;
+    if let Some(_dir) = pdata {
+        match rdec_arch_x86::pdata::UnwindTable::read(&img) {
+            Ok(t) => {
+                entries.extend(t.functions().map(|(begin, _end)| img.va(begin)));
+                census = format!(
+                    ".pdata: {} function seeds, {} chained refusals, {} version refusals",
+                    t.functions().count(),
+                    t.chaining_refusals().len(),
+                    t.version_refusals().len()
+                );
+            }
+            Err(e) => census = format!(".pdata read refused: {e} — entry point only"),
+        }
+    } else {
+        census = "no .pdata directory — entry point only".to_string();
+    }
+    let entry_in_text = text_start <= img.entry_va() && img.entry_va() < text_end;
+    if entry_in_text {
+        entries.push(img.entry_va());
+    }
+    entries.sort_unstable();
+    entries.dedup();
+
+    // One range (v1: .text), entry seeds and no call seeds; the descent
+    // finds calls inside the range itself from the immediates.
+    let ranges = [rdec_arch_x86::discover::Code {
+        base: text_start,
+        bytes: text_bytes,
+    }];
+    let mut seeds = std::collections::HashMap::new();
+    seeds.insert(0usize, (entries.clone(), Vec::new()));
+    let plan = rdec_arch_x86::discover::discover_all(&ranges, &seeds);
+
+    println!("{path}: PE32+ image, base {:#x}", img.image_base);
+    println!("  seeds: {census}");
+    println!(
+        "  {} entry seeds, entry point {:#x} ({})",
+        entries.len(),
+        img.entry_va(),
+        if entry_in_text {
+            "in .text"
+        } else {
+            "outside .text: not seeded"
+        }
+    );
+    println!(
+        "  .text {text_start:#x}..{text_end:#x} ({} bytes): functions {},          blocks {}, insns {}, covered {} bytes",
+        text.virtual_size,
+        plan.functions.len(),
+        plan.blocks.len(),
+        plan.insns.len(),
+        plan.covered_bytes()
+    );
+    let mut gap_line = String::new();
+    for (name, g) in [
+        (
+            "indirect-branch",
+            rdec_arch_x86::discover::Gap::IndirectBranch,
+        ),
+        ("partial-table", rdec_arch_x86::discover::Gap::PartialTable),
+        ("indirect-call", rdec_arch_x86::discover::Gap::IndirectCall),
+        ("external-call", rdec_arch_x86::discover::Gap::ExternalCall),
+        ("decoder-refusal", rdec_arch_x86::discover::Gap::Undecodable),
+        ("outside-code", rdec_arch_x86::discover::Gap::OutsideCode),
+    ] {
+        let n = plan.gap_count(g);
+        if n > 0 {
+            gap_line.push_str(&format!("{name}:{n} "));
+        }
+    }
+    println!(
+        "  gaps: {}",
+        if gap_line.is_empty() {
+            "none".to_string()
+        } else {
+            gap_line.trim_end().to_string()
+        }
+    );
+    println!(
+        "  overlap_free: {}",
+        rdec_arch_x86::discover::overlap_free(&plan.insns)
+    );
+    let outside: Vec<u64> = plan
+        .functions
+        .iter()
+        .filter(|f| !(text_start <= **f && **f < text_end))
+        .copied()
+        .collect();
+    if !outside.is_empty() {
+        println!(
+            "  {} seeds landed outside .text (not claimed):",
+            outside.len()
+        );
+        for f in outside.iter().take(10) {
+            println!("    {f:#x}");
+        }
+    }
+    Ok(0)
+}
