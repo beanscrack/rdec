@@ -592,11 +592,11 @@ fn cbw_and_cdqe_stay_refused_until_a_corpus_site_exists() {
 /// separate "CF preserved" from "CF forced": F1 rules out forced-0, F4 rules out
 /// forced-1.
 ///
-/// THOSE ARE SILICON ANSWERS, and the model does not reproduce F1/F2 — see the
-/// flag block in the loop: CF after `inc`/`dec` is left UNDEFINED by this model
-/// (SS1.2 item 3), the IR faults on reading it, and the emitter refuses the whole
-/// function. The numbers asserted per case are the post-pass interpreter values,
-/// with the silicon number in each case's own label.
+/// THOSE ARE SILICON ANSWERS, and the model reproduces all four: CF after
+/// `inc`/`dec` is the PREVIOUS flags value's CF, carried in the flags node as
+/// `cf_in` (SS1.2 item 3, closed), so F1 answers 12 and F2 answers 10. The
+/// emitter's rule for a carried CF is `getflag(CF, cf_in)`, which the fusion
+/// pass threads back to the producer — `cmp ecx,edx`'s `ecx < edx` above.
 ///
 /// F3 is the signed-overflow half: 0x7FFFFFFF + 1 lands on INT_MIN, `seto`
 /// answers 1, and the cell wraps to 0x80000000 — a saturating or
@@ -643,37 +643,43 @@ fn inc_dec_on_memory_write_the_cell_back_and_preserve_cf() {
             body(&[
                 cells[0],
                 cells[1],
-                &[0x48, 0x89, 0xE1][..], // mov rcx,rsp
                 setcf,
+                &[0x48, 0x89, 0xE1][..], // mov rcx,rsp — AFTER the cmp on purpose: it
+                // overwrites ECX, the comparison's first
+                // operand, so a cmp placed after it compares a
+                // stack address against the input and CF is a
+                // constant 0 (measured: `cmpult 0x7ffe0, edx`).
+                // A first version of this fixture had that
+                // order, and its "CF = 1" leg proved nothing.
                 &[0xFF, 0x41, 0x08], // inc dword [rcx+8]
                 read_cf,
                 &[0x03, 0x41, 0x08], // add eax, [rcx+8]
             ]),
-            10,
+            12,
             [0, 1, 0, 0],
-            "F1: cell 9->10; silicon answers 12 because CF is PRESERVED, the model leaves \
-             it undefined and reads of it refuse",
+            "F1: cell 9->10, CF preserved as 1 and read as 2*CF = 12 — the silicon number, \
+             now the model's: eax = 2*CF + cell",
         ),
         (
             body(&[
                 cells[0],
                 cells[1],
-                &[0x48, 0x89, 0xE1][..],
                 setcf,
+                &[0x48, 0x89, 0xE1][..],
                 &[0xFF, 0x49, 0x08], // dec dword [rcx+8]
                 read_cf,
                 &[0x03, 0x41, 0x08], // add eax, [rcx+8]
             ]),
-            8,
+            10,
             [0, 1, 0, 0],
-            "F2: cell 9->8; silicon answers 10 (CF preserved as 1), same undefined-CF story",
+            "F2: cell 9->8, CF preserved as 1 → 2*CF + cell = 10, the silicon number",
         ),
         (
             body(&[
                 &[0xC7, 0x04, 0x24, 0xFF, 0xFF, 0xFF, 0x7F][..], // mov dword [rsp], 0x7FFFFFFF
-                &[0x48, 0x89, 0xE1][..],                         // mov rcx,rsp
                 setcf,
-                &[0xFF, 0x01], // inc dword [rcx]
+                &[0x48, 0x89, 0xE1][..], // mov rcx,rsp
+                &[0xFF, 0x01],           // inc dword [rcx]
                 read_of,
                 &[0x03, 0x01], // add eax, [rcx]
             ]),
@@ -684,8 +690,8 @@ fn inc_dec_on_memory_write_the_cell_back_and_preserve_cf() {
         (
             body(&[
                 cells[0],
-                &[0x48, 0x89, 0xE1][..],
                 setcf,
+                &[0x48, 0x89, 0xE1][..],
                 &[0xFF, 0x01], // inc dword [rcx]
                 read_cf,
                 &[0x03, 0x01], // add eax, [rcx]
@@ -721,33 +727,52 @@ fn inc_dec_on_memory_write_the_cell_back_and_preserve_cf() {
             other => panic!("{why}: unexpected {other:?}"),
         }
 
-        // The flag half of the contract, and the reason the numbers above are
-        // not the silicon numbers: a function that READS CF after an inc/dec is
-        // REFUSED by the emitter, naming the gap. Silicon preserves CF, the
-        // model leaves it undefined, and `fuse`'s own rule is that an undefined
-        // bit keeps its getflag so the emitter refuses. Measured on this shape:
-        //     Refusal { at: 19, reason: "opaque: CF after inc/dec needs the
-        //                previous flags as an operand (SS1.2 item 3)" }
-        // The interpreter's 0 for CF (the pipeline values above) is therefore
-        // unreachable in any emitted function - a program that reads CF after
-        // inc/dec never emits, so T2 can never compare a wrong CF against C.
-        // Closing SS1.2 item 3 (thread the previous flags in as an operand) is
-        // what would let F1 answer silicon's 12.
-        let reads_cf = why.contains("CF");
-        match emit_c(&f) {
-            Err(rs) => {
-                let named = rs.iter().any(|r| r.reason.contains("SS1.2 item 3"));
-                assert!(
-                    reads_cf && named,
-                    "{why}: expected the SS1.2 item 3 refusal (silicon preserves CF); got {rs:?}"
-                );
-            }
-            Ok(_) => assert!(
-                !reads_cf,
-                "{why}: a function that reads CF after inc/dec EMITTED C — the gap leaked \
-                 into generated code, where a silent 0 would outlive any test"
-            ),
+        // The flag half of the contract: a function that READS CF after an
+        // inc/dec must now EMIT, because the flags node carries the previous
+        // flags value (`cf_in`) and the fusion pass threads the read back to the
+        // producer. Before this closed, the emitter refused the whole function
+        // with "CF after inc/dec needs the previous flags as an operand
+        // (SS1.2 item 3)" — the refusal was the only thing keeping the
+        // interpreter's silent 0 out of generated code. It is the value asserted
+        // per case above that now carries that guarantee, so the emit has to
+        // happen for the CF rows: a refusal here means the threading regressed
+        // and the numbers above are being produced by the old undefined path.
+        if let Err(rs) = emit_c(&f) {
+            assert!(
+                !why.contains("CF"),
+                "{why}: a CF-preserving inc/dec refused to emit: {rs:?}"
+            );
         }
+    }
+}
+
+/// CF is preserved, not invented. With NO flag producer before the `inc` there
+/// is no previous CF to preserve — silicon's CF at function entry is the
+/// caller's, which this model does not know — so a function that reads CF there
+/// must REFUSE, and must not emit a 0. This is the direction the threading must
+/// not break: `cf_in` is `None` exactly when nothing produced flags.
+#[test]
+fn cf_with_no_previous_flag_producer_refuses_instead_of_inventing_zero() {
+    let bytes: Vec<u8> = [
+        &[0x48u8, 0xC7, 0x04, 0x24, 0x05, 0x00, 0x00, 0x00][..], // mov qword [rsp], 5
+        &[0x48, 0x89, 0xE1][..],                                 // mov rcx,rsp
+        &[0xFF, 0x01][..],                                       // inc dword [rcx]
+        &[0x0F, 0x92, 0xC0, 0x0F, 0xB6, 0xC0][..], // setc al; movzx eax,al  -- eax = CF, no prior flags
+        &[0xC3][..],                               // ret
+    ]
+    .concat();
+    let (f, rep) = lift(&bytes);
+    verify_ssa(&f).expect("valid SSA");
+    assert_eq!(rep.gaps, 0, "the inc itself is modelled");
+    match emit_c(&f) {
+        Ok(_) => panic!(
+            "invented a CF at function entry, where silicon's CF is the caller's and the \
+             model has no producer for it: a 0 would be emitted as the preserved flag"
+        ),
+        Err(rs) => assert!(
+            rs.iter().any(|r| r.reason.contains("inc/dec")),
+            "the refusal must name the carried CF, not something else: {rs:?}"
+        ),
     }
 }
 
@@ -1067,4 +1092,178 @@ fn a_relocation_that_names_no_address_says_so_instead_of_blaming_the_operand() {
             .any(|t| t.contains("flag setting with an unmodelled first operand")),
         "the old key blamed the lifter for an address-space gap: {texts:?}"
     );
+}
+
+fn lift_raw(bytes: &[u8]) -> (Function, Report) {
+    let owned = bytes.to_vec();
+    let ranges = [Code {
+        base: 0,
+        bytes: owned.as_slice(),
+    }];
+    let mut seeds: std::collections::HashMap<usize, (Vec<u64>, Vec<u64>)> =
+        std::collections::HashMap::new();
+    seeds.insert(0, (vec![0u64; 4], vec![]));
+    let plan = discover_all(&ranges, &seeds);
+    let start = plan.functions[0];
+    lift_one(
+        "f",
+        &owned,
+        0,
+        start,
+        owned.len() as u64,
+        &plan,
+        &Default::default(),
+    )
+}
+
+/// The interpreter's OWN carried-CF read, with no pass to thread it. The
+/// post-pass fixture above proves the fusion threading and never reaches this
+/// code: after the pass the CF read is a `cmpult` and the inc's flags node is
+/// dead. Measured: with the interpreter's `cf_in` read sabotaged to
+/// `Some(false)`, that fixture stayed GREEN (the pass threads the read itself),
+/// so without this test the interpreter's arm has zero coverage. A raw run of
+/// the same bytes is where the interpreter answers, and it must answer 12.
+#[test]
+fn raw_ir_reads_the_carried_cf_with_no_pass_to_thread_it() {
+    let bytes: Vec<u8> = [
+        &[0x48u8, 0x83, 0xEC, 0x20][..], // sub rsp,0x20
+        &[
+            0x48, 0xC7, 0x44, 0x24, 0x08, 0x09, 0x00, 0x00, 0x00, // mov qword [rsp+8], 9
+        ][..],
+        &[0x39, 0xD1][..],       // cmp ecx,edx  (ecx=0, edx=1 -> CF=1)
+        &[0x48, 0x89, 0xE1][..], // mov rcx,rsp
+        &[0xFF, 0x41, 0x08][..], // inc dword [rcx+8]  (9 -> 10)
+        &[0x0F, 0x92, 0xC0, 0x0F, 0xB6, 0xC0, 0x01, 0xC0][..], // setc al; movzx; add eax,eax
+        &[0x03, 0x41, 0x08][..], // add eax, [rcx+8]
+        &[0x48, 0x83, 0xC4, 0x20][..], // add rsp,0x20
+        &[0xC3][..],             // ret
+    ]
+    .concat();
+    let (f, rep) = lift_raw(&bytes);
+    verify_ssa(&f).expect("valid SSA");
+    assert_eq!(rep.gaps, 0, "the shape lifts with no gap");
+    match answer(&f, &[0, 1, 0, 0]) {
+        Outcome::Ret(v) => assert_eq!(
+            v.bits(),
+            12,
+            "raw IR: the interpreter reads CF out of the flags value the inc carries \
+             (the comparison's CF), the same 12 the post-pass fixture answers"
+        ),
+        Outcome::Fault(fl) => panic!(
+            "the carried CF must be readable on raw IR; faulted {fl:?} — opaque texts: {:?}",
+            opaque_texts(&f)
+        ),
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+/// The register form of the same contract: `cmp ecx,edx ; inc eax ; setc al`.
+/// `inc` writes a register, not a cell, and the CF it preserves is the
+/// comparison's. Register `inc` reached this code through a different lifter
+/// arm than the memory form, so the arm is pinned on its own.
+#[test]
+fn raw_ir_register_inc_carries_cf_to_a_later_read() {
+    let bytes: Vec<u8> = [
+        &[0x39u8, 0xD1][..],     // cmp ecx,edx  (ecx=0, edx=1 -> CF=1)
+        &[0xFF, 0xC0][..],       // inc eax      (0 -> 1)
+        &[0x0F, 0x92, 0xC0][..], // setc al  -> eax's low byte = CF
+        &[0x0F, 0xB6, 0xC0][..], // movzx eax,al
+        &[0xC3][..],             // ret
+    ]
+    .concat();
+    let (f, rep) = lift_raw(&bytes);
+    verify_ssa(&f).expect("valid SSA");
+    assert_eq!(
+        rep.gaps, 0,
+        "register inc is modelled; opcodes: 39D1 FFC0 0F92C0 0FB6C0"
+    );
+    match answer(&f, &[0, 1, 0, 0]) {
+        Outcome::Ret(v) => assert_eq!(
+            v.bits(),
+            1,
+            "the comparison's CF must survive the register inc into the later setc"
+        ),
+        Outcome::Fault(fl) => panic!("the carried CF must be readable; faulted {fl:?}"),
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+/// The limit the leg's `lift` gate drew, pinned in one function. CF is preserved
+/// WITHIN a basic block; across a join there is no value to carry, because SSA
+/// has no flag phis (SS1.2 item 2). Shape:
+///
+/// ```text
+/// bb0: sub rsp,0x20 ; mov rcx,rsp ; cmp ecx,edx ; je L2
+/// bb1: inc dword [rcx]      ; jmp L3
+/// bb2: inc dword [rcx+4]       (the `je` target)
+/// L3:  inc dword [rcx+8] ; setc al ; movzx eax,al ; add rsp,0x20 ; ret
+/// ```
+///
+/// L3 has two predecessors, so a `cf_in` naming a flags value defined in bb1 (or
+/// bb2) is a use its block does not dominate. The MSVC leg's `lift` gate found
+/// exactly that (`%63 defined in bb5 does not dominate use in bb8`, in
+/// `early_returns.Od.obj :: $LN10`) when the lifter carried the flags value
+/// across joins unconditionally. Here the lifter must emit NO carried value, the
+/// IR must verify, and reading CF at the join must REFUSE — the comparison's CF
+/// is true on one path and undefined on the other, and answering either way
+/// invents a fact the machine only has per-path.
+#[test]
+fn cf_is_carried_within_a_block_and_not_across_a_join() {
+    // Offsets: `FF 01` is 2 bytes and `FF 41 04` is 3, so L1=11, L2=15, L3=18.
+    // (A first version counted L2 as 4 bytes, the jump targets landed
+    // mid-instruction, and the decoder desynced into `ror` gaps.)
+    let bytes: Vec<u8> = [
+        &[0x48u8, 0x83, 0xEC, 0x20][..], // 0:  sub rsp,0x20
+        &[0x48, 0x89, 0xE1][..],         // 4:  mov rcx,rsp
+        &[0x39, 0xD1][..],               // 7:  cmp ecx,edx
+        &[0x74, 0x04][..],               // 9:  je  L2 (11+4 = 15)
+        &[0xFF, 0x01][..],               // 11: L1: inc dword [rcx]
+        &[0xEB, 0x03][..],               // 13: jmp L3 (15+3 = 18)
+        &[0xFF, 0x41, 0x04][..],         // 15: L2: inc dword [rcx+4]
+        &[0xFF, 0x41, 0x08][..],         // 18: L3: inc dword [rcx+8]
+        &[0x0F, 0x92, 0xC0][..],         // 21: setc al
+        &[0x0F, 0xB6, 0xC0][..],         // 24: movzx eax,al
+        &[0x48, 0x83, 0xC4, 0x20][..],   // 27: add rsp,0x20
+        &[0xC3][..],                     // 31: ret
+    ]
+    .concat();
+    let (f, _) = lift_raw(&bytes);
+    // The IR must be structurally sound: this is the assertion that catches a
+    // carried CF across the join, which is a hard verifier error, not a refusal.
+    rdec_core::verify::verify_ssa(&f)
+        .unwrap_or_else(|e| panic!("carried CF across a join is a hard SSA error: {e:?}"));
+    assert!(
+        f.blocks.len() >= 3,
+        "the shape must have a join (bb0, two paths, L3); blocks lifted: {}",
+        f.blocks.len()
+    );
+    match emit_c(&f) {
+        Ok(_) => panic!(
+            "emitted C that answers CF at a join: one path has the comparison's CF, the \
+             other has none, and SSA has no flag phi to merge them (SS1.2 item 2)"
+        ),
+        Err(rs) => {
+            // Measured refusal texts for this shape, both honest gaps:
+            //     "flags value Sub { a: 4, b: 5, borrow: false } survived flag
+            //      elimination"   (a pre-existing emitter conservatism: the frame
+            //      `sub rsp,0x20`'s flags def, refused as a surviving flags value)
+            // and the CF read at the join, which lowers to
+            //     opaque "CF after inc/dec with no previous flag producer:
+            //             silicon's CF is the caller's and this model has no
+            //             value for it"
+            // The second is what this fixture is about. The first refuses the
+            // SAME function, and the guarantee under test is that no C is
+            // emitted at all — a specific text is asserted when the pipeline
+            // reaches it, and any named gap is accepted as a refusal.
+            let text: String = rs
+                .iter()
+                .map(|r| r.reason.to_string())
+                .collect::<Vec<_>>()
+                .join(" | ");
+            assert!(
+                text.contains("inc/dec") || text.contains("survived flag elimination"),
+                "the refusal must be a named gap, not silence: {text}"
+            );
+        }
+    }
 }

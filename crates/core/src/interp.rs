@@ -1333,7 +1333,7 @@ impl<'a> Interp<'a> {
                 d.sf = Some(bit(res, w.bits() - 1));
                 d.of = Some(x == 1u64 << (w.bits() - 1));
             }
-            FlagsOp::Inc { a } | FlagsOp::Dec { a } => {
+            FlagsOp::Inc { a, cf_in } | FlagsOp::Dec { a, cf_in } => {
                 let x = g(a)?;
                 let w = self.width_of(a);
                 let inc = matches!(fo, FlagsOp::Inc { .. });
@@ -1342,9 +1342,18 @@ impl<'a> Interp<'a> {
                 } else {
                     w.trunc(x.wrapping_sub(1), false)
                 };
-                // CF preserved; the IR cannot express that (no prev operand), so
-                // it is undefined here and a read of it is a recorded event.
-                d.cf = None;
+                // CF is PRESERVED across inc/dec, and the flags node carries the
+                // value it preserves: read the CF out of THAT value. With none
+                // carried there is nothing to preserve — silicon's CF at function
+                // entry is the caller's — so it stays undefined and a read of it
+                // faults, rather than answering 0.
+                d.cf = match cf_in {
+                    Some(p) => match self.get(p) {
+                        Some(Val::Fg(bits)) => bits.cf,
+                        _ => None,
+                    },
+                    None => None,
+                };
                 d.pf = Some(parity(res));
                 d.af = Some(((x ^ res ^ 1) >> 4) & 1 == 1);
                 d.zf = Some(res == 0);

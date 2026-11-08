@@ -302,13 +302,21 @@ pub enum FlagsOp {
     Neg {
         a: VId,
     },
-    /// a + 1: CF unchanged
+    /// a + 1: CF PRESERVED, OF = (a == INT_MAX), rest from the result.
+    /// CF is architecturally the PREVIOUS flags value's CF, so that value is an
+    /// operand: `cf_in` is the flags value this `inc` continues, or `None` when
+    /// nothing produced flags (function entry) — where silicon's CF is the
+    /// caller's, this model has no value for it, and reading CF faults rather
+    /// than answering 0.
     Inc {
         a: VId,
+        cf_in: Option<VId>,
     },
-    /// a - 1: CF unchanged
+    /// a - 1: CF PRESERVED, OF = (a == INT_MIN), rest from the result. Same
+    /// `cf_in` contract as `Inc`.
     Dec {
         a: VId,
+        cf_in: Option<VId>,
     },
     /// a * b, full width: CF/OF = high word != sign-extension of low
     Mul {
@@ -473,7 +481,13 @@ impl Op {
                 | FlagsOp::Shr { a, b }
                 | FlagsOp::Sar { a, b }
                 | FlagsOp::Mul { a, b, .. } => out.extend([a, b]),
-                FlagsOp::Neg { a } | FlagsOp::Inc { a } | FlagsOp::Dec { a } => out.push(a),
+                FlagsOp::Neg { a } => out.push(a),
+                // `cf_in` is a real SSA use: the preserved CF must not be
+                // dead-code-eliminated out from under the node that carries it.
+                FlagsOp::Inc { a, cf_in } | FlagsOp::Dec { a, cf_in } => {
+                    out.push(a);
+                    out.extend(cf_in);
+                }
             },
             Op::GetFlag(_, f) => out.push(f),
             Op::Load(_, a) => out.push(a),

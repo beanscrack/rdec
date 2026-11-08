@@ -47,6 +47,11 @@ pub enum SO {
     Cmp(IntCmp, Tm, Tm),
     Un(UnOp, Tm),
     Cast(CastKind, Ty, Tm),
+    /// Read one bit of an existing flags value. The carrier for a CF an
+    /// instruction PRESERVES (`inc`/`dec`): the lowering says "the previous
+    /// flags' CF", the pass splices it to `Op::GetFlag`, and the next fixpoint
+    /// round lowers THAT read by its own producer's rule.
+    Flag(Flag, VId),
     /// A loud gap: the IR cannot express this, so it says so (SS1.5). A gap
     /// makes the function E0; it is never a silent zero.
     Gap(&'static str),
@@ -124,6 +129,10 @@ impl SB {
     fn opaque(&mut self, why: &'static str) -> Tm {
         self.push(SO::Gap(why), Ty::Bool)
     }
+    /// "Bit `fl` of the flags value `v`" — the preserved-CF carrier.
+    fn flag(&mut self, fl: Flag, v: VId) -> Tm {
+        self.push(SO::Flag(fl, v), Ty::Bool)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -149,6 +158,9 @@ pub struct Ctx {
     pub op: FlagsOp,
     pub a: VId,
     pub b: VId,
+    /// The flags value an `inc`/`dec` carries its CF from — `None` at a point
+    /// with no flag producer. Every other flags op leaves it `None`.
+    pub cf_in: Option<VId>,
     pub w: Width,
     pub ty: Ty,
     /// Resolved constant shift count, when the count is a constant.
@@ -166,13 +178,19 @@ pub fn ctx_of(f: &Function, fop: FlagsOp) -> Ctx {
         | FlagsOp::Shr { a, b }
         | FlagsOp::Sar { a, b }
         | FlagsOp::Mul { a, b, .. } => (a, b),
-        FlagsOp::Neg { a } | FlagsOp::Inc { a } | FlagsOp::Dec { a } => (a, NO_VAL),
+        FlagsOp::Neg { a } => (a, NO_VAL),
+        FlagsOp::Inc { a, .. } | FlagsOp::Dec { a, .. } => (a, NO_VAL),
+    };
+    let cf_in = match fop {
+        FlagsOp::Inc { cf_in, .. } | FlagsOp::Dec { cf_in, .. } => cf_in,
+        _ => None,
     };
     let ty = f.ty_of(a).unwrap_or(Ty::u64());
     Ctx {
         op: fop,
         a,
         b,
+        cf_in,
         w: ty.width().unwrap_or(Width::W64),
         ty,
         count: match fop {
@@ -258,6 +276,7 @@ fn materialise(so: &SO, ids: &[VId]) -> Op {
         SO::Cmp(c, x, y) => Op::Cmp(*c, g(x), g(y)),
         SO::Un(o, x) => Op::Un(*o, g(x)),
         SO::Cast(k, t, x) => Op::Cast(*k, t.clone(), g(x)),
+        SO::Flag(fl, v) => Op::GetFlag(*fl, *v),
         SO::Gap(why) => Op::Opaque((*why).into()),
     }
 }
@@ -561,9 +580,18 @@ fn exact_flag(sb: &mut SB, ctx: &Ctx, fl: Flag) -> Tm {
                 let z = sb.c(0);
                 sb.cmp(IntCmp::Ne, a, z)
             }
-            FlagsOp::Inc { .. } | FlagsOp::Dec { .. } => {
-                sb.opaque("CF after inc/dec needs the previous flags as an operand (SS1.2 item 3)")
+            // x86 PRESERVES CF across inc/dec, and the flags node carries the
+            // value it preserves (SS1.2 item 3, closed): the read threads to
+            // that value and the fixpoint lowers it by ITS producer's rule.
+            FlagsOp::Inc { cf_in: Some(p), .. } | FlagsOp::Dec { cf_in: Some(p), .. } => {
+                sb.flag(Flag::CF, p)
             }
+            // With no producer there is nothing to preserve: silicon's CF at
+            // function entry is the caller's, and this model has no value for it.
+            FlagsOp::Inc { .. } | FlagsOp::Dec { .. } => sb.opaque(
+                "CF after inc/dec with no previous flag producer: silicon's CF is the \
+                 caller's and this model has no value for it",
+            ),
             FlagsOp::Shl { .. } => {
                 // CF = last bit shifted out = bit (width - n) of a
                 let bits = sb.c(w);

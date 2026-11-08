@@ -1346,7 +1346,7 @@ the date and the tree are in the heading: a row is a measurement with an expiry.
 | M2 step 1 lifter | `rdec lift --corpus` | **CLOSED — recorded late.** Criterion was "every lifted function is valid IR"; it printed `FAIL: 40 lifted functions are not valid IR` at step 1, and now prints `141 functions lifted, 141 pass verify_ssa`, exit 0. It became true at `aa0d8e7` (M3 step 1) and the roadmap never said so. | closed |
 | M2 instruction breadth, MSVC leg | `rdec msvc-gates --limit 40` | **MOVING — measured 2026-11-08.** The leg now emits **121 of 134** lifted (the row written earlier today: 118 emitted / 16 refused), census keys 6 → **5**: the class `inc/dec on an unmodelled destination` (3 sites, **all `incl (%rcx)`, all in MSVC objects** — clang lowers the same C as `addl $1, (%rcx)`, which was already modelled, so a clang-only census calls this arm dead code, and llvm-objdump prints it as `incl`: the same AT&T-name trap that nearly census'd `cwde` to zero) is gone. The arm loads the cell, adds/subtracts 1, stores the SAME address expression back, and sets `FlagsOp::Inc/Dec`; `addr_of` returns `Some` only for an operand it can express, so `inc dword [rip+0]` with no relocation stays REFUSED (fixture-pinned) instead of loading from an invented address. Silicon-pinned fixtures (`inc_mem_probe.c`): cell 9→10 via `[rcx+8]`, dec 9→8, 0x7FFFFFFF→0x80000000 with OF set. | the leg's coverage stays measured, not adopted as the M1 floor; and a class can be fully modelled with ZERO movement in this number — emission is per function, the census records one refusal per function, so a class's head count is its site count in the disassembly, never its record count (this slice: 34 memory-`cmp` sites, 3 records, 121 → 121) |
 | M2 memory-destination `cmp`/`test`, and RIP displacements | `acc_forms.rs` (9 fixtures incl. a silicon direction pair), `msvc-gates` census key | **ARM LANDED + SHARED-HELPER DEFECT FIXED + MISDIAGNOSED KEY RENAMED — measured 2026-11-08.** (a) `cmp`/`test` with a MEMORY destination (`cmpl %eax,(%rcx)`, `testb $1,(%rcx)`) loads the cell and compares **in Intel's order**, which is AT&T's last operand; the direction is pinned by a silicon pair (cell 5 vs eax 7 → CF=1 answers 13; cell 7 vs eax 5 → CF=0 answers 7 — F1 alone does NOT pin it, an `r − m` model answers 5 there), plus ZF/OF/byte-`test`/base+disp cases. Swapping `a`/`b` reddens this fixture AND the pre-existing `cdq_leaves_flags_alone`. These functions also assert `emit_c` succeeds (`cmp`/`test` define their flags, so a refusal means the arm lost the value). (b) `addr_of`/`rip_sym` resolved RIP displacements as `next_ip − 4` — right only when the disp32 is the instruction's LAST field. `cmpl $0x2, (%rip)` = `83 3D <disp32> <imm8>` has a trailing immediate: the field spans 2..6, the arithmetic lands at 4, the table keys 2 → the relocation was MISSED. Instrumented proof: `ZZ gap at 0x2f len=7 kind=Memory base=RIP hits=["0x31"]`. Covers `81 /7 id`, `C6 /0 ib`, `F6 /7 ib`, … Now resolved by scanning the instruction's span (the rule `reloc_on` already used); `RelocMap`'s doc corrected. (c) With (b) fixed the site STILL refuses, and the honest text now says why: the relocation names `g_count` with **no address** — the leg's map places CODE sections only, so a compare against a static in `.data` has no cell. New key `flag setting against a cell whose relocation names no address` (3 records moved to it; the old key asserted absent so the misdiagnosis cannot creep back). Census keys stay 5, records 13, emitted 121 of 134 | decide where data symbols live in the per-object space (M1/M4 scoping) → these 3 leg records become emissions; the clip rule for census keys is now shared between the two gates |
-| CF across `inc`/`dec` (SS1.2 item 3) | fixture `acc_forms.rs`, `c --corpus` refusal census | **NAMED GAP, BOUNDED BY A REFUSAL — found by this slice's fixture, and the boundary is the result.** x86 PRESERVES CF across `inc`/`dec`; measured on this host: `stc` then `inc [rcx+8]` then `setc` answers **12** (cell 10 + CF 1), the `clc` variant **6**, `dec` **10**, and OF on `0x7FFFFFFF + 1` gives **0x80000002**. This model leaves CF **undefined** there: the raw IR faults `UndefFlag(CF)`, the post-pass interpreter answers 0, and the emitter **refuses the whole function** naming the gap (`opaque: CF after inc/dec needs the previous flags as an operand (SS1.2 item 3)`, measured at 0x19) — so no emitted C carries a silent 0, and T2 can never compare a wrong CF against C, because a function that reads CF after `inc`/`dec` never emits. Sabotage proves the bound: spelling `inc`'s flags as `FlagsOp::Add` (the `add $1` temptation, which DEFINES CF=0) makes the function emit, and the fixture's leak assertion fires. Pre-existing (the register form has the same path); this slice inherits it and pins it, and cannot close it | thread the previous flags in as an operand (SS1.2 item 3); then the fixture's F1 answers silicon's 12 |
+| CF across `inc`/`dec` (SS1.2 item 3) | fixture `acc_forms.rs` (memory + register, raw-IR and post-pass), `msvc-gates` lift gate | **CLOSED WITHIN A BASIC BLOCK — 2026-11-08.** `FlagsOp::Inc`/`Dec` now carry `cf_in: Option<VId>`: the flags value whose CF x86 preserves. Fusion lowers a CF read on a carried node to `getflag(CF, cf_in)` and the fixpoint lowers THAT by its producer's rule, so `cmp ecx,edx ; inc ; setc` emits `ecx < edx`; the interpreter reads the carried `Val::Fg`; `uses()` lists `cf_in`, so DCE cannot delete the producer under it. The fixture's F1/F2 now answer silicon's **12** and **10** and the CF-reading functions **emit**. Two edges are design, not loose ends: **(a) function entry** — with no producer, silicon's CF is the caller's, so the read lowers to an opaque refusal naming that, never a 0 (`m0_gate` b6 + a new fixture); **(b) across a join** — SSA has no flag phis (SS1.2 item 2), so `cf_in` is set only when the flags value was defined in the current block. Carrying it across a join is a use its block does not dominate, and the MSVC leg's `lift` gate caught exactly that on real objects (`%63 defined in bb5 does not dominate use in bb8` in `early_returns.Od.obj :: $LN10`; `%59` in `switch_fallthrough.Od.obj :: $LN9`) before the guard existed; a new fixture reproduces the hard error locally. Closing (b) needs flag phis = SS1.2 item 2. Measured with the change: clang leg unchanged at **156 lifted / 129 emitted / 27 refused / 0 invalid** (no clang-corpus function reads CF after an `inc`), MSVC leg gates exit 0 over 134 functions. | flag phis (SS1.2 item 2) for cross-block CF; the leg's 3 `incl` sites never read CF, so its headline staying 121/134 is the expected result, not a stall |
 | M3 step 1 SSA | `rdec lift --corpus` | **GREEN** — 141/141 valid IR; strict interpreter: 0 uses of a value never defined | closed |
 | M3 step 2 block splitting | `rdec lift --corpus` | **GREEN** — loops lift; Exits 64 -> 27, clean functions 63 -> 85 | closed |
 | M3 noreturn / tail calls / jump-table targets | census + three floors inside `rdec c --corpus` | **LANDED, corpus witnesses present** (2026-11-08; the row before this one said "NOT DONE — zero handling" on the evidence of a `grep -ric` that returned 0, where the live count in `lift.rs` is 53). Jump-table resolution closed M1. Census now: **`tail calls: 3 modelled | 3 with no callable callee | noreturn calls: 4`** (`0xf -> abort`, `0x12 -> abort` x3) from the `tailcall_local` / `tailcall_external` / `noreturn_call` snippets. `cmd_c` FAILS on `tail + tail_unnamed == 0`, on `noreturn == 0`, and on any census site whose name `noreturn_symbol` does not declare — floor 3 exists because a sabotage that declared EVERY import noreturn moved one corpus function into `__builtin_unreachable()` and passed every other gate. The fixture found the real hole: the noreturn arm needed a signature entry, imports have none (`U abort`: no section, no size, no address), and in a linked binary every name in the termination family IS an import — the declaration is now made from the relocation's name, for imports only, `typed: false`, defines nothing. The emitted C is `o100_abort(x0,x1,x2,x3); __builtin_unreachable();` under an `__attribute__((noreturn))` declaration. | C++ corpus sites (that corpus imports no family name — measured with `llvm-nm`), and the `jmp`-to-import refusal class growing past 3 |
@@ -3147,3 +3147,112 @@ fmt and `clippy -D warnings` clean. Legs: clang `c --corpus` 156 lifted /
 129 emitted / 27 refused / 0 invalid (unchanged — the clang corpus has no
 memory-destination `cmp` with these shapes); MSVC 121 of 134 emitted, 13 refused,
 5 census keys with the class renamed. Floor tuple in the commit message.
+
+---
+
+## Slice 15 (2026-11-08) — M2: CF is PRESERVED across `inc`/`dec`, and the flags node carries the value (SS1.2 item 3 closed within a block)
+
+The emitter used to refuse any function that read CF after an `inc`: `opaque: CF
+after inc/dec needs the previous flags as an operand (SS1.2 item 3)`. That was the
+honest answer for a model with no such operand — silicon PRESERVES CF (measured:
+F1 answers 12, the model answered 10). The operand is the flags value being
+preserved, so the flags node now carries it.
+
+```text
+FlagsOp::Inc { a, cf_in: Option<VId> }        (Dec the same)
+
+fuse    CF of a carried node lowers to getflag(CF, cf_in); the pass splices it
+        (SO::Flag → Op::GetFlag) and the fixpoint lowers THAT read by its own
+        producer's rule — `cmp ecx,edx ; inc ; setc` becomes `ecx < edx` in C.
+interp  reads the CF out of the carried Val::Fg (raw IR, no pass involved).
+ir      uses() lists cf_in: it is a real SSA use, so DCE cannot delete the
+        producer out from under the node that preserves it (measured: dropping
+        it from uses() reddens the fixture, the fusion cone shrinks with it).
+lift    cf_in = self.flags, ONLY when self.flags_block == self.cur (see below).
+fmt_ir  prints the carried value as the second operand: a dump that dropped it
+        would print two programs with different CF semantics identically.
+```
+
+**Function entry is a refusal, not a 0.** With no producer, silicon's CF at entry
+is the caller's and the model has no value for it, so `cf_in = None` and the read
+lowers to an opaque refusal naming that. `m0_gate`'s b6 test pins the shape, and a
+new fixture pins the lifter's side of it.
+
+What the flip found in the FIXTURE, not the model
+-----------------------------------------------
+
+F1's bytes were `mov rcx,rsp` THEN `cmp ecx,edx`. The comparison's first operand
+is ECX, which the address setup had just overwritten, so the cmp compared a stack
+address with the input and CF was a **constant 0** — visible in the IR as
+`cmpult 0x7ffe0, edx`. The fixture's "CF = 1" leg proved nothing, and the old
+assertion (the model's 10, plus "the emitter refuses, naming the gap") could not
+see it: a refusal is a green test for a program whose flag is constant. The
+comparison now runs before the address setup, and F1 answers **12**, F2 **10** —
+the silicon numbers — with the CF-reading functions emitting C.
+
+What the leg's gate found in the MODEL
+--------------------------------------
+
+Carrying the flags value across a join is a use its block does not dominate:
+
+```text
+corpus/msvc/obj/early_returns.Od.obj      :: $LN10: %63 defined in bb5 does not dominate use in bb8
+corpus/msvc/obj/switch_fallthrough.Od.obj ::  $LN9: %59 defined in bb3 does not dominate use in bb5
+```
+
+The leg's `lift` gate went red on those two lines on the first run — the same gate
+that had been green for nine pushes, on a change that touched no leg-specific code.
+SSA has no flag phis (SS1.2 item 2 is a PREREQUISITE, not a follow-up), so the
+lifter sets `cf_in` only when the flags value was defined in the current block:
+CF is preserved **within** a basic block; across a join the read refuses and names
+the missing producer. `cf_is_carried_within_a_block_and_not_across_a_join` builds
+the join in raw bytes and asserts the hard SSA error plus the refusal; removing
+the guard prints the leg's exact text locally.
+
+Coverage found the same way
+---------------------------
+
+Sabotaging the interpreter's carried-CF read to `Some(false)` left the post-pass
+fixture **GREEN**: by then the pass has replaced the read with `cmpult`, so the
+interpreter's flags arm is unreachable there. The interpreter's path is pinned by
+two raw-IR tests (memory and register form, `run_budget` on unpassed IR), which is
+where it answers — 12 and 1.
+
+Sabotages, each reddening a named test
+--------------------------------------
+
+| Sabotage | Red |
+|---|---|
+| interpreter CF → `Some(false)` | `raw_ir_reads_the_carried_cf_with_no_pass_to_thread_it` (and ONLY that — the discovery above) |
+| lifter `cf_in: None` (memory arm) | the F-series fixture (10 vs 12) + the raw-IR test |
+| `uses()` drops `cf_in` | the F-series fixture (the fusion cone loses the producer) |
+| dominance guard removed | `cf_is_carried_within_a_block_and_not_across_a_join`, with the leg's `%N defined in bbX does not dominate use in bbY` |
+
+Measured
+--------
+
+| | before | after |
+|---|---|---|
+| `acc_forms` | 17 tests | **21 tests**, 0 failed |
+| F1 (`inc [rcx+8]`, CF from a `cmp`) | 10 (CF undefined → 0) | **12** = silicon |
+| F2 (`dec [rcx+8]`) | 8 | **10** = silicon |
+| CF-reading functions | emit refused | **emit** |
+| clang `c --corpus` | 156 / 129 / 27 / 0 | **156 / 129 / 27 / 0** (no corpus function reads CF after an `inc`) |
+| MSVC leg gates | exit 0 | exit 0, 134 functions, 132 verify |
+| `cargo test` / fmt / clippy | 0 | **0 / 0 / 0** |
+
+Rules this slice leaves behind
+------------------------------
+
+1. **A flags value is an SSA value, with SSA's obligations.** Any new operand on a
+   flags op must appear in `uses()`, in the SSA rename map, in the pass's operand
+   walk, and in the IR dump — and may only be used where its block dominates. The
+   corpus leg is the fastest dominator of them all: it found the violation on
+   production-shaped objects that no unit fixture resembled.
+2. **A refusal assertion can hide a dead fixture leg.** F1 asserted "the model
+   answers X and the emitter refuses" for a program whose flag was constant 0.
+   When a fixture's expected value equals "the model's undefined answer", check the
+   premise IN THE IR, not in the prose.
+3. **Preserve-within-a-block is the honest half.** Closing the join needs flag
+   phis (SS1.2 item 2); naming that as the prerequisite is the result, not a
+   deferral.

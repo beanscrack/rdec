@@ -978,6 +978,13 @@ pub struct Lifter<'a> {
     f: Function,
     regs: HashMap<Grp, VId>,
     flags: Option<VId>,
+    /// The block `flags` was DEFINED in. SSA has no flag phis (SS1.2 item 2), so
+    /// a flags value may only be used where its defining block dominates it, and
+    /// block identity is the dominance fact the lifter can check at emit time.
+    /// Measured: carrying a flags value across a join made an `inc`'s carried CF
+    /// a use that its block did not dominate — the MSVC leg's `lift` gate caught
+    /// it as `%63 defined in bb5 does not dominate use in bb8`.
+    flags_block: BbId,
     bb_of: HashMap<u64, BbId>,
     order: Vec<u64>,
     cur: BbId,
@@ -1184,6 +1191,7 @@ impl<'a> Lifter<'a> {
             f,
             regs,
             flags: None,
+            flags_block: 0,
             bb_of: HashMap::new(),
             order: Vec::new(),
             cur: entry,
@@ -1423,6 +1431,7 @@ impl<'a> Lifter<'a> {
     fn set_flags(&mut self, op: FlagsOp) {
         let v = self.f.emit(self.cur, Op::Flags(op), Ty::Flags, self.addr());
         self.flags = Some(v);
+        self.flags_block = self.cur;
     }
 
     /// Flags are undefined after ops the model does not define them for. Reading
@@ -3239,10 +3248,15 @@ impl<'a> Lifter<'a> {
                                 );
                                 self.f
                                     .emit_void(self.cur, Op::Store(ty_u(w), a, r), self.addr());
-                                self.set_flags(if m == Mnemonic::Inc {
-                                    FlagsOp::Inc { a: lhs }
+                                let cf_in = if self.flags_block == self.cur {
+                                    self.flags
                                 } else {
-                                    FlagsOp::Dec { a: lhs }
+                                    None
+                                };
+                                self.set_flags(if m == Mnemonic::Inc {
+                                    FlagsOp::Inc { a: lhs, cf_in }
+                                } else {
+                                    FlagsOp::Dec { a: lhs, cf_in }
                                 });
                             }
                             None => {
@@ -3264,10 +3278,15 @@ impl<'a> Lifter<'a> {
                     one,
                 );
                 self.write(d, dw, r);
-                self.set_flags(if m == Mnemonic::Inc {
-                    FlagsOp::Inc { a: lhs }
+                let cf_in = if self.flags_block == self.cur {
+                    self.flags
                 } else {
-                    FlagsOp::Dec { a: lhs }
+                    None
+                };
+                self.set_flags(if m == Mnemonic::Inc {
+                    FlagsOp::Inc { a: lhs, cf_in }
+                } else {
+                    FlagsOp::Dec { a: lhs, cf_in }
                 });
             }
             Mnemonic::Neg => {
@@ -4979,7 +4998,15 @@ fn rewrite_flags(f: &mut FlagsOp, old: VId, new: VId) {
             m(a);
             m(b);
         }
-        FlagsOp::Neg { a } | FlagsOp::Inc { a } | FlagsOp::Dec { a } => m(a),
+        FlagsOp::Neg { a } => m(a),
+        // An SSA rename must follow the carried flags value too: a stale `cf_in`
+        // is a dangling use, which verify_ssa rejects as a hard error.
+        FlagsOp::Inc { a, cf_in } | FlagsOp::Dec { a, cf_in } => {
+            m(a);
+            if let Some(v) = cf_in {
+                *v = map(*v, old, new);
+            }
+        }
     }
 }
 

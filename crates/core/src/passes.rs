@@ -1673,7 +1673,14 @@ impl Op {
                     | FlagsOp::Shr { a, b }
                     | FlagsOp::Sar { a, b }
                     | FlagsOp::Mul { a, b, .. } => (Some(a), Some(b)),
-                    FlagsOp::Neg { a } | FlagsOp::Inc { a } | FlagsOp::Dec { a } => (Some(a), None),
+                    FlagsOp::Neg { a } => (Some(a), None),
+                    // The carried flags value is an operand of the node: the
+                    // walk that rewrites operands must see it, and a flags def
+                    // never folds to a constant, so visiting it is a no-op
+                    // there and a rewrite wherever it needs one.
+                    FlagsOp::Inc { a, cf_in } | FlagsOp::Dec { a, cf_in } => {
+                        (Some(a), cf_in.as_mut())
+                    }
                 };
                 if let Some(a) = a {
                     g(a);

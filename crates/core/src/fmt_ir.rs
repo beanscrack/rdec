@@ -148,8 +148,10 @@ fn format_flags(f: &Function, fl: FlagsOp) -> String {
         FlagsOp::Shr { a, b } => ("flags.shr", a, Some(b)),
         FlagsOp::Sar { a, b } => ("flags.sar", a, Some(b)),
         FlagsOp::Neg { a } => ("flags.neg", a, None),
-        FlagsOp::Inc { a } => ("flags.inc", a, None),
-        FlagsOp::Dec { a } => ("flags.dec", a, None),
+        // The carried CF prints as the second operand: a dump that dropped it
+        // would print two programs with different CF semantics identically.
+        FlagsOp::Inc { a, cf_in } => ("flags.inc", a, cf_in),
+        FlagsOp::Dec { a, cf_in } => ("flags.dec", a, cf_in),
         FlagsOp::Mul { a, b, signed } => {
             (if signed { "flags.imul" } else { "flags.mul" }, a, Some(b))
         }

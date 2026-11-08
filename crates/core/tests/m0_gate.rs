@@ -361,13 +361,20 @@ fn b6_pf_after_test_is_lower_byte_parity_and_leaves_no_flags() {
 
 #[test]
 fn b6_cf_after_inc_is_undefined_and_must_be_reported_not_invented() {
-    // inc preserves CF, and v1's IR has no prev-flags operand to express it.
-    // The honest outcome is that the read is *defined as undefined*: the pass
-    // must not fabricate a value, and must not leave a raw get_flag.
+    // inc preserves CF, and the flags node carries the value it preserves
+    // (`cf_in`). This is the case with NO previous flags value — function entry,
+    // where silicon's CF is the caller's. The honest outcome is that the read is
+    // *defined as undefined*: the pass must not fabricate a value, and must not
+    // leave a raw get_flag.
     let mut f = fn2("b6inc");
     let e = f.entry;
     let a = f.params[0];
-    let fl = f.emit(e, Op::Flags(FlagsOp::Inc { a }), Ty::Flags, 0x1008);
+    let fl = f.emit(
+        e,
+        Op::Flags(FlagsOp::Inc { a, cf_in: None }),
+        Ty::Flags,
+        0x1008,
+    );
     let g = f.emit(e, Op::GetFlag(Flag::CF, fl), b(), 0x100c);
     let o = f.emit(e, Op::Cast(CastKind::ZExt, i32(), g), i32(), 0x1010);
     f.block_mut(e).term = Terminator::Return(o);
