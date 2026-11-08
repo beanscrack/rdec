@@ -1356,7 +1356,8 @@ the date and the tree are in the heading: a row is a measurement with an expiry.
 | M8 step 3 C++ value-verified | `rdec t2 --cpp` | **GREEN as a sample** (row above) | — |
 | M8 remainder | — | **NOT DONE** — packed SIMD (refused by name: `paddd/paddq/psubd/pmuludq/pcmpeqd/shufps`, mask `andps/orps`, GPR `movd/movq`), vtable dispatch and virtual calls. Measured: this clang build names ZERO vftable symbols in `.obj`, so vtable identity needs `.rdata` + REL32 relocation recovery | relocation reader, then vtable identity, then `call [this+k]` |
 | M5 control-flow structuring | `e0dafc6` | **LANDED** — if/while/switch recovery; jump-table switch sites close M1's last gap; M6 readability on top: 75 goto / 202 labels (from 123/217) | remaining fall-through gotos are back edges + multi-parent joins |
-| M6 readability + type recovery | `47b9076` `bfe8156` | **PARTIAL** — early-return printing, layout-then-prune, return-tail materialization (refusals 29→0); type recovery + Ghidra baseline NOT STARTED | type recovery next; Ghidra baseline is a user install decision |
+| M6 readability | `47b9076` `bfe8156` | **PARTIAL** — early-return printing, layout-then-prune, return-tail materialization (refusals 29→0) | Ghidra baseline is a user install decision |
+| M6 type recovery (tyinfer + `types`) | `8447945` `bd3f68b` + lane m6e | **LANDED, GATED, IN CI** — `types --corpus` signedness LIE 0 (exact 144, canonical-over-unsigned 27, sound-silent 141), width 150 exact + 21 narrower + WIDER 0, ptr 21/0, float 0/0, conflicts 12 loud; `types --selftest` battery 22/22 register 4/4; CI runs the `.gate/types-baseline` ratchet in `gates` and `release-parity` | the 4 named `carry_chain` void-return lies (a lifter IR-shape gap, see the m6e ledger); Ghidra baseline |
 | M7 whole binary | `rdec pe-discover <exe>` (+ `pe-info`) | **GATE EXISTS (2026-11-08)** — on the real linked image: 418 functions, 56266/61431 .text bytes covered = **91.59%**, `overlap_free: true`, VERDICT line printing **213 gaps (213 descent + 0 reloc boundary)**; a 0-function run exits 1 with its coverage declared void. Seeds from three named sources with per-source provenance: `.pdata` (328 of 336 entries seeded, 4 chained + 4 version-2 refused and COUNTED — the seed census is the witness, measured: seeding a refused entry does not move the function count, because the linear sweep decodes with the same engine a seed uses), the entry point, and `.reloc` DIR64 code targets (47 targets in `.text`, 38 distinct, 7 `.reloc`-only with printed provenance). `.reloc` reader (`crates/arch-x86/src/reloc.rs`) asserts a PARTITION — padding + absolute + relative + unreadable-site + refused-kind == entries — cross-checked against a python raw-byte walk sharing no code (6 blocks, 782 entries = 3 ABSOLUTE + 779 DIR64, `sum(SizeOfBlock) == dir size`). NOT DONE: imports/IAT unread (160 indirect-call gaps stay anonymous, `is this gap an import?` unmeasured), PE32 has no `.reloc` leg (refused by name), the half-address relocation family is named not paired, ELF not started, frame-model interpretation not started | imports/IAT, then CRT signatures; the 7 `.reloc`-only starts are addresses, not verified bodies |
 | M9 production | `289645b` `c08a894` | **PARTIAL** — fuzzing lane (0 crashes/0 hangs over 20k-input censuses ×3 seeds), nightly hardening workflow, release parity, panic-site ratchet, pass-pipeline + verify_ssa linear-time; the analyst loop is not built | analyst loop; fuzz generator extension to shift ops with raw counts (the P-track defect's domain) |
 | P track (proof) | seed | **EXTENDED 2026-11-08** — the oracle has its own oracle: `interp_arith_reference.rs`, an independent machine-semantics reference, now over the 9 original liftable BinOps **plus the accumulator ops that landed**: `UDiv/URem/SDiv/SRem` at all four widths and `MulHi/MulSmul` at W64 (boundary set + 3000 deterministic cases per op x width, both `Sx` displays, raw shift counts, zero-divisor fault pinned). The multiply-high reference is a LIMB DECOMPOSITION, so interpreter (`u128`), table (limbs) and the shipped C helper are three implementations; `mulhi_helpers.rs` is the C-leg (PRELUDE helpers vs `__int128` over 300+ vectors, compiled with the floor gate's own flags, and the emitter's W64-emits / W32-refuses claim). First run found two real defects, both fixed in the interpreter: `Shr`/`Sar` UB for counts 64..=128 (debug panic, RELEASE WRAP) and `shift_left` disagreeing with the machine's count masking at raw 32..63 (W32) | extend for `RotL/RotR` as sites land; C-emitter equivalence proofs beyond the multiply-high leg |
@@ -2641,3 +2642,129 @@ honest for a second toolchain; it does not claim a single new instruction. And a
 fill is named for the encodings our decoder prints: a toolchain that pads with a
 form printing anything other than `nop*`/`xchg ax,ax` will show up as uncovered
 bytes, which is the loud direction, not the quiet one.
+
+
+## M6 type recovery: landed on master, `types` in CI (lane m6e, 2026-11-08)
+
+MERGE. `git merge --no-commit --no-ff d295999` onto `m6-type-recovery` (bd3f68b) — auto-clean,
+zero conflicts: the two sides touch disjoint files (master: lift.rs, emit_c.rs, interp.rs, m1.rs,
+the SSE tests, main.rs's `pe-discover` hunk; M6: tyinfer.rs, m6.rs, truth.tsv, tyinfer_rules.rs,
+main.rs's `types` hunks, scripts/truth_extract.py). Chosen over a rebase because the merge is
+conflict-free (main.rs's hunks are 50+ lines apart) and a rebase would rewrite the two landed SHAs
+this ledger cites (8447945, bd3f68b). The master-owned files (lift.rs, emit_c.rs, interp.rs, m1.rs)
+AND width.rs, passes.rs, m4.rs, t2.rs are byte-identical to d295999 in the merged tree
+(`git diff --quiet d295999 -- <file>` per file); no M6 semantic hunk had to be adapted, because
+type recovery is a read-only analysis — `tyinfer::recover` is called only from `crates/cli/src/m6.rs`
+and its own test file. That is the structural half of the emitted-C byte-stability claim; the
+measured half is the c/t2 tuple below, which is identical to master's floor.
+
+THREE CHECKS THE BRANCH SHIPPED RED — all in M6's OWN files, all found by running the CI steps
+and nothing else:
+  - `cargo fmt --check` red at tyinfer.rs:718 (one `if` the slice-3 commit never formatted).
+  - `cargo clippy --all-targets -- -D warnings` red: `crates/core/tests/tyinfer_rules.rs:327`
+    bound an unused `q` in `let (p, q) = (c[0], c[1]);`, and `-D warnings` makes the whole
+    `rdec-core` test target fail to COMPILE — a lane that only ran `cargo test -p rdec-core`
+    (where an unused binding is a warning, and clippy never ran) sees green.
+  - `scripts/unwrap_ratchet.sh` red: crates/cli had 15 panic sites vs the baseline's 14 —
+    `m6.rs:447 opt_wanted.as_deref().unwrap()`, a hand-guarded unwrap. Fixed by binding the
+    Option (`if let Some(ow) = opt_wanted.as_deref()`), baseline UNCHANGED at 14. The comment
+    that replaced it must not QUOTE the pattern: the ratchet is a byte-exact grep and counted
+    the comment.
+  The slice-3 ledger said "clippy clean, all core suites green". True of its own core suite;
+  false of the three CI steps. Lesson: a lane runs `fmt --check`, `clippy --all-targets
+  -D warnings` and `unwrap_ratchet.sh`, or it ships red CI — which is what this repo's CI
+  history says it keeps doing.
+
+CI WIRING. `.github/workflows/ci.yml` gains a `types` step in the `gates` job, placed
+IMMEDIATELY AFTER `corpus (C + C++ objects…)` and in the same job (the gate reads
+`corpus/manifest.tsv`, the objects it names, and `corpus/truth.tsv`; the objects are generated,
+not committed — the trap that shipped red CI twice, runs 41415743892 and 42148930772), and the
+release leg goes at the end of `release-parity`'s gate block, whose corpus step is above it. The
+step runs the raw census, ASSERTS its exit code is 1, requires the battery green, and takes its
+verdict from the ratchet:
+  types --corpus                                  (exit 1 expected, census printed)
+  types --selftest                                (must be 0)
+  types --corpus --baseline .gate/types-baseline  (the step's verdict)
+with `$LASTEXITCODE` checked after every one. The ordering and the exit-code checks are pinned by
+`crates/cli/tests/types_ci_wiring.rs` (3 tests; each shown RED by sabotage: move the step above
+the corpus step, delete the `if ($LASTEXITCODE …)` lines).
+
+THE GATE IS NOT WEAKENED — the ratchet moves the exit code, never the scorer. `score_return` and
+`score_int_grid` are byte-identical to bd3f68b's; `types --corpus` still prints all 4 LIE lines
+and exits 1. New: `--baseline PATH` groups the printed lies into `subject|kind` FAMILIES
+(derived from the scorer's own text, so there is no parallel counter to stop counting; an
+unmappable text lands in `UNMAPPED(...)` and can never match a row) and compares against
+`.gate/types-baseline` (`carry_chain|void-return 4`). Red on a RISE, red on a FALL ("lower the
+baseline in this commit"), red on an unnamed family, error on a missing/empty file. Measured
+end-to-end on the corpus, not only in a unit test: as-shipped 0; baseline 3 -> 1 "NEW over-truth
+claims"; baseline 5 -> 1 "lower the baseline in this commit"; an extra row -> 1; a missing file
+-> 2. `types --selftest` gains a 4th register gate (register 4/4) pinning that the baseline file
+parses and names printable families; the 22-probe battery and `PROBE_RULES_TOTAL` are untouched
+(22/22).
+
+A BUG THE CI FORM CAUGHT BEFORE CI DID: the first arg-split skipped the `--baseline` FLAG's index
+instead of its VALUE's, so `types --corpus --baseline .gate/types-baseline` handed the TSV to the
+COFF loader — exit 2, "object with a 28515-byte optional header" — on the exact command line the
+CI step runs. `baseline_arg_split_pins_the_baseline_path_value` pins it, and was run RED against
+the pre-fix shape (`… .map(|i| i + 1)` removed) before it was run green.
+
+CENSUS (this tree, local clang 22.1.8 — CI's clang is 20.1.8, so a CI census is a different
+machine's claim): 128 functions scored, 640 sites, 308 unscoreable. signedness exact 144,
+canonical-display-over-unsigned 27, sound-silent 141, LIE 0. width exact 150, narrower(sound) 21,
+WIDER-LIE 0. pointer on-ptr 21, LIE 0. float on-float 0, LIE 0. void-return matches 0, LIE 4.
+conflicts (loud by design) signedness 12, slot 0, precision 0. Byte-identical to the slice-3
+numbers, so the merge moved no census counter — the silent-drop sin this lane was built to avoid.
+
+THE GAP THAT REMAINS, MEASURED: 4 void-return lies, ONE family — `carry_chain` at O0/O1/O2/Oz.
+`corpus/src/carry_chain.c` is `void f(unsigned long a, unsigned long b, unsigned long *lo,
+unsigned long *hi) { …; *lo = l; *hi = h; }`. At O0 the tail is `movq 0x18(%rsp), %rax` /
+`movl %ecx, (%rax)` / `addq $0x20, %rsp` / `retq`: RAX at `ret` is the spilled `hi` POINTER, left
+over from the address role of the last store. `--explain carry_chain.O0` prints the pass's claim
+verbatim: `return bb0 v84: claim Some("void *") facts read-width@0x43[Load W64] read-width@0x48
+address@0x48` — the pointer claim is TRUE of that cell (it is `unsigned long *hi`), and the
+scorer calls it over truth because the declared return is void. `void_return: false`, because
+`sig.void_return = rets.is_empty()` is the machine fact "leaves through an exit, not a value",
+and the IR has a value-returning terminator. The owner of the lie is the LIFTER: `Pending::Ret`
+with `RetKind::Int` emits `Terminator::Return(read64(Rax))` unconditionally (lift.rs:4415-4419),
+and `RetKind` for the C corpus is always `Int` — the lifter has no signature, because a COFF
+object carries none.
+WHAT A FIX WOULD HAVE TO CLAIM, measured on a twin, not theorised: the hand-built pair
+(void `g` and `unsigned long *k` over the same body, clang -O0, same object format) has
+BYTE-IDENTICAL bodies; `k` differs by exactly ONE appended instruction —
+`movq 0x18(%rsp), %rax` at 0x9a, the answer re-materialised — before the same epilogue. So the
+decidable fact is the ROLE of RAX's last write: in the void shape it is READ by a store as that
+store's address and nothing writes RAX afterwards; in the returning shape it is never read at all
+(it is the answer). A `RetKind::Void` rule has to claim exactly that — "RAX's reaching definition
+at every return is consumed only as a memory address, so the function has no answer cell" — and
+its fixture pair is this one (the void tail must go void, the pointer tail must stay a value, and
+a rule that fires on both is the miscompile). The cost it must pay is named and is SMALLER than
+feared: the four `carry_chain` objects are NOT in T2's compared set (all four are named by the
+gate as `not run [memory outside the modelled frame] … no base arithmetic from param 0`; measured
+alone: `t2 corpus/obj/carry_chain.Oz.obj` -> "1 lifted, 0 functions T2 can run", exit 1), so
+closing the family removes NO comparison from the 1820/1820/0/4 tuple. It does have to keep
+`verify`'s return-width bound and `emit_c`'s Void spelling honest, and truth.tsv keeps declaring
+`void` — the fix that is NOT allowed is a scorer that stops scoring declared-void return sites.
+Until that lifter change lands with machine evidence, the 4 stay in the census, in the printed
+LIE list, and in `.gate/types-baseline`.
+
+FLOORS (merged tree, un-piped, this box, per-command `CARGO_TARGET_DIR` outside the tree):
+fmt 0; clippy -D warnings 0; ratchet 0 (core 1, arch-x86 7, demangle 1, verify 4, cli 14 — the
+baseline is unchanged, nothing new and nothing removed); cargo test 45 suites / 403 passed /
+0 failed (master's 43/364 + tyinfer_rules 28 + the 7 ratchet tests + the 3 CI-wiring tests);
+selftest 0; objdump-check 0 (140 symbols, 140 exact, 0 refusals, 0 mismatches — the corpus grew
+past the 124 the older floors quoted); discover 0 (100.00%, 6764/6764 non-padding bytes, gaps
+none); lift 0 (140 lifted, 140 valid IR, 103 clean); c --corpus 98 emitted / 42 refused / 0
+invalid with clang -Werror OK (the gate's own exit is 1 BY DESIGN while refusals > 0, as on
+master); t2 --corpus compared 1820 / match 1820 / mismatch 0 / not-compared 4 with memory
+408/408/0 and the IR leg 408/408/0 — the tuple is master's, byte for byte; t2 --cpp 856/856/0
+over 39 compared functions; cpp --corpus 69 lifted / 64 emitted / 5 refused; demangle 68/68;
+status 0. types --selftest 0 (battery 22/22, register 4/4); types --corpus 1 (the 4 named lies);
+types --corpus --baseline 0.
+
+WHAT THIS DOES NOT PROVE: not CI (nothing was pushed; the CI-form command line was run locally,
+on clang 22.1.8, and CI's 20.1.8 is a different lowering — `objdump-check`/`c`/`t2` numbers can
+move there for reasons that are the compiler's); not the C++ lane's coverage (the corpus has no
+float/void C parameters: float 0/0 is silence, not skill); not that the baseline's family names
+are the RIGHT decomposition (the C++ `--explain` lane can add families, and the ratchet forces
+every one to be named in the same commit); not that a `RetKind::Void` rule is sound in general —
+the twin pair above is the fixture that would have to prove it, and it is not written here.

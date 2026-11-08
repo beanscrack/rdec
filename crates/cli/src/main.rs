@@ -13,6 +13,7 @@ mod corpus;
 mod fuzz;
 mod m1;
 mod m4;
+mod m6;
 mod m8;
 mod t2;
 
@@ -41,6 +42,7 @@ fn main() {
                 1
             }
         },
+        "types" => m6::cmd_types(&args),
         "cpp" => match m8::cmd_cpp(&args) {
             Ok(rc) => rc,
             Err(e) => {
@@ -136,6 +138,11 @@ fn print_help() {
          \x20                                   discover + lift + refusal census by mnemonic\n\
          \x20 corpus --cpp [--out DIR]         build the C++ corpus (M8, clang++ MSVC ABI)\n\
          \x20 demangle --cpp                  M8 gate: MSVC C++ names vs llvm-nm\n\
+         \x20 types --corpus                  M6 gate: recovered signatures vs corpus/truth.tsv;\n\
+         \x20   [--explain NAME]                claims printed with their machine-fact witnesses\n\
+         \x20   [--baseline PATH]               CI form: same census, exit code ratcheted\n\
+         \x20                                   against the named known lies (.gate/types-baseline)\n\
+         \x20 types --selftest                  the forcing drill: rule probes + register/admin gates\n\
          \x20 cpp --corpus                    M8 gate: the C++ corpus through the C\n\
          \x20                                   pipeline - demangled names, emitted C,\n\
          \x20                                   refusals and gaps by class\n\

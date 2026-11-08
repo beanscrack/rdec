@@ -1,0 +1,37 @@
+# M6 type-recovery truth: the declared signature of every corpus source.
+# Generated 2026-11-07 from corpus/src/*.c definitions (top-level defs only), audited by
+# hand row by row. Rerun recipe: scripts/truth_extract.py (committed next to this file).
+# Tokens: void i8 u8 i16 u16 i32 u32 i64 u64 px ppx f32 f64 s2 s4 mmx; array params decay to px.
+name	ret	params
+arith_basic	i32	i32;i32
+array_walk	i64	px;i32
+carry_chain	void	u64;u64;px;px
+cmov	i32	i32;i32
+cmp_signed	i32	i32;i32
+cmp_unsigned	u32	u32;u32
+copy_block	i64	px
+copy_words	i64	px
+div_pow2	i32	i32
+div_unsigned	u32	u32;u32
+divmod_signed	i32	i32;i32
+early_returns	i32	i32;i32
+fib_rec	i64	i32
+gcd_loop	i32	i32;i32
+irreducible_shape	i32	i32
+locals_addressed	i32	i32
+logic_flags	i32	i32;i32
+loop_do	i32	i32
+loop_nested_break	i32	i32
+loop_sum	i32	i32
+mul_wide	i64	i64;i64
+narrow_ext	i32	i8;u8;i16;u16
+narrow_store	i32	i32
+nested_if_tree	i32	i32;i32;i32
+read_only_words	i64	px
+saturation	i32	i32;i32
+setcc	i32	i32;i32
+shift_all	i64	i64;u32
+store_to_buffer	i64	px
+switch_dense	i32	i32
+switch_fallthrough	i32	i32
+switch_sparse	i32	i32
