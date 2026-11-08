@@ -101,6 +101,9 @@ fn g_table() -> std::collections::HashMap<String, CalleeSig> {
             // noreturn loses its caller's answer, so the flag is spelled out at
             // every declaration site rather than defaulted.
             noreturn: false,
+            // The default four pairs: this hand-built table carries no body
+            // evidence, so no arity is recovered (see `CalleeSig::nargs`).
+            nargs: 4,
         },
     )]
     .into_iter()
@@ -405,6 +408,7 @@ fn a_double_returning_call_passes_bits_and_declares_double() {
         abi: abi_g.clone(),
         typed: true,
         noreturn: false, // a float-returning sibling: the caller reads XMM0
+        nargs: 4,
     };
     let sigs: std::collections::HashMap<String, CalleeSig> =
         [("g".to_string(), sig_g)].into_iter().collect();
@@ -641,9 +645,13 @@ fn the_call_defines_its_answer_and_clobbers_the_rest() {
     // root-cause move 24 -> 40: the pair model (M8 packed slice) made each XMM
     // register TWO caller-saved cells (lo+hi) — an IR node defines one value,
     // so the IR count is cells: 9 GPR + 32 XMM cells - the defined output.
-    // The register-level ABI fact (25 caller-saved) is unchanged; clobbering
-    // the high lane is the point of the model, not a side effect.
-    assert_eq!(clobbers, 40, "the defined output is not clobbered");
+    // 2026-11-08 Win64-arity slice moves 40 -> 38: the volatile integer set is
+    // the Windows x64 ABI's SEVEN (RAX, RCX, RDX, R8-R11) — RSI and RDI are
+    // nonvolatile there (the 9-GPR list was SysV's answer), so 7 GPR + 32 XMM
+    // cells - the defined output. The register-level ABI fact is what the
+    // comment above states; clobbering the high lane is the point of the
+    // model, not a side effect.
+    assert_eq!(clobbers, 38, "the defined output is not clobbered");
 }
 
 /// The entry-seeding window is unchanged by all of this: a call is a statement
@@ -654,4 +662,417 @@ fn lifting_a_caller_keeps_the_abi_seeding() {
     let l = Lifter::new_abi("f", 4, &names, &FnAbi::integer());
     let seeded = l.entry_regs().iter().filter(|(_, v)| v.is_some()).count();
     assert_eq!(seeded, 4, "the four integer argument registers");
+}
+
+// ---------------------------------------------------------------------------
+// ARITY, fixture (a): the `call_helper` shape. The ground truth is the corpus
+// source `corpus/src/call_helper.c`, quoted:
+//
+//     int h(int x) { return x * x + 1; }
+//     int f(int a, int b) { return h(a) + h(b); }
+//
+// compiled `clang -O1`, which keeps `b` in RSI (a Win64 NONVOLATILE register:
+// the callee preserves it) and rewrites only RCX between the two calls:
+// RDX, the second argument cell, is NOT rewritten between them. The 4-pair
+// model made the second call site read RDX to "pass" a fourth argument the
+// callee never reads; RDX is destroyed by the FIRST call, so the emitter
+// refused the function with `opaque: clobbered by call` - a refusal on a
+// machine-dead argument cell. Hand-assembled -O1 shape:
+fn bytes_call_helper() -> Vec<u8> {
+    vec![
+        // 0x00  h: imul ecx, ecx ; lea eax, [rcx+1] ; ret   =  x*x + 1
+        0x0F, 0xAF, 0xC9, 0x8D, 0x41, 0x01, 0xC3, 0x90, //
+        // 0x08  f(a, b):
+        0x53, // 0x08  push rbx
+        0x56, // 0x09  push rsi
+        0x48, 0x83, 0xEC, 0x20, // 0x0A  sub rsp, 0x20
+        0x89, 0xD6, // 0x0E  mov  esi, edx      ; b -> RSI (RDX read #1)
+        0xE8, 0xEB, 0xFF, 0xFF, 0xFF, // 0x10  call 0x0 ; h(a)  (next 0x15)
+        0x89, 0xC3, // 0x15  mov  ebx, eax      ; h(a) -> RBX (nonvolatile)
+        0x89, 0xF1, // 0x17  mov  ecx, esi      ; RCX = RSI (RSI read AFTER call #1)
+        0xE8, 0xE2, 0xFF, 0xFF, 0xFF, // 0x19  call 0x0 ; h(b)  (next 0x1E; RDX NOT rewritten)
+        0x01, 0xD8, // 0x1E  add  eax, ebx      ; h(b) + h(a)
+        0x48, 0x83, 0xC4, 0x20, // 0x20  add rsp, 0x20
+        0x5B, // 0x24  pop rbx
+        0x5E, // 0x25  pop rsi
+        0xC3, // 0x26  ret
+    ]
+}
+
+#[test]
+fn a_one_argument_callee_makes_both_call_sites_read_one_cell() {
+    let owned = bytes_call_helper();
+    let ranges = [Code {
+        base: 0,
+        bytes: owned.as_slice(),
+    }];
+    let mut seeds: std::collections::HashMap<usize, (Vec<u64>, Vec<u64>)> =
+        std::collections::HashMap::new();
+    seeds.insert(0, (vec![0u64, 8u64], vec![]));
+    let plan = discover_all(&ranges, &seeds);
+    let mut names: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+    names.insert(0, "h".to_string());
+    names.insert(8, "f".to_string());
+    // The callee table the TWO-PASS front end hands the lifter: `h`'s own
+    // lifted body reads ONE argument cell (`x * x + 1` reads x), so its
+    // signature carries `nargs: 1`, the value `Function::args_read` computes
+    // from the body lifted below - the fixture asserts that equality, so the
+    // hand-built table cannot drift from the rule the pipeline recovers.
+    let sig_h = CalleeSig {
+        cname: "h".to_string(),
+        abi: FnAbi::integer(),
+        typed: true,
+        noreturn: false,
+        nargs: 1,
+    };
+    let sigs: std::collections::HashMap<String, CalleeSig> =
+        [("h".to_string(), sig_h)].into_iter().collect();
+    let (mut h, _) = lift_one_sigs(
+        "h",
+        &owned,
+        0,
+        0,
+        8,
+        &plan,
+        &names,
+        &FnAbi::integer(),
+        &sigs,
+        &no_relocs(),
+        &no_tables(),
+    );
+    let (mut f, rep) = lift_one_sigs(
+        "f",
+        &owned,
+        0,
+        8,
+        owned.len() as u64,
+        &plan,
+        &names,
+        &FnAbi::integer(),
+        &sigs,
+        &no_relocs(),
+        &no_tables(),
+    );
+    assert_eq!(h.args_read(), 1, "h reads only its first argument cell");
+    assert_eq!(rep.calls_modelled, 2, "both calls are modelled");
+    clean(&mut h);
+    clean(&mut f);
+    // f reads a (to pass to h) and b (the `mov esi, edx`) - and nothing of
+    // R8/R9: the arity the two-pass stamps on f's OWN signature.
+    assert_eq!(f.args_read(), 2);
+    // The two-pass stamps these (crates/cli/src/m4.rs); the fixture mirrors
+    // the stamped state so the emitter and the C harness see what pass 2 emits.
+    h.nparams = Some(1);
+    f.nparams = Some(2);
+    verify_ssa(&f).expect("valid SSA");
+    let mut protos: Protos = Protos::new();
+    protos.insert("h".to_string(), callee_decl(&h));
+    let out = emit_c_sig(&f, &protos).unwrap_or_else(|rs| {
+        panic!(
+            "the second call site reads ONE cell, so f emits; refused with {:?}\n{}",
+            rs.iter().map(|r| &r.reason).collect::<Vec<_>>(),
+            rdec_core::fmt_ir::format_function(&f)
+        )
+    });
+    assert!(
+        out.text.contains("extern uint32_t h(uint64_t);"),
+        "the prototype declares the RECOVERED arity (one parameter):\n{}",
+        out.text
+    );
+    assert!(
+        !out.text.contains(", 0, 0, 0)"),
+        "the call passes ONE argument, not the 4-pair spelling:\n{}",
+        out.text
+    );
+    assert!(
+        !out.text.contains("clobbered by call"),
+        "no clobber refusal text:\n{}",
+        out.text
+    );
+    // Ground truth, from the C source quoted above:
+    // f(3, 4) = h(3) + h(4) = (3*3+1) + (4*4+1) = 10 + 17 = 27.
+    let exec = run_program_budget(&f, &[3, 4, 0, 0], &[h.clone()], 20000);
+    match exec.outcome {
+        Outcome::Ret(Val::Int(v)) => assert_eq!(v, 27, "f(3,4) = h(3) + h(4) = 27"),
+        other => panic!("expected the answer, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ARITY, fixture (b): the `fib_rec` shape. Ground truth, the corpus source
+// `corpus/src/fib_rec.c` (`long f(int n)` computing Fibonacci), compiled
+// -O1: the recursion carries `n` in RSI across the self-call and accumulates
+// in RDI - both NONVOLATILE - and the self-call passes ONE cell. Pre-fix the
+// loop-carried RDX/R8/R9 cells (destroyed by the previous iteration's call)
+// sat in the call's argument list and the function refused. Hand-assembled
+// from the -O1 disassembly:
+//
+//     f(5):  acc=0, n=5 >= 2: acc += f(4)=3, n=3
+//            n=3 >= 2:       acc += f(2)=1 -> 4, n=1
+//            n=1 <  2: return acc + n = 4 + 1 = 5
+//     f(4):  acc += f(3)=2, n=2; acc += f(1)=1 -> 3, n=0; return 3.
+//     f(3):  acc += f(2)=1, n=1; return 1+1 = 2.
+//     f(2):  acc += f(1)=1, n=0; return 1.   f(1)=1, f(0)=0.
+fn bytes_fib_rec() -> Vec<u8> {
+    vec![
+        0x56, // 0x00  push rsi
+        0x57, // 0x01  push rdi
+        0x48, 0x83, 0xEC, 0x28, // 0x02  sub rsp, 0x28
+        0x89, 0xCE, // 0x06  mov esi, ecx       ; n -> RSI (RSI read)
+        0x31, 0xFF, // 0x08  xor edi, edi       ; acc = 0
+        0x83, 0xFE, 0x02, // 0x0A  cmp esi, 2
+        0x7C, 0x13, // 0x0D  jl  0x22
+        0x90, // 0x0F  nop
+        0x8D, 0x4E, 0xFF, // 0x10  lea ecx, [rsi-1]   ; n-1 -> RCX
+        0xE8, 0xE8, 0xFF, 0xFF, 0xFF, // 0x13  call 0x0 ; f(n-1)  (next 0x18; self)
+        0x01, 0xC7, // 0x18  add edi, eax       ; acc += answer (RAX defined BY the call)
+        0x83, 0xC6, 0xFE, // 0x1A  add esi, -2        ; n -= 2 (RSI read AFTER the call)
+        0x83, 0xFE, 0x02, // 0x1D  cmp esi, 2
+        0x7D, 0xEE, // 0x20  jge 0x10
+        0x01, 0xFE, // 0x22  add edi, esi       ; acc + n
+        0x89, 0xF0, // 0x24  mov eax, esi       ; answer = acc + n
+        0x48, 0x83, 0xC4, 0x28, // 0x26  add rsp, 0x28
+        0x5F, // 0x2A  pop rdi
+        0x5E, // 0x2B  pop rsi
+        0xC3, // 0x2C  ret
+    ]
+}
+
+#[test]
+fn a_recursive_callee_reads_its_own_first_cell_only() {
+    let owned = bytes_fib_rec();
+    let ranges = [Code {
+        base: 0,
+        bytes: owned.as_slice(),
+    }];
+    let mut seeds: std::collections::HashMap<usize, (Vec<u64>, Vec<u64>)> =
+        std::collections::HashMap::new();
+    seeds.insert(0, (vec![0u64], vec![]));
+    let plan = discover_all(&ranges, &seeds);
+    let mut names: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+    names.insert(0, "f".to_string());
+    // RECURSION IS COVERED BY THE CALLEE'S OWN BODY: `f`'s pass-1 lift is the
+    // evidence for `f`'s calls to itself, and a self-forwarded cell is not a
+    // read (`Function::args_read`), so the arity drops to the ONE cell the
+    // body reads. The hand-built table carries that recovered value.
+    let sig_f = CalleeSig {
+        cname: "f".to_string(),
+        abi: FnAbi::integer(),
+        typed: true,
+        noreturn: false,
+        nargs: 1,
+    };
+    let sigs: std::collections::HashMap<String, CalleeSig> =
+        [("f".to_string(), sig_f)].into_iter().collect();
+    let (mut f, rep) = lift_one_sigs(
+        "f",
+        &owned,
+        0,
+        0,
+        owned.len() as u64,
+        &plan,
+        &names,
+        &FnAbi::integer(),
+        &sigs,
+        &no_relocs(),
+        &no_tables(),
+    );
+    assert_eq!(rep.calls_modelled, 1, "the self-call is modelled");
+    clean(&mut f);
+    assert_eq!(
+        f.args_read(),
+        1,
+        "the loop-carried RDX reaches only SELF-call argument slots: forwarding to self is not reading"
+    );
+    f.nparams = Some(1);
+    verify_ssa(&f).expect("valid SSA");
+    let mut protos: Protos = Protos::new();
+    protos.insert("f".to_string(), callee_decl(&f));
+    let out = emit_c_sig(&f, &protos).unwrap_or_else(|rs| {
+        panic!(
+            "the loop-carried call reads ONE cell, so f emits; refused with {:?}\n{}",
+            rs.iter().map(|r| &r.reason).collect::<Vec<_>>(),
+            rdec_core::fmt_ir::format_function(&f)
+        )
+    });
+    assert!(
+        !out.text.contains("clobbered by call"),
+        "no clobber refusal text:\n{}",
+        out.text
+    );
+    // The interpreter runs the recursion; the derivation is in the comment on
+    // `bytes_fib_rec`: f(5)=5, f(4)=3, f(2)=1, f(0)=0 (Fibonacci).
+    let callee = f.clone();
+    for (n, want) in [(5u64, 5u64), (4, 3), (3, 2), (2, 1), (1, 1), (0, 0)] {
+        let exec = run_program_budget(&f, &[n, 0, 0, 0], std::slice::from_ref(&callee), 20000);
+        match exec.outcome {
+            Outcome::Ret(Val::Int(v)) => assert_eq!(v, want, "f({n})"),
+            other => panic!("f({n}) must answer, got {other:?}"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ANTI-INVENTION: a callee with NO visible body keeps the four pairs. The
+// arity comes from a lifted body and from nothing else: an import, a thunk,
+// any name the pipeline cannot see into, stays at the loud 4-pair default
+// (over-estimating refuses loudly; under-estimating reads a cell the caller
+// never passed). Asserted on the IR the lifter emits, not on prose.
+#[test]
+fn a_callee_with_no_recovered_arity_keeps_four_argument_reads() {
+    let owned = bytes_int_pair();
+    let ranges = [Code {
+        base: 0,
+        bytes: owned.as_slice(),
+    }];
+    let mut seeds: std::collections::HashMap<usize, (Vec<u64>, Vec<u64>)> =
+        std::collections::HashMap::new();
+    seeds.insert(0, (vec![0u64, 4u64], vec![]));
+    let plan = discover_all(&ranges, &seeds);
+    let mut names: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+    names.insert(0, "g".to_string());
+    names.insert(4, "f".to_string());
+    // `g` is TYPED (the integer model) with NO body evidence: nargs stays 4.
+    let sig = CalleeSig {
+        cname: "g".to_string(),
+        abi: FnAbi::integer(),
+        typed: true,
+        noreturn: false,
+        nargs: 4,
+    };
+    let sigs: std::collections::HashMap<String, CalleeSig> =
+        [("g".to_string(), sig)].into_iter().collect();
+    let (g, _) = lift_one_sigs(
+        "g",
+        &owned,
+        0,
+        0,
+        4,
+        &plan,
+        &names,
+        &FnAbi::integer(),
+        &sigs,
+        &no_relocs(),
+        &no_tables(),
+    );
+    let (f, _) = lift_one_sigs(
+        "f",
+        &owned,
+        0,
+        4,
+        owned.len() as u64,
+        &plan,
+        &names,
+        &FnAbi::integer(),
+        &sigs,
+        &no_relocs(),
+        &no_tables(),
+    );
+    let call = f
+        .blocks
+        .iter()
+        .flat_map(|b| b.instrs.iter())
+        .find(|i| matches!(i.op, Op::Call { .. }))
+        .expect("f has a call");
+    match &call.op {
+        Op::Call { args, .. } => assert_eq!(args.len(), 4, "the 4-pair default stands"),
+        _ => unreachable!(),
+    }
+    let decl = callee_decl(&g);
+    assert_eq!(
+        decl.params.len(),
+        4,
+        "the declaration keeps the four seeded cells: {} params",
+        decl.params.len()
+    );
+    assert!(
+        decl.params.iter().all(|p| *p == Ty::u64()),
+        "the four cells are the integer model's, undeclared-arity intact: {:?}",
+        decl.params
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The MAX-INDEX rule at the call site: a callee that reads TWO argument cells
+// gets TWO arguments at every call site - never one (a leading-reads count
+// would give 1 if the body's reads were sparse), never four. A body that
+// reads cell 1 and NOT cell 0 needs two cells: `max(read index) + 1`.
+#[test]
+fn a_two_cell_callee_gets_exactly_two_arguments() {
+    // g(a, b): `imul ecx, edx; lea eax, [rcx+1]; ret` = x*y + 1 - reads
+    // RCX (cell 0) and RDX (cell 1). f(a, b, c, d): `call g; ret` passes
+    // exactly the two cells g reads.
+    let owned: Vec<u8> = vec![
+        0x0F, 0xAF, 0xCA, // 0x00  g: imul ecx, edx
+        0x8D, 0x41, 0x01, // 0x03       lea eax, [rcx+1]
+        0xC3, // 0x06       ret
+        // 0x07  f:
+        0xE8, 0xF4, 0xFF, 0xFF, 0xFF, // 0x07  call 0x0 (next 0x0C, target 0)
+        0xC3, // 0x0C       ret
+    ];
+    let ranges = [Code {
+        base: 0,
+        bytes: owned.as_slice(),
+    }];
+    let mut seeds: std::collections::HashMap<usize, (Vec<u64>, Vec<u64>)> =
+        std::collections::HashMap::new();
+    seeds.insert(0, (vec![0u64, 7u64], vec![]));
+    let plan = discover_all(&ranges, &seeds);
+    let mut names: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+    names.insert(0, "g".to_string());
+    names.insert(7, "f".to_string());
+    let sig = CalleeSig {
+        cname: "g".to_string(),
+        abi: FnAbi::integer(),
+        typed: true,
+        noreturn: false,
+        nargs: 2,
+    };
+    let sigs: std::collections::HashMap<String, CalleeSig> =
+        [("g".to_string(), sig)].into_iter().collect();
+    let (g, _) = lift_one_sigs(
+        "g",
+        &owned,
+        0,
+        0,
+        7,
+        &plan,
+        &names,
+        &FnAbi::integer(),
+        &sigs,
+        &no_relocs(),
+        &no_tables(),
+    );
+    let (mut f, _) = lift_one_sigs(
+        "f",
+        &owned,
+        0,
+        7,
+        owned.len() as u64,
+        &plan,
+        &names,
+        &FnAbi::integer(),
+        &sigs,
+        &no_relocs(),
+        &no_tables(),
+    );
+    assert_eq!(g.args_read(), 2, "imul reads cells 0 and 1");
+    clean(&mut f);
+    let call = f
+        .blocks
+        .iter()
+        .flat_map(|b| b.instrs.iter())
+        .find(|i| matches!(i.op, Op::Call { .. }))
+        .expect("f calls g");
+    match &call.op {
+        Op::Call { args, .. } => {
+            assert_eq!(args.len(), 2, "TWO arguments - max index 1 plus one");
+            assert_eq!(args[0], f.params[0], "argument 0 is the caller's RCX cell");
+            assert_eq!(
+                args[1], f.params[1],
+                "argument 1 is the caller's RDX cell, not an undef"
+            );
+        }
+        _ => unreachable!(),
+    }
 }

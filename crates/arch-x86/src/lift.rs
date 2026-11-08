@@ -452,7 +452,7 @@ pub struct FnShape {
 
 /// What a call site knows about one callee: its identity in the generated
 /// translation unit, and its declared shape.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct CalleeSig {
     /// The C name the pipeline gives this function - the identity `Op::Call`
     /// records and the emitter declares. Not the COFF name: one C file holds
@@ -469,6 +469,35 @@ pub struct CalleeSig {
     /// callee noreturn deletes its caller's answer; leaving a noreturn callee
     /// undeclared leaves the caller's `Exit`, which is loud.
     pub noreturn: bool,
+    /// How many leading argument CELLS the call site reads for this callee:
+    /// the call passes the first `nargs` of the callee's seeded pairs.
+    ///
+    /// The DEFAULT is the pair count of the integer model (four), which is
+    /// today's behaviour and what EVERY callee keeps until the pipeline's
+    /// two-pass RECOVERS a smaller number from the callee's own lifted body
+    /// (`rdec_core::ir::Function::args_read`, applied in the CLI's
+    /// `lift_all_named_shapes`). The anti-invention floor lives in that
+    /// default: a callee the pipeline cannot see - an import, a relocation
+    /// whose symbol this object does not define, any callee with no lifted
+    /// body - keeps four, so the call site reads all four cells and a caller
+    /// that reads a dead cell keeps the loud `clobbered by call` refusal.
+    /// Lowering this field is a FACT about a body the pipeline lifted, never
+    /// a guess from a name.
+    pub nargs: usize,
+}
+
+impl Default for CalleeSig {
+    fn default() -> CalleeSig {
+        CalleeSig {
+            cname: String::new(),
+            abi: FnAbi::default(),
+            typed: false,
+            noreturn: false,
+            // Four pairs: the integer model's argument cells, the loud default
+            // (see the `nargs` doc - an unseen callee keeps today's behaviour).
+            nargs: ARG_REGS.len(),
+        }
+    }
 }
 
 /// The termination family: symbols whose calls do not return. A NAME TABLE, kept
@@ -571,16 +600,25 @@ pub fn no_tables() -> Tables {
 
 static EMPTY_TABLES: std::sync::LazyLock<Tables> = std::sync::LazyLock::new(Tables::new);
 
-/// Caller-saved: a call may overwrite these. The Windows x64 ABI says the
-/// WHOLE XMM register is caller-saved, and the pair model has two cells to
-/// destroy per register — a high lane left alive across a call is the same
-/// class of bug as an int in ECX across one. The CLOBBER COUNT, though, stays
-/// at the ABI's register count (9 GPRs + 16 XMMs, minus the defined output):
+/// Caller-saved: a call may overwrite these. The Windows x64 ABI's volatile
+/// integer set is RAX, RCX, RDX, R8-R11 — SEVEN: `RSI` and `RDI` are NOT
+/// volatile on Win64 (the ABI classifies RBX, RBP, RDI, RSI, R12-R15 as
+/// nonvolatile, callee-preserved); the 9-GPR list this set carried was the
+/// SysV ABI's answer, a different ABI (measured, `call_helper.O1`: `movl
+/// %edx,%esi` carries `b` in RSI across `callq h` and reads it at 0x13 — with
+/// RSI modelled destroyed the read lands on the call's `Op::Clobber` and the
+/// function refuses `clobbered by call`, a modelling artifact the machine
+/// contradicts, and T2 is the gate that says so). The WHOLE XMM register is
+/// caller-saved on Win64 (XMM6-15 are nonvolatile there too — untouched by
+/// this fix, no measured refusal; the pair model has two cells to destroy per
+/// register — a high lane left alive across a call is the same class of bug
+/// as an int in ECX across one). The CLOBBER COUNT, though, stays at the
+/// ABI's register count (7 GPRs + 16 XMMs, minus the defined output):
 /// `calls.rs` pins "RAX is defined BY THE CALL, so it is not among the
-/// clobbers: 25 caller-saved registers minus the one the call defines", and
-/// the clobber is a STATEMENT ABOUT A REGISTER — a cell-level pair is two
-/// IR ops for the same statement, and counting the statement twice would
-/// move a floor this slice must not move.
+/// clobbers" at the CELL level (7 + 32 - 1 = 38), and the clobber is a
+/// STATEMENT ABOUT A REGISTER — a cell-level pair is two IR ops for the same
+/// statement, and counting the statement twice would move a floor this slice
+/// must not move.
 static CALLER_SAVED: &[&[Grp]] = &[
     &[
         Grp::Rax,
@@ -590,8 +628,6 @@ static CALLER_SAVED: &[&[Grp]] = &[
         Grp::R9,
         Grp::R10,
         Grp::R11,
-        Grp::Rsi,
-        Grp::Rdi,
     ],
     &[
         Grp::Xmm(0),
@@ -4520,6 +4556,18 @@ impl<'a> Lifter<'a> {
             }
             _ => ARG_REGS.to_vec(),
         };
+        // ARITY: the call reads only the FIRST `nargs` of the callee's pairs.
+        // `nargs` is 4 (today's reading) for every callee the pipeline cannot
+        // see into, and the count of argument cells the callee's OWN lifted
+        // body reads once the two-pass front end has recovered it (see
+        // `CalleeSig::nargs`). The refusal this closes is the machine-dead
+        // cells: `int h(int x)` reads only pair 0, and a caller that read
+        // RDX/R8/R9 to "pass" four arguments was reading the PREVIOUS call's
+        // clobbers and refusing on them.
+        let mut pairs = pairs;
+        if let Some(s) = sig {
+            pairs.truncate(s.nargs);
+        }
         let mut args: Vec<VId> = Vec::with_capacity(pairs.len());
         for g in pairs {
             let a = self.read64(g);
@@ -4628,12 +4676,19 @@ impl<'a> Lifter<'a> {
             self.gap("call with more than four register arguments", Ty::i64());
             self.rep.calls_over_args += 1;
         }
-        let pairs: Vec<Grp> = match self.sigs.get(sym) {
+        let mut pairs: Vec<Grp> = match self.sigs.get(sym) {
             Some(s) if s.typed && ins.op_count() <= 1 => {
                 s.abi.seeded_pairs().into_iter().map(|(g, _)| g).collect()
             }
             _ => ARG_REGS.to_vec(),
         };
+        // The same arity rule as `emit_call_site` (see `CalleeSig::nargs`):
+        // a callee whose body the two-pass lifted is called with the cells its
+        // body reads. The noreturn family is declared by NAME (an import, no
+        // body) and keeps the table's default four.
+        if let Some(s) = self.sigs.get(sym) {
+            pairs.truncate(s.nargs);
+        }
         let mut args: Vec<VId> = Vec::with_capacity(pairs.len());
         for g in pairs {
             let a = self.read64(g);

@@ -684,6 +684,14 @@ pub struct Function {
     /// always had.
     pub param_tys: Vec<Ty>,
     pub ret_ty: Ty,
+    /// The arity the generated C declares for this function, when the pipeline
+    /// has RECOVERED one: `Some(k)` means "the definition declares exactly k
+    /// parameters, every call site passes exactly k arguments" — the number the
+    /// two-pass front end computes from the callee's own body with
+    /// [`Function::args_read`]. `None` is today's spelling (declare every
+    /// seeded parameter, at least one), which is what a hand-built function,
+    /// an import, and any callee the pipeline cannot see into keeps.
+    pub nparams: Option<usize>,
 }
 
 impl Function {
@@ -699,6 +707,7 @@ impl Function {
             params: Vec::new(),
             param_tys: Vec::new(),
             ret_ty: Ty::Void,
+            nparams: None,
         };
         let e = f.new_block(0);
         f.entry = e;
@@ -815,6 +824,88 @@ impl Function {
             }
         }
         out
+    }
+
+    /// The number of leading argument cells this function's body READS:
+    /// `max(index of a READ parameter) + 1`, and 0 when no parameter is read.
+    ///
+    /// A parameter counts as READ iff its value appears in this function's
+    /// def-use use set — `uses_of` answers it, walking exactly ONE step to the
+    /// operand (an `Add` on a parameter is a read of the parameter; walking
+    /// INTO the arithmetic would answer a different question). Reads reached
+    /// through `Cast`/`Copy`/`Phi` count, and terminator operands count:
+    /// `uses_of` includes `Branch.cond`, `Return` and `Switch.index`, the
+    /// known trap in this repo (a callee whose parameter only reaches a branch
+    /// condition reads that parameter).
+    ///
+    /// SELF-FORWARDING IS NOT READING. A use at a call to this function's OWN
+    /// name, in the argument list, is the model's own pair-count talking: the
+    /// cell is read only to be passed to the very callee whose arity this
+    /// question is computing, and a callee of arity `k` reads only pairs
+    /// `0..k`, so the forwarded cell is never consumed (measured, `fib_rec`:
+    /// `long f(int n)` reads only RCX, and RDX reaches an argument slot
+    /// through the 4-pair model's own reading — a self-witness the two-pass
+    /// must not count, or the arity never drops below the artifact that
+    /// raised it). Calls to a DIFFERENT named callee count: forwarding `x` to
+    /// `h` is reading `x` for `h`.
+    ///
+    /// The walk is transitive through `Phi` ONLY: a loop-carried parameter
+    /// reaches its use as `phi(param, latch)`, so stopping at the phi's
+    /// incoming edge would call the RDX of `fib_rec`'s loop UNREAD (the real
+    /// use consumes the PHI'S DEST) and under-estimate — the unsafe
+    /// direction. Walking through anything that COMPUTES (Add, Load, …)
+    /// would answer a different question, so the walk stops at the first
+    /// non-phi consumer, which is the read.
+    ///
+    /// SOUNDNESS DIRECTION: over-estimating arity is the SAFE direction — the
+    /// call site reads more cells, which is today's loud `clobbered by call`
+    /// refusal. Under-estimating is UNSAFE — the callee would read a cell the
+    /// caller never passed. That is why this is MAX-INDEX-PLUS-ONE over all
+    /// reads, never a count of leading reads: a body that reads cell 1 and not
+    /// cell 0 needs TWO cells, not one.
+    pub fn args_read(&self) -> usize {
+        fn reads(f: &Function, v: VId, seen: &mut std::collections::BTreeSet<VId>) -> bool {
+            for u in f.uses_of(v) {
+                let ins = if u.instr == usize::MAX {
+                    // A terminator operand (Branch/Return/Switch) is a read.
+                    return true;
+                } else {
+                    match f.blocks[u.bb as usize].instrs.get(u.instr) {
+                        Some(ins) => ins,
+                        None => return true,
+                    }
+                };
+                match &ins.op {
+                    Op::Call { callee, .. } => {
+                        // Forwarding to SELF is not reading; forwarding to a
+                        // named other callee, or through an indirect call, is.
+                        if !matches!(callee, Callee::Symbol(s) if *s == f.name) {
+                            return true;
+                        }
+                    }
+                    Op::Phi(_) => {
+                        // `v` flows INTO the phi; the value that flows OUT
+                        // (the phi's dest) is what the loop consumes, so the
+                        // walk continues at the dest, not at the other edge.
+                        let d = ins.dest;
+                        if seen.insert(d) && reads(f, d, seen) {
+                            return true;
+                        }
+                    }
+                    _ => return true,
+                }
+            }
+            false
+        }
+        let mut n = 0;
+        for (i, &p) in self.params.iter().enumerate() {
+            let mut seen = std::collections::BTreeSet::new();
+            seen.insert(p);
+            if reads(self, p, &mut seen) {
+                n = i + 1;
+            }
+        }
+        n
     }
 
     /// Rewrite every use of `old` to `new`, in operands and in terminators.

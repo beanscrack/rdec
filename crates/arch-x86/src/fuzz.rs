@@ -958,6 +958,10 @@ pub fn front_half(input: &Input, st: &mut Stats) {
                             abi: FnAbi::integer(),
                             typed: true,
                             noreturn: crate::lift::noreturn_symbol(&s.name),
+                            // The default four pairs: this table has no body
+                            // evidence, so no arity is recovered (see
+                            // `CalleeSig::nargs`).
+                            nargs: 4,
                         },
                     );
                 }

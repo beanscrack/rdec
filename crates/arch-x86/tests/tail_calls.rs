@@ -778,6 +778,9 @@ fn abort_declared() -> CalleeSig {
         abi: FnAbi::integer(),
         typed: true,
         noreturn: true,
+        // An import: no body in the object, so the default four pairs stand
+        // (the anti-invention floor, see `CalleeSig::nargs`).
+        nargs: 4,
     }
 }
 
@@ -1001,6 +1004,7 @@ fn the_same_bytes_without_a_declared_noreturn_callee_keep_the_loud_call_shape() 
         abi: FnAbi::integer(),
         typed: true,
         noreturn: false,
+        nargs: 4,
     };
     let (f, rep) = lift_nr(&table_with(undeclared, "abort"));
     assert_eq!(rep.noreturn_calls, 0, "no declaration, no noreturn model");
