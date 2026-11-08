@@ -40,7 +40,19 @@ function Set-RdecMsvcEnv {
     # which prints the banner on stderr, a usage line on stdout, and exits 1 (cl's
     # usage path). `Select-Object -First 1` alone grabbed the usage line, not the
     # version - select the line that names the version.
-    $banner = (& $wrap 2>&1 | Select-String -Pattern "Version" | Select-Object -First 1)
+    # The banner is on stderr, and Windows PowerShell 5.1 turns a native
+    # command's stderr, taken with `2>&1`, into an ERROR RECORD. Under
+    # $ErrorActionPreference = 'Stop' — which is what a CI step runs with —
+    # capturing a version banner then aborts the job: measured on windows-latest,
+    # run 42472240749, where "Microsoft (R) C/C++ Optimizing Compiler Version
+    # 19.51.36260 for x64" arrived as NativeCommandError and the msvc job died 43
+    # seconds in, before a single object was compiled. Locally this line never
+    # ran, because the generator spawns the driver directly from Rust; the lane's
+    # own validation ran it on a shell where the same construct does not throw.
+    # Route the probe through cmd so the streams merge BEFORE PowerShell sees
+    # them: there is then no error record to throw, and `cl` with no arguments
+    # still exits 1, which `cmd /c` reports in $LASTEXITCODE without ending us.
+    $banner = (cmd /c "`"$wrap`" 2>&1") | Select-String -Pattern "Version" | Select-Object -First 1
     Write-Host "cl          : $banner"
     if (-not "$banner") { Write-Error "cl printed no banner through $wrap" }
 }
