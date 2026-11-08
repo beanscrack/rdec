@@ -1346,8 +1346,8 @@ lift.rs crates/arch-x86/src/discover.rs` returns 0 — that is the evidence for 
 | M3 noreturn / tail calls / jump-table targets | (no gate exists yet) | **NOT DONE** — zero handling in the lifter or discovery; the roadmap moved these into M3 (`ROADMAP.md:363-367`) and they were never built. A `jmp` to a known entry is still a call-shaped exit; `abort`/`__fastfail` are not noreturn, so CFG recovery is wrong at those. | gate first, then the feature: a fixture per item, red, then green |
 | M3 stable IDs | (no gate exists yet) | **NOT DONE** — IR value numbers are per-function and not stable across passes, so cross-pass diffing is not available | needs a stable-id invariant pinned by a test |
 | M4 C emitter | `rdec c --corpus` | **RED, by design** — 140 lifted / **119 emitted** / **21 refused** / 0 invalid after passes; clang -Werror OK. Classes now: 8 call-clobber, 6 `lea` of an unnameable address, 4 `lea` naming `.rdata`, 2 live-in `Rsp`, 1 `shufps` (packed SIMD, M8). The arithmetic classes are **gone**: 10 `cdq`, 6 `imul`, 4 `div` landed 2026-11-08 (accumulator forms, silicon-quoted fixtures in `acc_forms.rs`). Remaining named gaps: the 128-bit `rdx:rax` dividend of `div`/`idiv r/m64`, quotient overflow (`#DE`), CF/OF after a 32-bit `mul`/`imul` (declared undefined) | refusals -> 0 with every gap named in between |
-| T2 differential, C | `rdec t2 --corpus` | **GREEN as a sample** — 107 native drivers, compared **2260**, match **2260**, mismatch **0**, 20 not-compared (genuine `loop_do` infinite loops). Memory axis **408/408**, IR leg **408/408**. The +464 comparisons since 2026-11-07 are the four division/multiply families (`div_pow2`, `div_unsigned`, `divmod_signed`, `mul_wide` x 4 opt levels) that were refused before: signed `/` and `%`, unsigned `/`, the 64-bit `imul` high half and the magic-constant `imul r64,r/m64,imm32` are now machine-verified. | XMM0 class, more coverage, memory effects beyond the caller window |
-| T2 differential, C++ | `rdec t2 --cpp` | **GREEN as a sample** — 27 functions (15 RAX-class + 12 window-class), 648 runs, 648 matches, 0 mismatch, 0 faults, buckets sum to 78. Return value only; the window class compares the return, not memory. | XMM0 class (in progress), more coverage, memory effects |
+| T2 differential, C | `rdec t2 --corpus` | **GREEN as a sample** — 107 native drivers, compared **2260**, match **2260**, mismatch **0**. The 20 not-compared runs are ALL machine-side `#DE` (`exit 0xc0000094`, STATUS_INTEGER_DIVIDE_BY_ZERO) on `div_unsigned`/`divmod_signed` at vectors 1 and 22 — the zero-divisor vectors, where the machine traps, the interpreter faults `Fault::DivZero`, and the emitted C answers 0. The harness names the faulting side and excludes them from the match count, so "2260/2260" is a claim about the division cases the machine survives. Memory axis **408/408**, IR leg **408/408**. The +464 comparisons since 2026-11-07 are the four division/multiply families (`div_pow2`, `div_unsigned`, `divmod_signed`, `mul_wide` x 4 opt levels) that were refused before: signed `/` and `%`, unsigned `/`, the 64-bit `imul` high half and the magic-constant `imul r64,r/m64,imm32` are now machine-verified. | XMM0 class, more coverage, memory effects beyond the caller window |
+| T2 differential, C++ | `rdec t2 --cpp` | **GREEN as a sample** (measured 2026-11-08, after this slice's emitter change) — compared **856**, match **856**, mismatch **0**, not-compared **0**, over 18 RAX-class + 16 window-class + 5 XMM0-class functions; 22 native drivers, 2 decompiled runners, 0 restarts after faults. Return value and XMM0 bit pattern; the window class compares the return, not memory. This row re-reads the gate because `SDiv`/`SRem` now read their operands with the op's signedness, and the C++ corpus is where signed `/` and `%` reach the emitter from C++ types — the change is green on 856 C++ machine runs, not only on the C corpus. | memory effects; the window class compares the return, not the window |
 | M8 step 0 demangler | `rdec demangle --cpp` | **GREEN** — 68/68 supported symbols agree with `llvm-nm`, 1 template unsupported (named) | closed for the corpus; templates open |
 | M8 step 1-2 C++ through the pipeline | `rdec cpp --corpus` | **RED by design, improving** — lifted 78, valid 78/78, emitted C 62, refused 16; clang -Werror OK | refusals -> 0 |
 | M8 step 3 C++ value-verified | `rdec t2 --cpp` | **GREEN as a sample** (row above) | — |
@@ -2182,6 +2182,20 @@ MEASURED (parent-run, un-piped, exit codes as verdicts):
   families at four opt levels — `divmod_signed` (signed `/` and `%`),
   `div_unsigned`, `div_pow2`, `mul_wide` (the 64-bit `imul` high half, so the
   PRELUDE helper is compared against the machine, not just against `__int128`).
+- THE 20 NOT-COMPARED RUNS ARE THE MACHINE TRAPPING, not the model drifting:
+  every one is `exit 0xc0000094` = STATUS_INTEGER_DIVIDE_BY_ZERO, on the
+  **machine-code side**, on `div_unsigned`/`divmod_signed` vectors 1 and 22 — the
+  zero-divisor vectors. The harness names the faulting side and refuses to count
+  them as matches, which is the accounting that makes "2260/2260" a real claim:
+  the corpus's division cases where the machine survives are all compared, and
+  the ones where it raises `#DE` are named. Same three-way story the fixtures
+  pin: machine `#DE`, interpreter `Fault::DivZero`, emitted C answers 0. The
+  infinite-loop fixtures that used to fill this bucket are not in it.
+- `t2 --cpp`: **856 / 856 / 0 mismatch / 0 not-compared** over 18 RAX + 16
+  window + 5 XMM0 functions. This gate matters more for this slice than the
+  numbers suggest: the C++ corpus is where signed `/` and `%` reach the emitter
+  from C++ signed types, so the `SDiv`/`SRem` signedness change is green on 856
+  machine runs, not only on the C corpus.
 - `c --corpus` exits 1 by design (refusals > 0), and the refusal census is the
   map: `lea`-of-an-unnameable-address is the largest class now, and it is a
   discovery artifact, not an instruction set.
