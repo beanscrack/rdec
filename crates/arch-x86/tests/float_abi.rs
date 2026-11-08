@@ -491,8 +491,9 @@ fn a_signed_int_to_double_conversion_emits_c_that_clang_accepts() {
     assert_eq!(rep.ret_f64, 1, "a declared double answer comes from XMM0");
     let out = emit_c(&f).expect("emits");
     assert!(
-        out.text.contains("(double)((int64_t)("),
-        "the signed source is cast to a TYPE: `(double)((int64_t)(x))`\n{}",
+        out.text.contains("(double)((int32_t)("),
+        "the signed source is cast at ITS OWN width: `cvtsi2sd xmm0, ecx` reads a \
+         32-bit cell, so the C must say `(double)((int32_t)(x))`\n{}",
         out.text
     );
     assert!(
@@ -500,6 +501,11 @@ fn a_signed_int_to_double_conversion_emits_c_that_clang_accepts() {
         "`((int64_t))(x)` is a cast with no operand; clang: expected expression\n{}",
         out.text
     );
+    // The cast WIDTH is part of the conversion, which is why the pin above is
+    // `int32_t` and not the widened `(int64_t)` this emitter used to spell: a
+    // cell holding 0xCB01F9D0 read as `int64_t` is +3405904336 (the zero-extend
+    // of a 32-bit unsigned), and the same cell read at its own width is
+    // -889062960. The machine reads the second.
     let exec = run_budget(&f, &[5, 0, 0, 0], 20000);
     match exec.outcome {
         Outcome::Ret(Val::Fl(v)) => {
@@ -508,6 +514,14 @@ fn a_signed_int_to_double_conversion_emits_c_that_clang_accepts() {
                 "the interpreter converts the same value the C casts"
             )
         }
+        other => panic!("unexpected: {other:?}"),
+    }
+    let exec = run_budget(&f, &[0xCB01_F9D0, 0, 0, 0], 20000);
+    match exec.outcome {
+        Outcome::Ret(Val::Fl(v)) => assert_eq!(
+            v, -889_062_960.0,
+            "a 32-bit signed source with the sign bit set converts NEGATIVE"
+        ),
         other => panic!("unexpected: {other:?}"),
     }
 }
@@ -531,8 +545,9 @@ fn a_signed_int_to_single_conversion_converts_to_float_not_double() {
     verify_ssa(&f).expect("valid SSA");
     let out = emit_c(&f).expect("emits");
     assert!(
-        out.text.contains("(float)(float)((int64_t)(") && out.text.contains("rdec_f32_bits"),
-        "the single-precision form must convert to float and store f32 bits:\n{}",
+        out.text.contains("(float)(float)((int32_t)(") && out.text.contains("rdec_f32_bits"),
+        "the single-precision form must convert to float at the source's own 32-bit \
+         width and store f32 bits:\n{}",
         out.text
     );
     // 16777217 is not representable in a float: the f32 conversion is observable,

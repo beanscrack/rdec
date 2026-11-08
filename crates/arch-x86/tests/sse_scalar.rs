@@ -288,45 +288,123 @@ fn cvttsd2si_of_nan_lands_on_the_x86_magic_not_a_c_cast() {
     );
 }
 
-/// `pxor xmm0,xmm0 ; cvtsi2ss xmm0,rcx(1e10) ; cvttss2si eax,xmm0 ; ret` and the
-/// 64-bit destination form.
+/// `pxor xmm0,xmm0 ; cvtsi2ss xmm0,ecx(=v) ; cvttss2si eax|xmm0 -> eax/rax ; ret`
+/// — the 32-bit source SSE1 form, both destination widths, then the REX.W
+/// source refusal.
 ///
-/// 1e10 is out of i32 range: x86 answers 0x80000000 for the 32-bit destination
-/// and 0x8000000000000000 for the 64-bit one. (1e10 is exactly representable in
-/// f32, so the source is exactly 1e10 and the only question is the conversion.)
+/// EVERY expectation below is a silicon measurement, not a derivation: the
+/// exact byte sequences were executed on this host (`VirtualAlloc`
+/// PAGE_EXECUTE_READWRITE + a call with the argument in `ecx`), and the machine's
+/// answers are quoted verbatim. That discipline is the point of this fixture's
+/// history — the previous version asserted two things the hardware does not do:
+///
+///   1. "v = 0xCB01F9D0 is out of i32 range, so the magic fires". FALSE on both
+///      counts. Read as int32 it is -889062960, which is IN range, and it is NOT
+///      f32-exact: at that magnitude a float's ULP is 2^(29-23) = 64, and
+///      889062960 = 64 x 13891608.75, so `cvtsi2ss` answers -889062976.0. The
+///      machine's answers are eax = 0xCB01F9C0, rax = -889062976 — the f32
+///      rounding is observable in the answer, which is exactly what makes this
+///      leg worth pinning (the old fixture's -889062960 expectation, in range
+///      both ways, hid it).
+///   2. the magic leg was aimed at the wrong value. It fires for
+///      v = 0x7FFFFFFF: 2147483647 rounds to the nearest float, 2^31
+///      (ULP 128, distance 1 vs 127), and 2^31 is OUT of i32 range ->
+///      eax = 0x80000000. The same value in the 64-bit destination is IN range
+///      -> rax = +2147483648. One value, magic on one side, exact on the other.
+///
+/// The low-end pair is the discriminator: v = 0x80000000 read as int32 is
+/// -2^31, which IS exactly representable and converts exactly, so eax answers
+/// 0x80000000 for the OPPOSITE reason (a real conversion, not the invalid-op
+/// magic). The rax leg separates them: -2147483648 for the real conversion,
+/// 0x8000000000000000 for the magic. Measured: eax = 0x80000000, rax =
+/// 0xFFFFFFFF80000000.
+///
+/// `F3 REX.W 0F 2A` is `cvtsi2ssq`, the SSSE3 64-bit-source extension: the
+/// model speaks SSE1-plus, so it is refused by name as a named gap, counted,
+/// and the refusal is asserted here — the form must not be silently modelled
+/// at 64 bits.
 #[test]
-fn cvttss2si_out_of_range_lands_on_the_x86_magic() {
+fn cvttss2si_answers_the_machine_f32_rounding_and_the_i32_magic() {
     let i32_form: &[u8] = &[
         0x66, 0x0F, 0xEF, 0xC0, // pxor     xmm0, xmm0
-        0xF3, 0x48, 0x0F, 0x2A, 0xC1, // cvtsi2ss xmm0, rcx
+        0xF3, 0x0F, 0x2A, 0xC1, // cvtsi2ss xmm0, ecx
         0xF3, 0x0F, 0x2C, 0xC0, // cvttss2si eax, xmm0
         0xC3, // ret
     ];
-    let (f, _rep) = lift(i32_form);
+    let (f, rep) = lift(i32_form);
     verify_ssa(&f).expect("valid SSA");
-    match answer(&f, &[10_000_000_000, 0, 0, 0]) {
-        Outcome::Ret(v) => {
-            assert_eq!(v.bits(), 0x8000_0000, "the i32 magic, not 0x7FFFFFFF");
-        }
+    assert_eq!(rep.gaps, 0, "the SSE1 32-bit source form is modelled");
+
+    // Machine: eax = 0xCB01F9C0. An f64 model (no f32 rounding) answers
+    // 0xCB01F9D0; the machine answers the rounded -889062976.
+    match answer(&f, &[0xCB01F9D0, 0, 0, 0]) {
+        Outcome::Ret(v) => assert_eq!(
+            v.bits(),
+            0xCB01_F9C0,
+            "f32(-889062960) = -889062976: the f32 ULP is 64 at this magnitude"
+        ),
+        other => panic!("unexpected: {other:?}"),
+    }
+    // Machine: eax = 0x80000000 — the invalid-op magic (2^31 does not fit i32).
+    match answer(&f, &[0x7FFF_FFFF, 0, 0, 0]) {
+        Outcome::Ret(v) => assert_eq!(v.bits(), 0x8000_0000, "the i32 magic, not 0x7FFFFFFF"),
+        other => panic!("unexpected: {other:?}"),
+    }
+    // Machine: eax = 0x80000000 — the SAME bits from the opposite cause: -2^31
+    // is f32-exact and converts exactly. The i64 leg below is what tells the
+    // two apart.
+    match answer(&f, &[0x8000_0000, 0, 0, 0]) {
+        Outcome::Ret(v) => assert_eq!(v.bits(), 0x8000_0000, "-2^31 converts exactly"),
+        other => panic!("unexpected: {other:?}"),
+    }
+    // Machine: eax = 0x01000000 from 16777217 — the 2^24 f32 rounding wall.
+    match answer(&f, &[16_777_217, 0, 0, 0]) {
+        Outcome::Ret(v) => assert_eq!(v.bits(), 16_777_216, "the f32 rounding is modelled"),
         other => panic!("unexpected: {other:?}"),
     }
 
     let i64_form: &[u8] = &[
         0x66, 0x0F, 0xEF, 0xC0, // pxor      xmm0, xmm0
-        0xF3, 0x48, 0x0F, 0x2A, 0xC1, // cvtsi2ss  xmm0, rcx
+        0xF3, 0x0F, 0x2A, 0xC1, // cvtsi2ss  xmm0, ecx
         0xF3, 0x48, 0x0F, 0x2C, 0xC0, // cvttss2si rax, xmm0
         0xC3, // ret
     ];
-    let (f, _rep) = lift(i64_form);
+    let (f, rep) = lift(i64_form);
     verify_ssa(&f).expect("valid SSA");
-    match answer(&f, &[10_000_000_000_000, 0, 0, 0]) {
-        // 1e13 fits i64, so the magic must NOT fire. The answer is not 1e13:
-        // `cvtsi2ss` rounds through f32, and f32's 24-bit mantissa answers
-        // 9999999827968. That is the machine's answer, and the test records the
-        // machine's answer, not the decimal that went in.
-        Outcome::Ret(v) => assert_eq!(v.bits(), (1e13f32) as i64 as u64, "f32-rounded 1e13"),
+    assert_eq!(rep.gaps, 0, "the SSE1 32-bit source form is modelled");
+    // Machine: rax = -889062976 (NOT -889062960): the f32 leg of the rounding,
+    // and not the magic, which the i32 leg above needed.
+    match answer(&f, &[0xCB01F9D0, 0, 0, 0]) {
+        Outcome::Ret(v) => assert_eq!(v.bits() as i64, -889_062_976, "rounded by f32, signed"),
         other => panic!("unexpected: {other:?}"),
     }
+    // Machine: rax = +2147483648 — in i64 range, so the magic must NOT fire.
+    match answer(&f, &[0x7FFF_FFFF, 0, 0, 0]) {
+        Outcome::Ret(v) => assert_eq!(v.bits(), 0x8000_0000, "2^31 fits i64: exact, not magic"),
+        other => panic!("unexpected: {other:?}"),
+    }
+    // Machine: rax = 0xFFFFFFFF80000000 = -2147483648. If the i32 leg's
+    // 0x80000000 had been the magic, this leg would read 0x8000000000000000.
+    match answer(&f, &[0x8000_0000, 0, 0, 0]) {
+        Outcome::Ret(v) => assert_eq!(v.bits() as i64, -2_147_483_648, "the low-end conversion"),
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    // The SSSE3 extension stays a named refusal.
+    let ssq: &[u8] = &[
+        0x66, 0x0F, 0xEF, 0xC0, // pxor     xmm0, xmm0
+        0xF3, 0x48, 0x0F, 0x2A, 0xC1, // cvtsi2ss xmm0, rcx  (REX.W: cvtsi2ssq)
+        0xF3, 0x48, 0x0F, 0x2C, 0xC0, // cvttss2si rax, xmm0
+        0xC3, // ret
+    ];
+    let (f, rep) = lift(ssq);
+    verify_ssa(&f).expect("valid SSA: a refusal is still IR");
+    assert_eq!(rep.gaps, 1, "the REX.W source form is a gap, counted");
+    assert!(
+        opaque_texts(&f).iter().any(|t| t.contains("cvtsi2ss")),
+        "the refusal does not name the mnemonic -> {:?}",
+        opaque_texts(&f)
+    );
 }
 
 /// `mov eax,-1 ; cvtsi2sd xmm0,eax ; cvttsd2si rax,xmm0 ; ret`

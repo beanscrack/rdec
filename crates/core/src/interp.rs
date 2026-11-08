@@ -154,7 +154,11 @@ pub fn fptosi_x86(x: f64, w: Width) -> u64 {
         // value (2^63) that would not fit.
         x.trunc() as i64 as u64
     } else {
-        (x.trunc() as i64) as u64
+        // The 32-bit destination: the answer is 32 bits. Sign-extending to 64
+        // (the old spelling) handed a 30-bit value back as 64 bits, and the
+        // `zext` into the register showed the sign bits — a defect invisible
+        // below 2^31 where the value fits either way.
+        ((x.trunc() as i64) as u32) as u64
     }
 }
 
@@ -909,7 +913,17 @@ impl<'a> Interp<'a> {
                         // hardware does -- keeping the unrounded f64 here would
                         // make the reference answer differ from the machine (and
                         // from the emitted C) for every integer above 2^24.
-                        let v = sw.trunc(x, true) as i64 as f64;
+                        // signedness is the operand's TYPED property, like the
+                        // width: a `uint32_t` cell converts as its raw bits,
+                        // an `int32_t` cell converts signed.
+                        let signed = matches!(
+                            self.f.ty_of(*a),
+                            Some(Ty::Int {
+                                sx: crate::ty::Sx::Signed,
+                                ..
+                            })
+                        );
+                        let v = (sw.trunc(x, signed) as i64) as f64;
                         Val::Fl(match t {
                             Ty::Float { w: FWidth::F32 } => v as f32 as f64,
                             _ => v,
@@ -1399,5 +1413,38 @@ impl TrailingOnes0 for u64 {
         } else {
             self.trailing_zeros()
         }
+    }
+}
+
+// Unit tests live at the BOTTOM of the file: the panic-site ratchet
+// (`scripts/unwrap_ratchet.sh`) cuts each file at its first `#[cfg(test)]`, so a
+// mid-file test module makes the ratchet blind to every production line below it.
+#[cfg(test)]
+mod x86_cast_tests {
+    use super::*;
+    #[test]
+    fn fptosi_w32_window_is_the_machines_and_the_answer_is_32_bits() {
+        // In range: -889062960 is INSIDE [-2^31, 2^31) — the earlier version of
+        // this test asserted the magic here on a magnitude comparison it got
+        // backwards. Silicon: `cvtsi2sd xmm0,eax(-889062960)` is exact as an
+        // f64, `cvttsd2si eax,xmm0` answers 0xCB01F9D0 (probe run on this host).
+        assert_eq!(fptosi_x86(-889062960.0, Width::W32), 0xCB01_F9D0);
+        // Out of range on the high side: the window is exclusive at 2^31, so
+        // 2^31 itself is the magic — the value the f32 round of 2147483647
+        // lands on (see cvttss2si_answers_the_machine_f32_rounding_and_the_i32_magic).
+        assert_eq!(fptosi_x86(2_147_483_648.0, Width::W32), 0x8000_0000);
+        assert_eq!(fptosi_x86(3405904320.0, Width::W32), 0x8000_0000);
+        // In-range W32 answers are 32 bits — no 64-bit sign extension. That is
+        // the defect this arm fixes: a 30-bit answer returned as 64 bits shows
+        // its sign bits through the `zext` into the register cell.
+        assert_eq!(fptosi_x86(-1.0, Width::W32), 0xFFFF_FFFF);
+        assert_eq!(fptosi_x86(12582912.0, Width::W32), 12582912);
+        assert_eq!(fptosi_x86(-889062960.0, Width::W64), (-889062960i64) as u64);
+        // -2^31 itself converts exactly (the window is inclusive at the low
+        // end), so 0x80000000 has two causes and this is the honest one.
+        assert_eq!(fptosi_x86(-2147483648.0, Width::W32), 0x8000_0000);
+        // NaN is invalid operation on every width.
+        assert_eq!(fptosi_x86(f64::NAN, Width::W32), 0x8000_0000);
+        assert_eq!(fptosi_x86(f64::NAN, Width::W64), 0x8000_0000_0000_0000);
     }
 }
