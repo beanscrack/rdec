@@ -87,6 +87,13 @@ fn main() {
         },
         "pe-info" => cmd_pe_info(&args),
         "pe-functions" => cmd_pe_functions(&args),
+        "pe-discover" => match m1::cmd_pe_discover(&args) {
+            Ok(rc) => rc,
+            Err(e) => {
+                eprintln!("{e}");
+                2
+            }
+        },
         "fuzz" => match fuzz::cmd_fuzz(&args) {
             Ok(rc) => rc,
             Err(e) => {
