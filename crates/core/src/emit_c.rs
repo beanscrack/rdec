@@ -730,30 +730,70 @@ impl<'a> Emitter<'a> {
             BinOp::Add => format!("({x} + {y})"),
             BinOp::Sub => format!("({x} - {y})"),
             BinOp::Mul => format!("({x} * {y})"),
-            // The high/low halves of a full-width product: the widened multiply
-            // is the only C that spells it, and 128-bit ints are a compiler
-            // extension - clang has them, gcc has them, MSVC does not. Say so.
+            // The high half of a full-width product. `__int128` spells this in
+            // one line and is exactly why it is not used: the emitted C must
+            // compile with the same compilers the project's own C compiles
+            // with, and MSVC has no `__int128`. The PRELUDE helpers decompose
+            // the product into four 32x32 limb products — every operation
+            // unsigned, so the only wrap is the final sum, which IS the answer
+            // modulo 2^64. crates/core/tests/mulhi_helpers.rs cross-checks
+            // both helpers against `__int128` over 200+ vectors, on this host.
             BinOp::MulHi => {
-                self.refuse(
-                    at,
-                    "MulHi needs __int128 (a compiler extension)".to_string(),
-                );
-                return None;
+                if w != 64 {
+                    self.refuse(
+                        at,
+                        format!(
+                            "MulHi at width {w} is the product's high 64 bits, which are always \
+                             zero - the caller means a shift"
+                        ),
+                    );
+                    return None;
+                }
+                format!("(uint64_t)rdec_mulhi64({x}, {y})")
             }
             BinOp::MulSmul => {
-                self.refuse(at, "MulSmul (overflow flag) is not expressible".to_string());
-                return None;
+                if w != 64 {
+                    self.refuse(
+                        at,
+                        format!(
+                            "MulSmul at width {w} is the product's high 64 bits, which are only \
+                             the sign - the caller means a shift"
+                        ),
+                    );
+                    return None;
+                }
+                format!("(uint64_t)rdec_smulhi64((int64_t){x}, (int64_t){y})")
             }
             BinOp::UDiv => format!("({y} == 0 ? 0 : {x} / {y})"),
             BinOp::URem => format!("({y} == 0 ? 0 : {x} % {y})"),
-            // x86 idiv traps on INT_MIN / -1; C calls it undefined behaviour.
-            // Guarding both is what lets the differential compare answers.
-            BinOp::SDiv if signed => {
-                format!("({y} == 0 ? 0 : {y} == -1 ? (uint64_t)(0ULL - (uint64_t){x}) : {x} / {y})")
+            // `SDiv`/`SRem` are SIGNED operations by definition; the operand
+            // TYPE says nothing about that. Registers are modelled as unsigned
+            // cells, so spelling a signed division from an unsigned cell as
+            // `(uint64_t)x / (uint64_t)y` answers 0x7FFFFFFC where the machine
+            // answers 0xFFFFFFFD (-7 / 2): the `cdq`+`idiv` pair lands here with
+            // its dividend assembled in an unsigned W64 cell. Read both
+            // operands with the OP's signedness.
+            //
+            // x86 `idiv` traps on INT_MIN / -1; in C that division is undefined
+            // behaviour, and the guard is what lets the differential compare
+            // answers at all. The machine's answer for the guarded case is the
+            // wrapped quotient (0x8000..00), which `0 - x` reproduces; the
+            // remainder is 0. Divisor zero is the model's answer (0), not the
+            // machine's (#DE) — the divergence is named in the roadmap.
+            BinOp::SDiv => {
+                let it = format!("int{w}_t");
+                format!(
+                    "(uint64_t)({y} == 0 ? 0 : (int64_t){y} == -1 ? (uint64_t)(0ULL - (uint64_t){x}) \
+                     : (uint64_t)(({it}){x} / ({it}){y}))"
+                )
             }
-            BinOp::SDiv => format!("({y} == 0 ? 0 : {x} / {y})"),
-            BinOp::SRem if signed => format!("({y} == 0 ? 0 : {y} == -1 ? 0 : {x} % {y})"),
-            BinOp::SRem => format!("({y} == 0 ? 0 : {x} % {y})"),
+            BinOp::SRem => {
+                let it = format!("int{w}_t");
+                format!(
+                    "(uint64_t)({y} == 0 ? 0 : (int64_t){y} == -1 ? 0 \
+                     : (uint64_t)(({it}){x} % ({it}){y}))"
+                )
+            }
             BinOp::And => format!("({x} & {y})"),
             BinOp::Or => format!("({x} | {y})"),
             BinOp::Xor => format!("({x} ^ {y})"),
@@ -1598,6 +1638,32 @@ static inline __attribute__((unused)) double rdec_bits_f64(uint64_t b){double d=
 static inline __attribute__((unused)) float rdec_bits_f32(uint64_t b){uint32_t u=(uint32_t)b;float f=0.0f;memcpy(&f,&u,4);return f;}
 static inline __attribute__((unused)) uint64_t rdec_f64_bits(double d){uint64_t b=0;memcpy(&b,&d,8);return b;}
 static inline __attribute__((unused)) uint64_t rdec_f32_bits(float f){uint32_t u=0;memcpy(&u,&f,4);return u;}
+
+/* The high 64 bits of a 64x64 product — `mul`/`imul`'s RDX, and the value the
+IR calls MulHi/MulSmul. __int128 spells this in one line and is exactly why it
+is not used: the emitted C has to compile with the compilers this project's own
+C compiles with, and MSVC has no 128-bit integer type. Four 32x32 limb products
+spell it in portable C: each limb product is < 2^64 so it is EXACT, every
+operation below is unsigned, and the only wrap is the final sum, which is the
+answer modulo 2^64 — the machine's answer. */
+static inline __attribute__((unused)) uint64_t rdec_mulhi64(uint64_t a, uint64_t b){
+    uint64_t a0 = a & 0xFFFFFFFFULL, a1 = a >> 32;
+    uint64_t b0 = b & 0xFFFFFFFFULL, b1 = b >> 32;
+    uint64_t p00 = a0 * b0, p01 = a0 * b1, p10 = a1 * b0, p11 = a1 * b1;
+    uint64_t mid = (p00 >> 32) + (p01 & 0xFFFFFFFFULL) + (p10 & 0xFFFFFFFFULL);
+    return p11 + (p01 >> 32) + (p10 >> 32) + (mid >> 32);
+}
+/* The signed sibling: the unsigned high half of the same bits, minus each
+ * negative operand's contribution. Reading the signed product as unsigned,
+ * (a - 2^64)(b - 2^64) = ab - 2^64*b - 2^64*a + 2^128, and the 2^128 term is
+ * out of the high 64 bits' reach — so subtract b when a is negative and a when
+ * b is. The subtractions are unsigned and wrap, which is the answer. */
+static inline __attribute__((unused)) uint64_t rdec_smulhi64(int64_t sa, int64_t sb){
+    uint64_t a = (uint64_t)sa, b = (uint64_t)sb, h = rdec_mulhi64(a, b);
+    if (sa < 0) h -= b;
+    if (sb < 0) h -= a;
+    return h;
+}
 ";
 
 #[cfg(test)]

@@ -259,3 +259,390 @@ fn shift_counts_are_machine_masked_not_saturated() {
     assert_eq!(model(BinOp::Shl, Width::W8, Sx::Unsigned, 1, 8), 0); // 8 & 31 = 8
     assert_eq!(model(BinOp::Shl, Width::W8, Sx::Unsigned, 1, 32), 1); // 32 & 31 = 0
 }
+
+// ============================================================================
+// THE ACCUMULATOR OPS — the extension this file's header asked for.
+//
+// `cdq`+`idiv`, `xor`+`div`, and one-operand `mul`/`imul` landed in
+// `lift.rs` (fixtures, and the silicon measurements behind every expectation,
+// in `crates/arch-x86/tests/acc_forms.rs`). The header scoped this suite to
+// "the set the lifter CAN emit" and said the day an `imul` high form lands,
+// this table extends. It did, so it does.
+//
+// Scope, width by width, is the set the lifter can actually produce:
+//
+//   MulHi / MulSmul   W64 ONLY. The IR contract is bits 64..127 of the
+//                     128-bit product; for a 32-bit `mul` that is the wrong
+//                     question (the machine's EDX is bits 32..63), so the
+//                     lifter spells the 32-bit pair form as a W64 product plus
+//                     a shift, and `emit_c` REFUSES a multiply-high below 64
+//                     rather than emitting a zero nobody asked for. The signed
+//                     limb identity below is a W64 identity (its correction
+//                     terms are 2^64-based), which is the same scope, arrived
+//                     at from the other direction.
+//   UDiv / URem /
+//   SDiv / SRem       every width, divisor non-zero. A zero divisor is a
+//                     FAULT, pinned by name below — the machine #DEs, the
+//                     interpreter faults, and the emitted C answers 0. That
+//                     last leg is a deliberate, named divergence (the C has to
+//                     return something to compare), not an accident.
+//
+// The multiply-high reference is a LIMB DECOMPOSITION in Rust — the same shape
+// as the PRELUDE's C helper. That is the point: the interpreter computes
+// multiply-high with `u128`/`i128`, this table computes it with limbs, and
+// `crates/core/tests/mulhi_helpers.rs` checks the C helper against `__int128`.
+// Three independent implementations, one answer, and no `__int128` in the C
+// that ships (MSVC has no 128-bit integer type).
+// ============================================================================
+
+/// High 64 bits of a 64x64 product, by 32-bit limbs — deliberately NOT the
+/// interpreter's `u128` route. Each limb product is < 2^64, so every term is
+/// exact and the only wrap is the sum, which is the answer modulo 2^64.
+fn mulhi_limbs(x: u64, y: u64) -> u64 {
+    let (x0, x1) = (x & 0xFFFF_FFFF, x >> 32);
+    let (y0, y1) = (y & 0xFFFF_FFFF, y >> 32);
+    let p00 = x0 * y0;
+    let p01 = x0 * y1;
+    let p10 = x1 * y0;
+    let p11 = x1 * y1;
+    let mid = (p00 >> 32) + (p01 & 0xFFFF_FFFF) + (p10 & 0xFFFF_FFFF);
+    p11.wrapping_add(p01 >> 32)
+        .wrapping_add(p10 >> 32)
+        .wrapping_add(mid >> 32)
+}
+
+fn sext(w: Width, x: u64) -> i64 {
+    let x = trunc(w, x);
+    if x & sign_bit(w) != 0 {
+        (x | !mask(w)) as i64
+    } else {
+        x as i64
+    }
+}
+
+/// THE REFERENCE for the accumulator ops, written from the x86 facts.
+fn reference_acc(o: BinOp, w: Width, x: u64, y: u64) -> u64 {
+    let (x, y) = (trunc(w, x), trunc(w, y));
+    match o {
+        BinOp::MulHi => trunc(w, mulhi_limbs(x, y)),
+        // The signed high half of the same bits. Reading the signed product
+        // through unsigned limbs: (a - 2^64)(b - 2^64) = ab - 2^64*b - 2^64*a
+        // + 2^128, and the 2^128 term is out of reach of the high 64 bits, so
+        // each negative operand costs the other one. Exact at W64, which is the
+        // only width this op is emitted at.
+        BinOp::MulSmul => {
+            let mut h = mulhi_limbs(x, y);
+            if x & sign_bit(w) != 0 {
+                h = h.wrapping_sub(y);
+            }
+            if y & sign_bit(w) != 0 {
+                h = h.wrapping_sub(x);
+            }
+            h
+        }
+        // `div`: the machine's unsigned divide, truncating toward zero — which
+        // for unsigned operands is C's `/` exactly.
+        BinOp::UDiv => trunc(w, x / y),
+        BinOp::URem => trunc(w, x % y),
+        // `idiv`: signed, and x86 truncates TOWARD ZERO, the C rule, not the
+        // floor rule: -7/2 = -3 remainder -1, never -4 remainder +1.
+        BinOp::SDiv => trunc(w, sext(w, x).wrapping_div(sext(w, y)) as u64),
+        BinOp::SRem => trunc(w, sext(w, x).wrapping_rem(sext(w, y)) as u64),
+        _ => unreachable!("accumulator scope: the ops named above"),
+    }
+}
+
+fn check_acc(o: BinOp, w: Width) {
+    // The domain where the model returns a VALUE. Outside it the model FAULTS,
+    // and a fault is pinned by name below, not compared as a number:
+    //   y == 0                    -> Fault::DivZero (the machine's #DE)
+    //   xs == i64::MIN, ys == -1  -> Fault::IntMinDivMinusOne (also #DE)
+    let faulted = |x: u64, y: u64| trunc(w, y) == 0 || (sext(w, x) == i64::MIN && sext(w, y) == -1);
+    let m = mask(w);
+    let edges: Vec<u64> = vec![
+        0,
+        1,
+        2,
+        3,
+        m,
+        m - 1,
+        m / 2,
+        m / 2 + 1,
+        0x55,
+        0xaa_55,
+        0x1_0000_0000,
+        0xFFFF_FFFF_FFFF_FF01,
+    ];
+    for &x in &edges {
+        for &y in &edges {
+            // The guard is on the TRUNCATED divisor: at W8 the edge value
+            // 0x1_0000_0000 truncates to 0, and the interpreter faults on that
+            // (pinned by `a_zero_divisor_faults_naming_the_divide` below), which
+            // is exactly the machine's #DE.
+            if faulted(x, y) {
+                continue;
+            }
+            for sx in [Sx::Unsigned, Sx::Signed] {
+                let got = model(o, w, sx, x, y);
+                let want = reference_acc(o, w, x, y);
+                assert_eq!(
+                    got, want,
+                    "{o:?} {w:?} ({sx:?}) x={x:#x} y={y:#x}: model {got:#x}, machine {want:#x}"
+                );
+            }
+        }
+    }
+    let mut s: u64 = 0xDEAD_BEEF_CAFE_BABE;
+    let mut next = move || {
+        s ^= s >> 12;
+        s ^= s << 25;
+        s ^= s >> 27;
+        s.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    };
+    for _ in 0..3000 {
+        let (x, y) = (next(), next());
+        // Same rule as the edges: the op sees the TRUNCATED operands, and a
+        // value that is a multiple of 2^w at W8/W16/W32 is a zero divisor.
+        if faulted(x, y) {
+            continue;
+        }
+        for sx in [Sx::Unsigned, Sx::Signed] {
+            let got = model(o, w, sx, x, y);
+            let want = reference_acc(o, w, x, y);
+            assert_eq!(
+                got, want,
+                "{o:?} {w:?} ({sx:?}) x={x:#x} y={y:#x}: model {got:#x}, machine {want:#x}"
+            );
+        }
+    }
+}
+
+#[test]
+fn multiply_high_matches_a_limb_decomposition_at_64_bits() {
+    // W64 only, for the reason in the header: the lifter never emits a
+    // multiply-high below 64, and the emitter refuses one if it did.
+    for o in [BinOp::MulHi, BinOp::MulSmul] {
+        check_acc(o, Width::W64);
+    }
+}
+
+#[test]
+fn division_and_remainder_match_the_machine_at_every_width() {
+    for w in [Width::W8, Width::W16, Width::W32, Width::W64] {
+        for o in [BinOp::UDiv, BinOp::URem, BinOp::SDiv, BinOp::SRem] {
+            check_acc(o, w);
+        }
+    }
+}
+
+#[test]
+fn signed_division_truncates_toward_zero_like_idiv() {
+    // The hand-named cases, for the reader. `cdq` + `idiv` of -7 by 2 is -3
+    // remainder -1 on the machine (measured, in acc_forms.rs); a floor-dividing
+    // model answers -4 and +1, and the remainder's SIGN is where the two
+    // implementations are told apart.
+    assert_eq!(
+        model(BinOp::SDiv, Width::W32, Sx::Unsigned, 0xFFFF_FFF9, 2),
+        0xFFFF_FFFD
+    );
+    assert_eq!(
+        model(BinOp::SRem, Width::W32, Sx::Unsigned, 0xFFFF_FFF9, 2),
+        0xFFFF_FFFF
+    );
+    // The remainder's sign follows the DIVIDEND (the C99 rule), not the divisor:
+    assert_eq!(
+        model(BinOp::SRem, Width::W32, Sx::Unsigned, 7, 0xFFFF_FFFE),
+        1
+    );
+    assert_eq!(
+        model(BinOp::SDiv, Width::W32, Sx::Unsigned, 7, 0xFFFF_FFFE),
+        0xFFFF_FFFD
+    );
+    // Unsigned on the same bytes is a different answer, and that difference is
+    // the ONLY difference between `div` and `idiv`: 0xFFFFFFF9/2 = 0x7FFFFFFC
+    // remainder 1 (measured).
+    assert_eq!(
+        model(BinOp::UDiv, Width::W32, Sx::Unsigned, 0xFFFF_FFF9, 2),
+        0x7FFF_FFFC
+    );
+    assert_eq!(
+        model(BinOp::URem, Width::W32, Sx::Unsigned, 0xFFFF_FFF9, 2),
+        1
+    );
+    // INT_MIN / -1: the machine raises #DE at every width. At W64 the model
+    // FAULTS (`int_min_over_minus_one_faults_at_64_and_wraps_below_it`), and
+    // below 64 it answers the wrapped quotient — the value the emitted C's
+    // guard spells. Pinned in both directions there, so a future "fix" that
+    // faults at the narrow widths is a decision with a red test to turn green.
+    assert_eq!(
+        model(
+            BinOp::SDiv,
+            Width::W32,
+            Sx::Unsigned,
+            0x8000_0000,
+            0xFFFF_FFFF
+        ),
+        0x8000_0000
+    );
+    assert_eq!(
+        model(
+            BinOp::SRem,
+            Width::W32,
+            Sx::Unsigned,
+            0x8000_0000,
+            0xFFFF_FFFF
+        ),
+        0
+    );
+}
+
+#[test]
+fn a_zero_divisor_faults_naming_the_divide() {
+    // The machine raises #DE. The model's answer is a FAULT, not a number: an
+    // interpreter that answered 0 here would make every guarded division in the
+    // corpus agree with the emitted C's `y == 0 ? 0` and agree with the machine
+    // on nothing.
+    use rdec_core::interp::{run, Fault};
+    for o in [BinOp::UDiv, BinOp::URem, BinOp::SDiv, BinOp::SRem] {
+        for w in [Width::W32, Width::W64] {
+            let mut f = Function::new("prop", 0);
+            let e = f.entry;
+            let a = f.emit(
+                e,
+                Op::Param,
+                Ty::Int {
+                    sx: Sx::Unsigned,
+                    w,
+                },
+                0,
+            );
+            let b = f.emit(
+                e,
+                Op::Param,
+                Ty::Int {
+                    sx: Sx::Unsigned,
+                    w,
+                },
+                0,
+            );
+            let r = f.emit(
+                e,
+                Op::Bin(o, a, b),
+                Ty::Int {
+                    sx: Sx::Unsigned,
+                    w,
+                },
+                0,
+            );
+            f.block_mut(e).term = Terminator::Return(r);
+            f.params.extend([a, b]);
+            f.ret_ty = Ty::Int {
+                sx: Sx::Unsigned,
+                w,
+            };
+            match run(&f, &[7, 0, 0, 0]).outcome {
+                Outcome::Fault(Fault::DivZero) => {}
+                other => panic!("{o:?} {w:?} x=7 y=0: interpreter said {other:?}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn int_min_over_minus_one_faults_at_64_and_wraps_below_it() {
+    // The machine raises #DE at EVERY width here: the quotient +2^(w-1) does
+    // not fit the destination. The model's guard is
+    // `xs == i64::MIN && ys == -1` — a W64-shaped test — so:
+    //
+    //   W64: the model FAULTS (the honest answer, and the emitted C's
+    //        `y == -1 ? 0 - x` guard spells the same wrapped value the C
+    //        returns, which the differential never reaches because the IR leg
+    //        faults and the pair is not compared).
+    //   W8/W16/W32: the model answers the WRAPPED quotient. That agrees with the
+    //        emitted C's guard and DISAGREES with the machine, which traps.
+    //
+    // Pinned in both directions so "quotient overflow is not modelled" stays a
+    // named M4 gap with a red test to turn green, not a quiet asymmetry.
+    use rdec_core::interp::{run, Fault};
+    for o in [BinOp::SDiv, BinOp::SRem] {
+        let mut f = Function::new("prop", 0);
+        let e = f.entry;
+        let ty = Ty::Int {
+            sx: Sx::Unsigned,
+            w: Width::W64,
+        };
+        let a = f.emit(e, Op::Param, ty.clone(), 0);
+        let b = f.emit(e, Op::Param, ty.clone(), 0);
+        let r = f.emit(e, Op::Bin(o, a, b), ty.clone(), 0);
+        f.block_mut(e).term = Terminator::Return(r);
+        f.params.extend([a, b]);
+        f.ret_ty = ty;
+        match run(&f, &[1 << 63, u64::MAX, 0, 0]).outcome {
+            Outcome::Fault(Fault::IntMinDivMinusOne) => {}
+            other => panic!("{o:?} W64 INT_MIN/-1: interpreter said {other:?}"),
+        }
+    }
+    // The narrow leg: the model answers the wrapped quotient (the machine traps).
+    assert_eq!(
+        model(
+            BinOp::SDiv,
+            Width::W32,
+            Sx::Unsigned,
+            0x8000_0000,
+            0xFFFF_FFFF
+        ),
+        0x8000_0000
+    );
+    assert_eq!(
+        model(BinOp::SDiv, Width::W16, Sx::Unsigned, 0x8000, 0xFFFF),
+        0x8000
+    );
+    assert_eq!(
+        model(BinOp::SDiv, Width::W8, Sx::Unsigned, 0x80, 0xFF),
+        0x80
+    );
+}
+
+#[test]
+fn multiply_high_agrees_with_the_prelude_helpers_and_int128() {
+    // The triangle's third corner lives in
+    // crates/core/tests/mulhi_helpers.rs (the C helper vs `__int128`, compiled
+    // and run). This is the cheap leg: the table's limb reference must agree
+    // with the `u128` route on the boundary set, so the two Rust readings cannot
+    // drift apart silently while the C leg is green.
+    let edges = [
+        0u64,
+        1,
+        2,
+        u64::from(u32::MAX),
+        1 << 32,
+        1 << 63,
+        (1 << 63) - 1,
+        u64::MAX,
+        0x00FF_00FF_00FF_00FF,
+    ];
+    for &x in &edges {
+        for &y in &edges {
+            assert_eq!(
+                mulhi_limbs(x, y),
+                ((x as u128 * y as u128) >> 64) as u64,
+                "limbs vs u128 at x={x:#x} y={y:#x}"
+            );
+            let sm = {
+                let mut h = mulhi_limbs(x, y);
+                if (x as i64) < 0 {
+                    h = h.wrapping_sub(y);
+                }
+                if (y as i64) < 0 {
+                    h = h.wrapping_sub(x);
+                }
+                h
+            };
+            assert_eq!(
+                sm,
+                (((x as i64) as i128 * (y as i64) as i128) >> 64) as u64,
+                "signed limbs vs i128 at x={x:#x} y={y:#x}"
+            );
+        }
+    }
+}

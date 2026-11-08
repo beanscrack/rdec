@@ -1571,6 +1571,13 @@ impl<'a> Lifter<'a> {
             | OpKind::Immediate8to64
             | OpKind::Immediate16
             | OpKind::Immediate32
+            // `imul rax,rcx,imm32` — the form every compiler uses for division
+            // by a magic constant — reports its immediate as
+            // `Immediate32to64`, and iced sign-extends it. It was the one
+            // immediate kind missing from this list, so the whole 3-operand
+            // 64-bit `imul` family was refused as "an unmodelled operand" while
+            // the arithmetic next to it lifted fine.
+            | OpKind::Immediate32to64
             | OpKind::Immediate64 => {
                 let v = self.imm_of(ins, i, w)?;
                 Some(self.const_of(v, w))
@@ -3205,6 +3212,171 @@ impl<'a> Lifter<'a> {
                     .emit(self.cur, Op::Un(UnOp::Not, lhs), ty_u(dw), self.addr());
                 self.write(d, dw, r);
                 // `not` leaves EFLAGS untouched: keep the previous flags value.
+            }
+            // ---- the ACCUMULATOR family: the implicit `RDX:RAX` pair. Every
+            // C `/` and `%` compiles to one of these, so refusing them refuses
+            // the function. All expectations in
+            // crates/arch-x86/tests/acc_forms.rs are silicon measurements (the
+            // probe recipe is in that file's header), including the EFLAGS
+            // claims below.
+            Mnemonic::Cwd | Mnemonic::Cdq | Mnemonic::Cqo => {
+                // Sign-replicate the accumulator into the high half of the
+                // dividend pair: `EDX = EAX >> 31` is the whole instruction
+                // (and `RDX = RAX >> 63` for `cqo` — the shift count is the
+                // width, which is why the 32-bit form passing does not prove
+                // the 64-bit one).
+                //
+                // NO flag is touched, and that is a measured claim, not an
+                // omission: `cmp ecx,edx ; cdq ; setc al` reads the `cmp`'s CF
+                // across the `cdq` on the machine. A lifter that treats the
+                // sign-replicate as flag-clearing answers 0 for every `setc`
+                // leg, so the fixture keeps a flag read in the sequence.
+                let (dw, count) = match m {
+                    Mnemonic::Cwd => (Width::W16, 15u64),
+                    Mnemonic::Cdq => (Width::W32, 31),
+                    _ => (Width::W64, 63),
+                };
+                let a = self.read(Grp::Rax, dw);
+                // The shift count carries the OPERATION's width: the verifier's
+                // width-homogeneity rule rejects a node mixing W32 operands with
+                // a W64 count, and the rule is right — a mixed-width node is a
+                // statement about no real machine width.
+                let sh = self.const_of(count, dw);
+                let hi = self.bin(BinOp::Sar, a, sh);
+                self.write(Grp::Rdx, dw, hi);
+            }
+            Mnemonic::Mul | Mnemonic::Imul | Mnemonic::Div | Mnemonic::Idiv
+                if ins.op_count() == 1 =>
+            {
+                // F7 /4 /5 /6 /7 with ONE operand: the operand is the divisor
+                // (or multiplier) and the other operand is the accumulator
+                // pair. The operand's OWN width sets the size of everything —
+                // `imul rcx` is a 64-bit pair, `idiv r8d` a 32-bit one.
+                let signed = matches!(m, Mnemonic::Imul | Mnemonic::Idiv);
+                let divide = matches!(m, Mnemonic::Div | Mnemonic::Idiv);
+                let aw = self.src_w(ins, 0, w);
+                let b = match self.src(ins, 0, aw) {
+                    Some(v) => v,
+                    None => {
+                        self.gap("accumulator form with an unmodelled operand", ty_u(aw));
+                        self.clear_flags();
+                        return;
+                    }
+                };
+                let a = self.read(Grp::Rax, aw);
+                match (divide, aw) {
+                    (false, Width::W64) => {
+                        // The 128-bit product's halves: the low half is the
+                        // ordinary `Mul`, the high half is `MulHi`/`MulSmul`,
+                        // which the interpreter computes exactly and the C
+                        // emitter spells as a portable 32x32-limb decomposition
+                        // (no `__int128`, so the C compiles where the model's
+                        // u64 cells do).
+                        let lo = self.bin(BinOp::Mul, a, b);
+                        let hi = self.bin(if signed { BinOp::MulSmul } else { BinOp::MulHi }, a, b);
+                        self.write(Grp::Rax, Width::W64, lo);
+                        self.write(Grp::Rdx, Width::W64, hi);
+                        self.set_flags(FlagsOp::Mul { a, b, signed });
+                    }
+                    (false, Width::W32) => {
+                        // 32x32 fits in 64 bits under EITHER reading, so the
+                        // full product is EXACT in the model's W64 cell: widen
+                        // both halves with the mnemonic's own signedness,
+                        // multiply once, and the pair's halves are the low 32
+                        // bits and bits 32..63 of that product. Signed 32x32
+                        // and unsigned 32x32 differ ONLY in the high half, and
+                        // this spelling is where that difference lives.
+                        let k = if signed {
+                            CastKind::SExt
+                        } else {
+                            CastKind::ZExt
+                        };
+                        let pa = self.cast(k, a, Width::W64);
+                        let pb = self.cast(k, b, Width::W64);
+                        let p = self.bin(BinOp::Mul, pa, pb);
+                        let lo = self.narrow(p, Width::W32);
+                        let sh32 = self.const_of(32, Width::W64);
+                        let hi = self.bin(BinOp::Shr, p, sh32);
+                        let hi32 = self.narrow(hi, Width::W32);
+                        self.write(Grp::Rax, Width::W32, lo);
+                        self.write(Grp::Rdx, Width::W32, hi32);
+                        // EFLAGS: `mul`/`imul` DO define CF/OF (the carry out of
+                        // the pair) and leave SF/ZF/AF/PF undefined. The model's
+                        // `FlagsOp::Mul` rule compares a high and low half of the
+                        // SAME width, and this pair's halves live in a W64 cell,
+                        // so reusing it here would compare the wrong bits and
+                        // agree with the machine on nothing. Undefined is the
+                        // machine's own answer for four of the five flags, and
+                        // for CF/OF it is the honest one: a function that reads a
+                        // flag after a 32-bit multiply hits the existing loud
+                        // "flags undefined" refusal at the READ site instead of
+                        // quietly getting a bit nobody computed.
+                        self.clear_flags();
+                    }
+                    (true, Width::W32) => {
+                        // The pair IS the dividend: (EDX << 32) | EAX as one
+                        // 64-bit value. `cdq` put the sign of EAX in EDX, which
+                        // is why the signed form's pair read as a signed 64-bit
+                        // dividend equals the signed 32-bit value it came from.
+                        // The mnemonic's signedness lives in the DIVISION, not
+                        // the assembly of the pair — `div` and `idiv` on the
+                        // same bytes differ only in how the pair and the divisor
+                        // are read.
+                        let hi = self.read(Grp::Rdx, Width::W32);
+                        let hi64 = self.cast(CastKind::ZExt, hi, Width::W64);
+                        let a64 = self.cast(CastKind::ZExt, a, Width::W64);
+                        let sh32 = self.const_of(32, Width::W64);
+                        let shifted = self.bin(BinOp::Shl, hi64, sh32);
+                        let pair = self.bin(BinOp::Or, shifted, a64);
+                        let d64 = self.cast(
+                            if signed {
+                                CastKind::SExt
+                            } else {
+                                CastKind::ZExt
+                            },
+                            b,
+                            Width::W64,
+                        );
+                        let q = self.bin(if signed { BinOp::SDiv } else { BinOp::UDiv }, pair, d64);
+                        let r = self.bin(if signed { BinOp::SRem } else { BinOp::URem }, pair, d64);
+                        let q32 = self.narrow(q, Width::W32);
+                        let r32 = self.narrow(r, Width::W32);
+                        self.write(Grp::Rax, Width::W32, q32);
+                        self.write(Grp::Rdx, Width::W32, r32);
+                        // `div`/`idiv` leave ALL flags undefined on the machine.
+                        self.clear_flags();
+                        // NOT modelled, and deliberately so: a quotient that
+                        // does not fit EAX is a #DE fault on the machine (the
+                        // classic divide-by-zero, and `INT_MIN / -1`), and the
+                        // model answers with the truncated quotient instead. The
+                        // C side guards a zero divisor; overflow stays a named
+                        // limitation in the roadmap, not a silent 0.
+                    }
+                    (true, Width::W64) => {
+                        // A 64-bit `div`/`idiv` divides a 128-bit `rdx:rax`. The
+                        // model's widest integer cell is 64 bits, so the honest
+                        // answer is a refusal that names the missing type — the
+                        // map for the slice that adds it. Modelling it as a
+                        // 64-bit division would answer every real 128-bit
+                        // dividend wrong while the 32-bit cases above kept
+                        // passing, which is the failure mode a gate must not
+                        // allow.
+                        self.gap(
+                            &format!(
+                                "{m:?} r/m64: the 128-bit rdx:rax dividend needs a 128-bit integer type"
+                            ),
+                            ty_u(Width::W64),
+                        );
+                        self.clear_flags();
+                    }
+                    _ => {
+                        self.gap(
+                            &format!("{m:?} on an 8/16-bit accumulator pair is not modelled"),
+                            ty_u(aw),
+                        );
+                        self.clear_flags();
+                    }
+                }
             }
             Mnemonic::Cmp | Mnemonic::Test => {
                 let w2 = self.op_w(ins);

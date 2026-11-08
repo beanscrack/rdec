@@ -1345,8 +1345,8 @@ lift.rs crates/arch-x86/src/discover.rs` returns 0 — that is the evidence for 
 | M3 step 2 block splitting | `rdec lift --corpus` | **GREEN** — loops lift; Exits 64 -> 27, clean functions 63 -> 85 | closed |
 | M3 noreturn / tail calls / jump-table targets | (no gate exists yet) | **NOT DONE** — zero handling in the lifter or discovery; the roadmap moved these into M3 (`ROADMAP.md:363-367`) and they were never built. A `jmp` to a known entry is still a call-shaped exit; `abort`/`__fastfail` are not noreturn, so CFG recovery is wrong at those. | gate first, then the feature: a fixture per item, red, then green |
 | M3 stable IDs | (no gate exists yet) | **NOT DONE** — IR value numbers are per-function and not stable across passes, so cross-pass diffing is not available | needs a stable-id invariant pinned by a test |
-| M4 C emitter | `rdec c --corpus` | **RED, by design** — 84 emitted / **57 refused** / 0 invalid after passes; clang -Werror OK. Top classes: 15 call-clobber, 14 `lea` of an unnameable address, 10 `cdq`, 6 `imul`, 4 unstructured conditional branch, 4 `div` | refusals -> 0 with every gap named in between |
-| T2 differential, C | `rdec t2 --corpus` | **GREEN as a sample** — runnable 64 of 141, compared 1364, match 1364, mismatch 0, 4 faults (genuine `loop_do` infinite loops). **Proves the returned 64-bit value only.** Memory effects are NOT compared; 77 functions are not in the compared set. | add memory-effect comparison; widen coverage |
+| M4 C emitter | `rdec c --corpus` | **RED, by design** — 140 lifted / **119 emitted** / **21 refused** / 0 invalid after passes; clang -Werror OK. Classes now: 8 call-clobber, 6 `lea` of an unnameable address, 4 `lea` naming `.rdata`, 2 live-in `Rsp`, 1 `shufps` (packed SIMD, M8). The arithmetic classes are **gone**: 10 `cdq`, 6 `imul`, 4 `div` landed 2026-11-08 (accumulator forms, silicon-quoted fixtures in `acc_forms.rs`). Remaining named gaps: the 128-bit `rdx:rax` dividend of `div`/`idiv r/m64`, quotient overflow (`#DE`), CF/OF after a 32-bit `mul`/`imul` (declared undefined) | refusals -> 0 with every gap named in between |
+| T2 differential, C | `rdec t2 --corpus` | **GREEN as a sample** — 107 native drivers, compared **2260**, match **2260**, mismatch **0**, 20 not-compared (genuine `loop_do` infinite loops). Memory axis **408/408**, IR leg **408/408**. The +464 comparisons since 2026-11-07 are the four division/multiply families (`div_pow2`, `div_unsigned`, `divmod_signed`, `mul_wide` x 4 opt levels) that were refused before: signed `/` and `%`, unsigned `/`, the 64-bit `imul` high half and the magic-constant `imul r64,r/m64,imm32` are now machine-verified. | XMM0 class, more coverage, memory effects beyond the caller window |
 | T2 differential, C++ | `rdec t2 --cpp` | **GREEN as a sample** — 27 functions (15 RAX-class + 12 window-class), 648 runs, 648 matches, 0 mismatch, 0 faults, buckets sum to 78. Return value only; the window class compares the return, not memory. | XMM0 class (in progress), more coverage, memory effects |
 | M8 step 0 demangler | `rdec demangle --cpp` | **GREEN** — 68/68 supported symbols agree with `llvm-nm`, 1 template unsupported (named) | closed for the corpus; templates open |
 | M8 step 1-2 C++ through the pipeline | `rdec cpp --corpus` | **RED by design, improving** — lifted 78, valid 78/78, emitted C 62, refused 16; clang -Werror OK | refusals -> 0 |
@@ -1356,17 +1356,18 @@ lift.rs crates/arch-x86/src/discover.rs` returns 0 — that is the evidence for 
 | M6 readability + type recovery | `47b9076` `bfe8156` | **PARTIAL** — early-return printing, layout-then-prune, return-tail materialization (refusals 29→0); type recovery + Ghidra baseline NOT STARTED | type recovery next; Ghidra baseline is a user install decision |
 | M7 whole binary | `75e655c` | **PARTIAL** — PE32+ loader + `pe-info` on a real linked EXE; `.pdata` unwind reader in flight; ELF support not started | frame-model interpretation, `.reloc`, imports, CRT sigs |
 | M9 production | `289645b` `c08a894` | **PARTIAL** — fuzzing lane (0 crashes/0 hangs over 20k-input censuses ×3 seeds), nightly hardening workflow, release parity, panic-site ratchet, pass-pipeline + verify_ssa linear-time; the analyst loop is not built | analyst loop; fuzz generator extension to shift ops with raw counts (the P-track defect's domain) |
-| P track (proof) | seed | **SEEDED** — the oracle gets its own oracle: `interp_arith_reference.rs`, an independent machine-semantics reference over the 9 liftable integer BinOps (boundary set + 3000 deterministic cases per op×width, both `Sx` displays, raw shift counts). First run found two real defects, both fixed in the interpreter: `Shr`/`Sar` UB for counts 64..=128 (debug panic, RELEASE WRAP) and `shift_left` disagreeing with the machine's count masking at raw 32..63 (W32) | extend as lift sites land (MulHi/UDiv/Rot); C-emitter equivalence proofs |
+| P track (proof) | seed | **EXTENDED 2026-11-08** — the oracle has its own oracle: `interp_arith_reference.rs`, an independent machine-semantics reference, now over the 9 original liftable BinOps **plus the accumulator ops that landed**: `UDiv/URem/SDiv/SRem` at all four widths and `MulHi/MulSmul` at W64 (boundary set + 3000 deterministic cases per op x width, both `Sx` displays, raw shift counts, zero-divisor fault pinned). The multiply-high reference is a LIMB DECOMPOSITION, so interpreter (`u128`), table (limbs) and the shipped C helper are three implementations; `mulhi_helpers.rs` is the C-leg (PRELUDE helpers vs `__int128` over 300+ vectors, compiled with the floor gate's own flags, and the emitter's W64-emits / W32-refuses claim). First run found two real defects, both fixed in the interpreter: `Shr`/`Sar` UB for counts 64..=128 (debug panic, RELEASE WRAP) and `shift_left` disagreeing with the machine's count masking at raw 32..63 (W32) | extend for `RotL/RotR` as sites land; C-emitter equivalence proofs beyond the multiply-high leg |
 
-The honest headline (updated 2026-11-07, floors above): closed structural gates
+The honest headline (updated 2026-11-08, floors above): closed structural gates
 (decode, lift, SSA — verify_ssa linear-time), a differential that proves returned
-values on the full emitted corpus (1796 comparisons, 0 mismatches, caller-buffer
-memory 384/384) and 856 C++ vectors, control-flow structuring landed (75 goto /
-202 labels across 97 emitted functions), a PE32+ loader reading a real linked
-EXE, and a proof track seeded on the interpreter itself. What remains: type
-recovery, whole-binary discovery, packed arithmetic + vtables, and the analyst
-loop — correctness is measured everywhere it claims; the gaps are named, counted,
-and printed.
+values on the full emitted corpus (2260 comparisons, 0 mismatches, caller-buffer
+memory 408/408) and 856 C++ vectors, control-flow structuring landed (75 goto /
+202 labels across 97 emitted functions), the integer division and multiply
+families emitting and machine-verified (43 C refusals -> 21), a PE32+ loader
+reading a real linked EXE, and a proof track that now covers the ops the lifter
+can emit, three implementations deep. What remains: type recovery, whole-binary
+discovery, packed arithmetic + vtables, and the analyst loop — correctness is
+measured everywhere it claims; the gaps are named, counted, and printed.
 
 ### M8 step 4 - the float ABI, measured (`b60538e`, `0b4b2dd`)
 
@@ -2100,3 +2101,106 @@ fix-forward: first red 33s doc_lazy_continuation on a doc line starting with +.
 
 NEXT: discover speaking .pdata (start seeds from the table), .reloc, imports/IAT 
 (named boundary + refusal), CRT library signatures; then M6 type recovery.
+
+## M4 slice: the accumulator forms land — every C `/` and `%` the corpus compiles to
+
+`cdq`/`cqo`/`cwd`, `div`/`idiv`, one-operand `mul`/`imul`, and
+`imul r64,r/m64,imm32`. These are not exotic instructions; they are what a
+compiler emits for integer division and for a wide multiply, so refusing them
+refused the function. `crates/arch-x86/tests/acc_forms.rs` (9 fixtures, red
+first), `crates/core/tests/interp_arith_reference.rs` (the P-track extension the
+suite's own header asked for), `crates/core/tests/mulhi_helpers.rs` (the C leg).
+
+THE MODEL, in the three lines that matter:
+- `cdq`/`cqo` is `EDX = EAX >> 31` / `RDX = RAX >> 63`, and it touches NO flag.
+  The flag claim is MEASURED, not assumed: the fixture runs `cmp ecx,edx ; cdq ;
+  setc al` and reads the `cmp`'s CF across the `cdq` — a lifter that clears flags
+  here answers 0 on the `al = 1` legs.
+- The 32-bit pair IS a 64-bit value: dividend = `(EDX << 32) | EAX`, divisor =
+  the operand read with the mnemonic's signedness, `SDiv`/`SRem`/`UDiv`/`URem` at
+  W64, halves written back as W32. `div` and `idiv` are the same assembly; the
+  whole difference is the reading, and that is where the model puts it.
+- The 32-bit multiply needs no high-half op at all: 32x32 fits 64 bits under
+  either reading, so widen both halves (`SExt` for `imul`, `ZExt` for `mul`),
+  one `Mul`, low 32 bits -> EAX, bits 32..63 -> EDX. At 64 bits the high half is
+  `MulHi`/`MulSmul`, which the interpreter had and the C emitter refused
+  ("needs `__int128`") — so the emitter got the portable spelling instead.
+
+THE EMITTER, two changes with teeth:
+- `rdec_mulhi64`/`rdec_smulhi64` in the PRELUDE: four 32x32 limb products, every
+  operation unsigned, the only wrap the final sum, which IS the answer mod 2^64.
+  No `__int128`, because the emitted C has to compile where the project's own C
+  compiles and MSVC has no 128-bit integer type. `mulhi_helpers.rs` compiles the
+  helpers with the floor gate's flags and compares them against `__int128` over
+  300+ vectors (the boundaries a limb decomposition breaks on + a golden-ratio
+  sweep), and the P-track table's reference is the SAME decomposition written a
+  third time in Rust. Interpreter (`u128`), table (limbs), shipped C (limbs),
+  reference (`__int128`): four readings, one answer.
+- `SDiv`/`SRem` are now read with the OP's signedness, not the operand TYPE's.
+  Registers are modelled as unsigned cells, and the pair dividend lands in one,
+  so the old rendering of a signed division on an unsigned cell emitted a
+  `(uint64_t)/` — 0x7FFFFFFC where the machine answers 0xFFFFFFFD for -7/2. The
+  `cdq`+`idiv` path walks straight into that. `INT_MIN / -1` keeps its guard (C
+  UB, machine `#DE`, model wraps to `INT_MIN`, pinned by name).
+
+GAPS, named not hidden:
+- `div`/`idiv r/m64` divides a 128-bit `rdx:rax`. Refused, with the missing type
+  in the reason: a 64-bit rendering would answer every real `__int128`-style
+  division wrong while the 32-bit cases kept passing, which is the one failure
+  mode a gate must not allow. Zero corpus sites.
+- Quotient overflow. Divide by zero: the interpreter FAULTS (`Fault::DivZero`,
+  pinned at every width), the emitted C answers 0 (it must return something to
+  compare). `INT_MIN / -1`: the model's guard is `xs == i64::MIN && ys == -1`, a
+  W64-shaped test, so the model FAULTS at W64 (`Fault::IntMinDivMinusOne`) and
+  answers the WRAPPED quotient at W8/W16/W32 — where the machine traps at every
+  width. Both directions are pinned by name
+  (`int_min_over_minus_one_faults_at_64_and_wraps_below_it`), which is what makes
+  "quotient overflow is not modelled at the narrow widths" a gap with a red test
+  to turn green instead of an asymmetry nobody noticed. The divergences are
+  written down at the lift site and at the emitter.
+- CF/OF after a 32-bit `mul`/`imul` are defined by the machine and NOT modelled:
+  the model's `FlagsOp::Mul` rule compares halves of the same width and this
+  pair's halves live in a W64 cell. Flags are declared undefined, so a function
+  that reads a flag after such a multiply hits the existing loud refusal at the
+  READ site — the machine's own answer for SF/ZF/AF/PF, and for CF/OF the honest
+  one: a counted refusal beats a bit nobody computed.
+
+THE IMMEDIATE32TO64 GAP was the invisible one: `src` listed every immediate kind
+except the one iced reports for `imul r64,r/m64,imm32`, so clang's entire
+magic-constant-division idiom was refused as "an unmodelled operand" while the
+arithmetic beside it lifted fine. One variant, and the imm32 sign-extension the
+fixture pins (0x92492493 must multiply as -1840700269, measured) is the whole
+content of the form.
+
+MEASURED (parent-run, un-piped, exit codes as verdicts):
+- `c --corpus`: 140 lifted, **119 emitted, 21 refused** (from 97/43), 0 invalid,
+  clang -Werror OK. The arithmetic classes are GONE: 10 `cdq` + 6 `imul` + 4
+  `div` = 20 of the 42 refusal records. What is left is 8 call-clobber, 6+4
+  `lea`-of-an-unnameable-address, 2 live-in `Rsp`, 1 `shufps`.
+- `t2 --corpus`: **compared 2260 / match 2260 / mismatch 0**, memory **408/408**,
+  IR leg **408/408** (from 1796 / 384). The +464 are the four division/multiply
+  families at four opt levels — `divmod_signed` (signed `/` and `%`),
+  `div_unsigned`, `div_pow2`, `mul_wide` (the 64-bit `imul` high half, so the
+  PRELUDE helper is compared against the machine, not just against `__int128`).
+- `c --corpus` exits 1 by design (refusals > 0), and the refusal census is the
+  map: `lea`-of-an-unnameable-address is the largest class now, and it is a
+  discovery artifact, not an instruction set.
+
+SABOTAGE, all parent-run, all restored: `cdq` count 31 -> 32 reddens
+`cdq_idiv32…` (the pair's high half is then the value, not the sign); pair `SDiv`
+-> `UDiv` reddens it with the machine's number quoted (`left: 4294967292 right:
+4294967293`); the 32-bit multiply widened unsigned reddens
+`one_operand_mul_imul32…` on the high half (`1` vs `0xFFFFFFFF`); dropping the
+carry limb from the PRELUDE helper reddens the `__int128` cross-check; dropping
+the signed correction terms from the TABLE's reference reddens
+`multiply_high_matches_a_limb_decomposition_at_64_bits`
+(`model 0xffffffffffffffff, machine 0x0`) — which is the reference being wrong,
+the way a reference has to be provable-wrong for the triangle to mean anything.
+
+TWO TEST-WRITING DEFECTS the gates caught in the tests, not the code: the
+divisibility sweep skipped a RAW zero divisor where the op sees the TRUNCATED one
+(at W8 the edge value 0x1_0000_0000 IS a zero divisor, and the interpreter
+faults, exactly as the machine #DEs), and the emitter's refusal claim was asserted
+against text containing `/* refusal` when `emit_c` returns refusals as `Err` — so
+that leg had never run. Both tests were rewritten to read the real contract, and
+the rewritten legs are green.
