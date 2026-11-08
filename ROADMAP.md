@@ -1348,8 +1348,8 @@ the date and the tree are in the heading: a row is a measurement with an expiry.
 | M3 step 2 block splitting | `rdec lift --corpus` | **GREEN** — loops lift; Exits 64 -> 27, clean functions 63 -> 85 | closed |
 | M3 noreturn / tail calls / jump-table targets | census + three floors inside `rdec c --corpus` | **LANDED, corpus witnesses present** (2026-11-08; the row before this one said "NOT DONE — zero handling" on the evidence of a `grep -ric` that returned 0, where the live count in `lift.rs` is 53). Jump-table resolution closed M1. Census now: **`tail calls: 3 modelled | 3 with no callable callee | noreturn calls: 4`** (`0xf -> abort`, `0x12 -> abort` x3) from the `tailcall_local` / `tailcall_external` / `noreturn_call` snippets. `cmd_c` FAILS on `tail + tail_unnamed == 0`, on `noreturn == 0`, and on any census site whose name `noreturn_symbol` does not declare — floor 3 exists because a sabotage that declared EVERY import noreturn moved one corpus function into `__builtin_unreachable()` and passed every other gate. The fixture found the real hole: the noreturn arm needed a signature entry, imports have none (`U abort`: no section, no size, no address), and in a linked binary every name in the termination family IS an import — the declaration is now made from the relocation's name, for imports only, `typed: false`, defines nothing. The emitted C is `o100_abort(x0,x1,x2,x3); __builtin_unreachable();` under an `__attribute__((noreturn))` declaration. | C++ corpus sites (that corpus imports no family name — measured with `llvm-nm`), and the `jmp`-to-import refusal class growing past 3 |
 | M3 stable IDs | (no gate exists yet) | **NOT DONE** — IR value numbers are per-function and not stable across passes, so cross-pass diffing is not available | needs a stable-id invariant pinned by a test |
-| M4 C emitter | `rdec c --corpus` | **RED, by design** — 156 lifted / **125 emitted** / **27 refused** / 0 invalid after passes; clang -Werror OK. Classes (measured with `RDEC_C_CENSUS_ALL=1`, each site named): 8 call-clobber, 6 `lea` of an unnameable address, 6 `lea` naming `.rdata` (all six are `switch_dense`/`switch_fallthrough` at O1/O2/Oz — the jump-table base), **3 `tail call to 'ext'`** + **1 `call to 'ext'`** (the new `tailcall_external` witnesses, one per -O level: the honest answer is a refusal, a prototype for an unnamed callee would be invented), 2 live-in `Rsp`, 1 `shufps` (packed SIMD, M8). Counts moved 140 -> 156 lifted and 21 -> 27 refused because the corpus grew 16 functions, 4 of them refusal witnesses. The arithmetic classes stay gone: 10 `cdq`, 6 `imul`, 4 `div` landed 2026-11-08 (`acc_forms.rs`). Remaining named gaps: the 128-bit `rdx:rax` dividend of `div`/`idiv r/m64`, quotient overflow (`#DE`), CF/OF after a 32-bit `mul`/`imul` (declared undefined) | refusals -> 0 with every gap named in between |
-| T2 differential, C | `rdec t2 --corpus` | **GREEN as a sample** — 111 native drivers, compared **2452**, match **2452**, mismatch **0**, differing only above bit 31: **0**. The 20 not-compared runs are ALL machine-side `#DE` (`exit 0xc0000094`, STATUS_INTEGER_DIVIDE_BY_ZERO) on `div_unsigned`/`divmod_signed` at vectors 1 and 22 — the zero-divisor vectors, where the machine traps, the interpreter faults `Fault::DivZero`, and the emitted C answers 0. The harness names the faulting side and excludes them from the match count, so "2452/2452" is a claim about the division cases the machine survives. Memory axis **408/408**, IR leg **408/408** (unchanged: the new snippets are pure return-value shapes). The **+192 since the 2260 measurement earlier today** is exactly 8 functions x 24 vectors — `tailcall_local::f` at four -O levels (its emitted C answers with `return helper(a, b);`, compared against the machine's sibling-call answer) and `noreturn_call::f` at four (the `abort(); __builtin_unreachable();` leg present, never driven, the return leg compared). The earlier +464 is recorded in the M4 slice below. | XMM0 class, more coverage, memory effects beyond the caller window |
+| M4 C emitter | `rdec c --corpus` | **RED, by design** — 156 lifted / **129 emitted** / **27 refused** / 0 invalid after passes (re-read 2026-11-08 after the folded-SExt fix; the row measured **125** emitted, and 125 + 27 = 152 — **four functions were in neither bucket**, a hole the ledger carried as arithmetic: 129 + 27 = 156 accounts for every function); clang -Werror OK. Classes (measured with `RDEC_C_CENSUS_ALL=1`, each site named): 8 call-clobber, 6 `lea` of an unnameable address, 6 `lea` naming `.rdata` (all six are `switch_dense`/`switch_fallthrough` at O1/O2/Oz — the jump-table base), **3 `tail call to 'ext'`** + **1 `call to 'ext'`** (the new `tailcall_external` witnesses, one per -O level: the honest answer is a refusal, a prototype for an unnamed callee would be invented), 2 live-in `Rsp`, 1 `shufps` (packed SIMD, M8). Counts moved 140 -> 156 lifted and 21 -> 27 refused because the corpus grew 16 functions, 4 of them refusal witnesses. The arithmetic classes stay gone: 10 `cdq`, 6 `imul`, 4 `div` landed 2026-11-08 (`acc_forms.rs`). Remaining named gaps: the 128-bit `rdx:rax` dividend of `div`/`idiv r/m64`, quotient overflow (`#DE`), CF/OF after a 32-bit `mul`/`imul` (declared undefined) | refusals -> 0 with every gap named in between |
+| T2 differential, C | `rdec t2 --corpus` | **GREEN as a sample** — 112 harnesses over 115 runnable functions (**2472** planned comparisons), compared **2452**, match **2452**, mismatch **0**, differing only above bit 31: **0**. The 20 not-compared runs are ALL machine-side `#DE` (`exit 0xc0000094`, STATUS_INTEGER_DIVIDE_BY_ZERO) on `div_unsigned`/`divmod_signed` at vectors 1 and 22 — the zero-divisor vectors, where the machine traps, the interpreter faults `Fault::DivZero`, and the emitted C answers 0. The harness names the faulting side and excludes them from the match count, so "2452/2452" is a claim about the division cases the machine survives. Memory axis **408/408**, IR leg **408/408** (unchanged: the new snippets are pure return-value shapes). The **+192 since the 2260 measurement earlier today** is exactly 8 functions x 24 vectors — `tailcall_local::f` at four -O levels (its emitted C answers with `return helper(a, b);`, compared against the machine's sibling-call answer) and `noreturn_call::f` at four (the `abort(); __builtin_unreachable();` leg present, never driven, the return leg compared). The earlier +464 is recorded in the M4 slice below. | XMM0 class, more coverage, memory effects beyond the caller window |
 | T2 differential, C++ | `rdec t2 --cpp` | **GREEN as a sample** (measured 2026-11-08, after this slice's emitter change) — compared **856**, match **856**, mismatch **0**, not-compared **0**, over 18 RAX-class + 16 window-class + 5 XMM0-class functions; 22 native drivers, 2 decompiled runners, 0 restarts after faults. Return value and XMM0 bit pattern; the window class compares the return, not memory. This row re-reads the gate because `SDiv`/`SRem` now read their operands with the op's signedness, and the C++ corpus is where signed `/` and `%` reach the emitter from C++ types — the change is green on 856 C++ machine runs, not only on the C corpus. | memory effects; the window class compares the return, not the window |
 | M8 step 0 demangler | `rdec demangle --cpp` | **GREEN** — 68/68 supported symbols agree with `llvm-nm`, 1 template unsupported (named) | closed for the corpus; templates open |
 | M8 step 1-2 C++ through the pipeline | `rdec cpp --corpus` | **GREEN as a sample** (re-read 2026-11-08; the row said "RED by design — lifted 78, emitted 62, refused 16", which is a dated tree: the gate today prints **69 measured / 69 lifted / valid IR 69/69 / emitted C 64 / refused 5** and EXITS 0 with "the rest are named gaps"). Refusal classes: 4 `indirect call` (vtable dispatch, M8's next step), 1 call-clobber. This slice moved nothing here — measured: the C++ corpus imports no name in the noreturn family (`llvm-nm` over `corpus/cpp/*.obj`), and `corpus/cpp` is untouched by the slice, so the shared sig-table change cannot reach it. The row's old numbers are a corpus/gate history this table never recorded, which is what a dated row is for. | refusals -> 0 (4 vtable dispatches + 1) |
@@ -1357,7 +1357,7 @@ the date and the tree are in the heading: a row is a measurement with an expiry.
 | M8 remainder | — | **NOT DONE** — packed SIMD (refused by name: `paddd/paddq/psubd/pmuludq/pcmpeqd/shufps`, mask `andps/orps`, GPR `movd/movq`), vtable dispatch and virtual calls. Measured: this clang build names ZERO vftable symbols in `.obj`, so vtable identity needs `.rdata` + REL32 relocation recovery | relocation reader, then vtable identity, then `call [this+k]` |
 | M5 control-flow structuring | `e0dafc6` | **LANDED** — if/while/switch recovery; jump-table switch sites close M1's last gap; M6 readability on top: 75 goto / 202 labels (from 123/217) | remaining fall-through gotos are back edges + multi-parent joins |
 | M6 readability | `47b9076` `bfe8156` | **PARTIAL** — early-return printing, layout-then-prune, return-tail materialization (refusals 29→0) | Ghidra baseline is a user install decision |
-| M6 type recovery (tyinfer + `types`) | `8447945` `bd3f68b` + lane m6e | **LANDED, GATED, IN CI** — `types --corpus` signedness LIE 0 (exact 144, canonical-over-unsigned 27, sound-silent 141), width 150 exact + 21 narrower + WIDER 0, ptr 21/0, float 0/0, conflicts 12 loud; `types --selftest` battery 22/22 register 4/4; CI runs the `.gate/types-baseline` ratchet in `gates` and `release-parity` | the 4 named `carry_chain` void-return lies (a lifter IR-shape gap, see the m6e ledger); Ghidra baseline |
+| M6 type recovery (tyinfer + `types`) | `8447945` `bd3f68b` + lane m6e | **LANDED, GATED, IN CI** — re-measured 2026-11-08 on the MERGED tree (148 objects, not the lane's 136): 128 functions scored, 640 sites, 324 unscoreable; signedness LIE 0 (exact 150, canonical-over-unsigned 30, sound-silent 132), width 153 exact + 27 narrower + WIDER 0, ptr 21/0, float 0/0, void-return LIE 4, conflicts 25 loud; `types --selftest` battery 22/22 + register 4/4; `--baseline .gate/types-baseline` **GREEN with 0 new families** — the M3 slice's 12 objects added scoreable sites and no type claim, so the ratchet needed no edit; CI runs the ratchet in `gates` and `release-parity` | the 4 named `carry_chain` void-return lies (a lifter return-model gap: a COFF object carries no signature and `lift.rs` returns RAX unconditionally); Ghidra baseline |
 | M7 whole binary | `rdec pe-discover <exe>` (+ `pe-info`) | **GATE EXISTS (2026-11-08)** — on the real linked image: 418 functions, 56266/61431 .text bytes covered = **91.59%**, `overlap_free: true`, VERDICT line printing **213 gaps (213 descent + 0 reloc boundary)**; a 0-function run exits 1 with its coverage declared void. Seeds from three named sources with per-source provenance: `.pdata` (328 of 336 entries seeded, 4 chained + 4 version-2 refused and COUNTED — the seed census is the witness, measured: seeding a refused entry does not move the function count, because the linear sweep decodes with the same engine a seed uses), the entry point, and `.reloc` DIR64 code targets (47 targets in `.text`, 38 distinct, 7 `.reloc`-only with printed provenance). `.reloc` reader (`crates/arch-x86/src/reloc.rs`) asserts a PARTITION — padding + absolute + relative + unreadable-site + refused-kind == entries — cross-checked against a python raw-byte walk sharing no code (6 blocks, 782 entries = 3 ABSOLUTE + 779 DIR64, `sum(SizeOfBlock) == dir size`). NOT DONE: imports/IAT unread (160 indirect-call gaps stay anonymous, `is this gap an import?` unmeasured), PE32 has no `.reloc` leg (refused by name), the half-address relocation family is named not paired, ELF not started, frame-model interpretation not started | imports/IAT, then CRT signatures; the 7 `.reloc`-only starts are addresses, not verified bodies |
 | M9 production | `289645b` `c08a894` | **PARTIAL** — fuzzing lane (0 crashes/0 hangs over 20k-input censuses ×3 seeds), nightly hardening workflow, release parity, panic-site ratchet, pass-pipeline + verify_ssa linear-time; the analyst loop is not built | analyst loop; fuzz generator extension to shift ops with raw counts (the P-track defect's domain) |
 | P track (proof) | seed | **EXTENDED 2026-11-08** — the oracle has its own oracle: `interp_arith_reference.rs`, an independent machine-semantics reference, now over the 9 original liftable BinOps **plus the accumulator ops that landed**: `UDiv/URem/SDiv/SRem` at all four widths and `MulHi/MulSmul` at W64 (boundary set + 3000 deterministic cases per op x width, both `Sx` displays, raw shift counts, zero-divisor fault pinned). The multiply-high reference is a LIMB DECOMPOSITION, so interpreter (`u128`), table (limbs) and the shipped C helper are three implementations; `mulhi_helpers.rs` is the C-leg (PRELUDE helpers vs `__int128` over 300+ vectors, compiled with the floor gate's own flags, and the emitter's W64-emits / W32-refuses claim). First run found two real defects, both fixed in the interpreter: `Shr`/`Sar` UB for counts 64..=128 (debug panic, RELEASE WRAP) and `shift_left` disagreeing with the machine's count masking at raw 32..63 (W32) | extend for `RotL/RotR` as sites land; C-emitter equivalence proofs beyond the multiply-high leg |
@@ -2605,9 +2605,10 @@ MEASURED RE-READ on the merged tree (this slice's binary, 2026-11-08, cl
   name` | 1 `call to 'ext'`. Against the lane's 31 refusals: **`cdq` 12 → 0 and `div` 4 →
   0**. Both of the leg's biggest classes were fixed by the M4 accumulator slice, which
   never targeted MSVC — `cdq` was 39% of the leg's refusals because MSVC signs the `idiv`
-  dividend through the accumulator, and that is exactly the pair M4 lifted. `cwde` 3 is
-  the surviving sibling: `cwd`/`cdq`/`cqo` are modelled, `cwde` is not, and it is the
-  named next item on this leg. The 3 `tail call to 'ext'` + 1 `call to 'ext'` are new
+  dividend through the accumulator, and that is exactly the pair M4 lifted. `cwde` 3 was
+  the surviving sibling, and it landed the same day (section 12): the leg re-measures at
+  **118 emitted / 16 refused**, `cwde` 3 → 0, 6 census keys — and the fixture written for
+  those three sites is what found the folded-sign-extension defect described there. The 3 `tail call to 'ext'` + 1 `call to 'ext'` are new
   here because the M3 witnesses arrived after the lane branched: the tail-call witness
   compiles under cl (it uses no attribute), so the second leg inherited M3's coverage
   for free.
@@ -2768,3 +2769,128 @@ float/void C parameters: float 0/0 is silence, not skill); not that the baseline
 are the RIGHT decomposition (the C++ `--explain` lane can add families, and the ratchet forces
 every one to be named in the same commit); not that a `RetKind::Void` rule is sound in general —
 the twin pair above is the fixture that would have to prove it, and it is not written here.
+---
+
+## 12. M2 slice: `cwde`, and the constant folder that turned every folded sign-extension into a zero-extension (2026-11-08)
+
+**What was asked.** The MSVC leg's refusal census ended with three classes that clang
+does not have. One was `cwde` — 3 sites, byte `98`, at offset 8 in three `cl` objects.
+
+**The census almost missed it.** `llvm-objdump` prints that byte as `cwtl` (AT&T), not
+`cwde` (Intel). The first census grepped objdump output for `cwde` across all three
+corpora and counted **zero**, which reads exactly like "nobody emits this". The
+witnesses were found in the refusal text, not the disassembly. Any mnemonic census that
+mixes an Intel-name key with an AT&T-name source has a silent-zero hole: `cwde`/`cwtl`,
+`cdq`/`cqto`, `cwd`/`cltw`, `cbw`/`cbtw`. Measured site counts, all corpora:
+`cwde` 3 (MSVC only), `cbw` 0, `cdqe` 0, and **0 in the clang corpus** for all three —
+clang lowers the same C as `movsx eax,ax`, which was already modelled. So this arm's
+entire witness set exists only on the second toolchain: a clang-only corpus would show a
+correct, live, unexercised feature.
+
+**Silicon first** (`scratch/sign_extend_probe.c`, executed from `VirtualAlloc`
+`PAGE_EXECUTE_READWRITE`, not reasoned about):
+
+| bytes | machine RAX | the claim it pins |
+|---|---|---|
+| `mov eax,0x12348123 ; cwde` | `0x00000000FFFF8123` | sign 16→32, **upper 32 zeroed** |
+| `mov eax,0x00007FFF ; cwde` | `0x0000000000007FFF` | positive stays positive |
+| `mov eax,0xFFFF0005 ; cwde` | `0x0000000000000005` | reads **only** bits 0..16 |
+| `mov eax,0x12341281 ; cbw` | `0x000000001234FF81` | 8→16, upper 16 **preserved** |
+| `mov eax,0x80000000 ; cdqe` | `0xFFFFFFFF80000000` | 32→64 |
+
+Row 3 is the row that pays: a lifter that sign-extends the 32-bit cell answers
+`0xFFFFF005` there and passes rows 1 and 2. Rows 1 and 3 together pin both halves of the
+architecture, and `acc_forms.rs::cwde_sign_extends_ax_alone_and_zeroes_the_upper_half`
+carries all three.
+
+`cbw` and `cdqe` stay **refused**, pinned by
+`cbw_and_cdqe_stay_refused_until_a_corpus_site_exists` (gaps == 1, refusal names the
+mnemonic). Zero sites in any corpus means an arm that is green by construction; landing
+one requires a snippet that emits it, in the same commit.
+
+**What the fixture then found was not a `cwde` bug.** The fixture's first run was red on
+the *immediate* case only:
+
+```
+RUNTIME ecx=0x12348123 -> RAX=0xffff8123   (correct, matches silicon)
+RUNTIME ecx=0xffff0005 -> RAX=0x5          (correct)
+CONST   mov eax,0x12348123 -> RAX=0x8123   (machine: 0xffff8123)
+```
+
+Same instruction, same lifter arm, same IR. The difference is that the immediate version
+folds, and `const_cast`'s SExt arm read:
+
+```rust
+CastKind::SExt => w.trunc(x, true),   // w = the DESTINATION width
+```
+
+An SExt destination is **wider by construction**, so asking "is bit `dst-1` set?" of a
+value that lives in the low `src` bits asks about a bit that is always 0. Every
+sign-extension the folder ever applied to a constant was a zero-extension. Nothing else
+in the pipeline can see this: the fold output is what a hand-written expectation is
+written against, T2's vectors arrive in registers (Params, not `Const`s), and every test
+that mentions `const_fold` calls it as a *step of a pipeline*, never as the thing under
+test. That is the repo's worst defect class — a silent miscompile, no refusal, no gap, no
+T2 signal — and it was found by a fixture written for a 3-site MSVC mnemonic.
+
+**Two fixes, because the two evaluators must agree.** `passes.rs::const_cast` now signs
+from the source width and keeps the destination's bits; `interp.rs`'s `Op::Cast` SExt arm
+had the same shape and now matches it. The interpreter's version was independently
+inconsistent with two neighbours: `Trunc` already returns a destination-width cell, `ZExt`
+fits inside one, and the C this op emits — `(uint16_t)(int16_t)x` — answers `0xFF80` while
+the interpreter answered `0xFFFFFFFFFFFFFF80`. x86 cannot show the difference through a
+register (every write at the destination width truncates), which is exactly why T2's
+2452 comparisons never saw it.
+
+**New gate: `crates/core/tests/fold_agrees_with_interp.rs`.** Run the folded program and
+the unfolded program on the same inputs, over 22 cast shapes (widening SExt/ZExt,
+narrowing Trunc, same-width Bitcast, at every width pair) × 16 boundary vectors
+(`0x80`, `0x8000`, `0x80000000`, `0x8000000000000000`, …) = 352 cells. Anti-vacuity is
+asserted, not assumed: ≥300 cells swept **and** ≥90% of the programs must actually have
+the cast removed by the folder, because "the folder folded nothing, so the answers agree"
+is the vacuous pass this file exists to prevent. It bites on the first cell of the defect
+it was written for: revert the folder and the first failure is
+`sext W8->W16 of 0x80: the folder changed the answer` (`0xFFFFFFFFFFFFFF80` vs `0xFF80`).
+Breadth lives here; the silicon truth lives in `acc_forms.rs`, because an agreement test
+between two of our own programs is satisfied by both of them being wrong.
+
+**M6 merged the same day.** `m6-landed-m6e` (tyinfer + `rdec types` + the CI baseline
+ratchet) is in; the merge conflicted only in `ROADMAP.md` (kept the lane's two M6 rows and
+this tree's M7 row, sections unioned). Re-measured on the merged 148-object tree, not
+carried from the lane's 136: 128 functions scored, 640 sites, signedness LIE 0 (exact 150
+/ canonical 30 / sound-silent 132), width 153 + 27 narrower, WIDER 0, ptr 21/0, conflicts
+25, `--selftest` 22/22 + register 4/4, and the baseline ratchet **GREEN with 0 new
+families** — the M3 slice's 12 objects added scoreable sites and no type claims, so
+`.gate/types-baseline` needed no edit. The raw gate stays exit 1 by design on the 4 named
+`carry_chain` void-return lies; the root cause is a lifter return-model gap (a COFF object
+carries no signature; `lift.rs` emits `Return(read64(Rax))` unconditionally), not a type
+inference gap, and it is the named next item on the type-recovery lane.
+
+**Gate tuple, parent-run on this tree, un-piped, exit code = verdict** (`/tmp/floor_fold.log`,
+the 16-gate floor): fmt 0, clippy `-D warnings` 0, `cargo test` 0 (**51 suites, 465
+tests**), panic-site ratchet 0, `selftest` 0, `types --selftest` 0 (battery 22/22, register
+4/4), `types --corpus` **1 — by design, the same 4 named `carry_chain` lies, no new
+family**, `types --corpus --baseline .gate/types-baseline` 0, `objdump-check --corpus` 0
+(156/156 exact boundaries), `discover --corpus` 0, `lift --corpus` 0, `flags` 0 (593,400
+probes / 3,950,981 flag comparisons / 0 mismatches), `t2 --corpus` 0 (**2472 planned / 2452
+compared / 2452 match / 0 mismatch / 20 not-compared `#DE`**, memory 408/408, IR leg
+408/408), `t2 --cpp` 0 (856 / 856 / 0, not-compared 0), `pe-discover` on the linked image 0
+(418 functions, 91.59%), `msvc-gates --limit 40` 0 (132 objects, 134 symbols, 40/40
+boundaries, **118 emitted / 16 refused — `cwde` 3 → 0, leg refusals 19 → 16**, 6 census
+keys, "nothing vacuous"). clang `c --corpus` on this tree: 156 lifted / **129 emitted** /
+27 refused / 0 invalid — 129 + 27 = 156, every function in a bucket, where the ledger row
+measured 125 + 27 = 152 and four functions sat in neither.
+
+**A number this slice first read wrong, recorded so it can't be read that way again.** The
+T2 gate prints `-> 2472 comparisons` (planned inputs) and, further down, `compared: 2452`.
+The first read of this run called that "+20 growth over the ledger's 2452". It is not
+growth: the 20 are the machine-side `#DE` zero-divisor vectors, which are planned, run,
+faulted, and excluded from the compared count by design. The ledger row now prints
+planned-and-compared together for exactly that reason.
+
+**Not proven.** No corpus function is *measured* as value-changed by the folder fix:
+the fold path has no site census, so the blast radius is "every folded sign-extension of a
+constant", of which the count is unmeasured. T2 staying at 2452/2452 proves only that no
+*differentially-compared* function changed value — the class the fix targets is precisely
+the one T2 does not reach. `cwde`'s 3 MSVC sites are refusals→lifted, not
+value-verified: there is still no linked MSVC image, so no T2 leg over `cl` code exists.

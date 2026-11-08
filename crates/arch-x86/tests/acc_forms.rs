@@ -485,3 +485,82 @@ fn cqo_sign_extends_at_63_bits() {
         }
     }
 }
+
+/// `mov eax,imm32 ; cwde ; ret` — the sign-replicate that writes INTO the
+/// accumulator. Three rows, all silicon-measured on this host (the same bytes,
+/// executed from executable memory, printed these values):
+///
+/// ```text
+/// mov eax,0x12348123 ; cwde   -> RAX 0x00000000FFFF8123
+/// mov eax,0x00007FFF ; cwde   -> RAX 0x0000000000007FFF
+/// mov eax,0xFFFF0005 ; cwde   -> RAX 0x0000000000000005
+/// ```
+///
+/// The THIRD row is the one that earns the fixture: it says the instruction reads
+/// ONLY bits 0..16 of the accumulator. A lifter that sign-extends the 32-bit cell
+/// answers 0xFFFFF005 there and passes both of the first two rows, so a fixture
+/// with only "a negative short" would bless a real misread of the architecture.
+/// The first row carries the other half: a 32-bit write zeroes bits 63:32, so
+/// RAX is 0x00000000FFFF8123 and not a sign-extended 64-bit value.
+#[test]
+fn cwde_sign_extends_ax_alone_and_zeroes_the_upper_half() {
+    for (bytes, want) in [
+        (
+            &[0xB8u8, 0x23, 0x81, 0x34, 0x12, 0x98, 0xC3][..],
+            0xFFFF_8123u64,
+        ),
+        (&[0xB8u8, 0xFF, 0x7F, 0x00, 0x00, 0x98, 0xC3][..], 0x7FFF),
+        (&[0xB8u8, 0x05, 0x00, 0xFF, 0xFF, 0x98, 0xC3][..], 0x5),
+    ] {
+        let (f, rep) = lift(bytes);
+        verify_ssa(&f).expect("valid SSA");
+        assert_eq!(
+            rep.gaps,
+            0,
+            "cwde is modelled; opaque texts: {:?}",
+            opaque_texts(&f)
+        );
+        match answer(&f, &[0, 0, 0, 0]) {
+            Outcome::Ret(v) => assert_eq!(
+                v.bits(),
+                want,
+                "{:02x?}: the machine's answer, quoted in the header",
+                &bytes[..4]
+            ),
+            other => panic!("{:02x?}: unexpected {other:?}", &bytes[..4]),
+        }
+    }
+}
+
+/// The two siblings stay REFUSED, on purpose: `cbw` (`66 98`) and `cdqe`
+/// (`48 98`) have ZERO sites in any corpus this repo gates — counted over
+/// `corpus/obj`, `corpus/msvc/obj` and `corpus/cpp/obj` with llvm-objdump, whose
+/// AT&T names are `cbtw` and `cdqe` (the `cwde` sites print as `cwtl`, which is
+/// how the three MSVC witnesses were nearly census'd to zero). A modelled
+/// instruction with no corpus witness is a feature no gate measures: the arm
+/// would be green by construction, and a T2 leg over MSVC objects does not exist
+/// yet to test it. Landing either one means a snippet that emits it, in the same
+/// commit as the arm.
+#[test]
+fn cbw_and_cdqe_stay_refused_until_a_corpus_site_exists() {
+    for (bytes, name) in [
+        (
+            &[0xB8u8, 0x81, 0x12, 0x34, 0x12, 0x66, 0x98, 0xC3][..],
+            "cbw",
+        ),
+        (
+            &[0xB8u8, 0x00, 0x00, 0x00, 0x80, 0x48, 0x98, 0xC3][..],
+            "cdqe",
+        ),
+    ] {
+        let (f, rep) = lift(bytes);
+        assert_eq!(rep.gaps, 1, "{name} must stay a loud refusal");
+        let texts = opaque_texts(&f);
+        assert_eq!(texts.len(), 1, "{name}: one refusal, {texts:?}");
+        assert!(
+            texts[0].contains(name),
+            "{name}: the refusal names the mnemonic, got {:?}",
+            texts[0]
+        );
+    }
+}

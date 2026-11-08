@@ -3245,6 +3245,34 @@ impl<'a> Lifter<'a> {
                 let hi = self.bin(BinOp::Sar, a, sh);
                 self.write(Grp::Rdx, dw, hi);
             }
+            Mnemonic::Cwde => {
+                // `EAX = (int32_t)(int16_t)AX` — the sign-replicate that writes
+                // INTO the accumulator, unlike cwd/cdq/cqo above which write the
+                // high half of a dividend pair. Two machine facts decide the
+                // shape, both measured by executing the bytes on this host
+                // (VirtualAlloc + PAGE_EXECUTE_READWRITE, scratch/
+                // sign_extend_probe.c), and the fixture pins both:
+                //   - it reads ONLY its own 16-bit cell. EAX=0xFFFF0005 gives
+                //     EAX=0x5 — not 0xFFFFF005 (extending the 32-bit cell) and
+                //     not 0xFFFF...F005. A lifter that sign-extends from W32
+                //     passes the 0x12348123 case and fails this one, which is
+                //     why the case is in the table.
+                //   - the 32-bit write ZEROES bits 63:32: EAX=0x12348123 leaves
+                //     RAX=0xFFFF8123, so the ZExt on write is architecture, not
+                //     a choice.
+                // NO flag is touched (same measured claim as cdq: a `cmp` before
+                // it is read by a `setc` after it).
+                //
+                // The witnesses are MSVC-only: clang lowers the same C with
+                // `movsx eax,ax`, which is modelled, so a clang-only corpus shows
+                // this arm as dead code. And llvm-objdump prints the byte as
+                // `cwtl`, not `cwde` — an Intel-mnemonic census over objdump
+                // output counts ZERO sites and makes a live instruction look
+                // unexercised.
+                let a = self.read(Grp::Rax, Width::W16);
+                let v = self.cast(CastKind::SExt, a, Width::W32);
+                self.write(Grp::Rax, Width::W32, v);
+            }
             Mnemonic::Mul | Mnemonic::Imul | Mnemonic::Div | Mnemonic::Idiv
                 if ins.op_count() == 1 =>
             {

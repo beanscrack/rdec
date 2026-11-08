@@ -347,8 +347,10 @@ fn const_fold_sweep(f: &mut Function) -> bool {
                 // A cast whose SOURCE is a float is not foldable by this
                 // integer folder: `as_const` answers for `Op::Const` only, so a
                 // The integer folder folds the BIT-level casts (Trunc/ZExt/
-                // SExt/Bitcast), where the answer is the same bits read at the
-                // destination width. It does NOT touch a cast that crosses the
+                // SExt/Bitcast), where the answer is the same bits re-read at the
+                // widths the cast names — for SExt the SOURCE width decides the
+                // sign, so the source type has to ride into `const_cast`.
+                // It does NOT touch a cast that crosses the
                 // int/float boundary in either direction: SIToFp/UIToFp/FPExt/
                 // FPTrunc convert a VALUE, FpToSI/FpToUI answer x86's magic
                 // constant where C is undefined, and `const_cast` is a bit
@@ -359,7 +361,16 @@ fn const_fold_sweep(f: &mut Function) -> bool {
                 Op::Cast(k, t, a)
                     if !f.ty_of(*a).map(|ty| ty.is_float()).unwrap_or(false) && !t.is_float() =>
                 {
-                    kc(*a).map(|x| Op::Const(const_cast(*k, t, x)))
+                    // The source type is an INPUT to the fold, not decoration:
+                    // SExt reads its sign from the source width, and `t` — the
+                    // destination, always the wider one — cannot answer that
+                    // question. `Ty::u64()` is the conservative stand-in for a
+                    // source with no recorded type: at W64 a sign-extension is
+                    // the identity, which is what an untyped cell means here.
+                    kc(*a).map(|x| {
+                        let st = f.ty_of(*a).unwrap_or(Ty::u64());
+                        Op::Const(const_cast(*k, t, &st, x))
+                    })
                 }
                 Op::Cmp(c, a, b) => match (kc(*a), kc(*b)) {
                     (Some(x), Some(y)) => {
@@ -483,11 +494,26 @@ fn const_un(op: UnOp, x: u64, w: Width) -> u64 {
     }
 }
 
-fn const_cast(k: CastKind, t: &Ty, x: u64) -> u64 {
+fn const_cast(k: CastKind, t: &Ty, src: &Ty, x: u64) -> u64 {
     let w = t.width().unwrap_or(Width::W64);
     match k {
         CastKind::Trunc | CastKind::ZExt | CastKind::Bitcast => w.trunc(x, false),
-        CastKind::SExt => w.trunc(x, true),
+        CastKind::SExt => {
+            // Sign extension is a statement about the SOURCE's top bit. The
+            // destination of an SExt is wider by construction, so reading the
+            // sign from the DESTINATION width asks "is bit `dst-1` set?" of a
+            // value that lives in the low `src` bits — always 0 — and every
+            // folded sign-extension silently became a zero-extension. Measured
+            // before the fix: `mov eax,0x12348123 ; cwde` folded to
+            // Const(0x8123) where the machine answers 0xFFFF8123 (and the same
+            // function with the value in ECX, unfolded, was already correct —
+            // the miscompile appeared only once the constant folded).
+            // Sign from the source, then keep the destination's bits: a W32
+            // cell holds 0xFFFF8123, not a sign-extended 64-bit value, because
+            // a 32-bit write zeroes bits 63:32.
+            let sw = src.width().unwrap_or(w);
+            w.trunc(sw.trunc(x, true), false)
+        }
         _ => x,
     }
 }

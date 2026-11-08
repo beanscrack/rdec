@@ -888,7 +888,19 @@ impl<'a> Interp<'a> {
                 let v = match k {
                     CastKind::Trunc => Val::Int(t.width().unwrap_or(sw).trunc(x, false)),
                     CastKind::ZExt => Val::Int(sw.trunc(x, false)),
-                    CastKind::SExt => Val::Int(sw.trunc(x, true)),
+                    CastKind::SExt => {
+                        // Sign from the SOURCE, then keep the DESTINATION's
+                        // bits. Signing alone leaves a value typed T(dw)
+                        // carrying bits above dw — `sext` of an int8 to a W16
+                        // cell answered 0xFFFFFFFFFFFFFF80 for 0x80 — and that
+                        // cell is a lie twice over: the type says W16, and the
+                        // C this op emits, `(uint16_t)(int16_t)x`, answers
+                        // 0xFF80. x86 cannot show the difference through a
+                        // register (every write at the destination width
+                        // truncates), which is why T2 never saw it; a consumer
+                        // that reads the value at 64 bits does.
+                        Val::Int(t.width().unwrap_or(sw).trunc(sw.trunc(x, true), false))
+                    }
                     CastKind::Bitcast => match t {
                         Ty::Float { w: FWidth::F32 } => Val::Fl(f32::from_bits(x as u32) as f64),
                         Ty::Float { w: FWidth::F64 } => Val::Fl(f64::from_bits(x)),
