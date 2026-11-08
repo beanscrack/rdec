@@ -3356,3 +3356,34 @@ The LIFTER still records `Return(read64(Rax))` for these functions
 a `return` with a value. T2 cannot see it — all four legs are outside the compared set
 (`not run [memory outside the modelled frame]`) — and its owner is M4's void-return model:
 a `RetKind::Void`/no-value terminator with a `verify` bound, not a type-recovery rule.
+
+---
+
+## 17. T1's full grid re-proved on today's flag model (measured locally, 2026-11-08)
+
+CI runs the SAMPLED grid on every push (593,400 probes / 3,950,981 flag
+comparisons, ~30 s); the 9.7-billion-probe `--full` sweep is a nightly job, which
+means every flag-model change this repo landed today — `cwde`, memory `inc`/`dec`,
+memory `cmp`/`test` in Intel order, `CF` preserved across `inc`/`dec`, the
+constant-fold SExt fix — was pushed on sampled evidence. It has now been re-proved
+at full depth on the owner's machine, at `57747c0`, release build:
+
+```
+9728273400 probes, 69666730981 flag comparisons, 17835591539 undefined-skips, 0 mismatches
+elapsed 359.1741734s
+OK: flag model matches hardware on every probe          T1FULL=0
+```
+
+**Zero mismatches over 9,728,273,400 probes and 69.7 billion flag comparisons.**
+The probe count is above the nightly's 9,704,437,200 because the model now has more
+flag-setting sites to probe than when that number was recorded — the expected
+direction for a growing model, and the reason a probe count is printed rather than
+assumed. `undefined-skips` (17.8e9) are the SDM's undefined-flag cases the oracle
+deliberately does not assert; they are counted so a change that silently STARTS
+asserting an undefined flag shows up in this number.
+
+What this does NOT buy: the full grid covers the flag model's tables, not the
+lifter's flag plumbing (which flags node a given instruction writes) — that is the
+`lift` gate, T1R/T1L and T2's territory, and it runs sampled in CI. The nightly
+keeps the full sweep as its regression net; this section is a dated, locally
+measured re-proof of the model under all of M2's additions.
