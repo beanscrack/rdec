@@ -11,10 +11,16 @@
 //! bit and its predecessor) at every width the IR carries.
 //!
 //! Scope is the set the LIFTER CAN EMIT (measured: `Add Sub Mul And Or Xor
-//! Shl Shr Sar` appear in lift.rs; `MulHi/MulSmul/UDiv/URem/SDiv/SRem/RotL/
-//! RotR` do not — they sit in the IR for a front end that has not needed
-//! them, and testing them here would test code no gate reaches; the day an
-//! `imul` high form lands, its lane extends this table).
+//! Shl Shr Sar` appear in lift.rs, and the accumulator slice added
+//! `MulHi/MulSmul/UDiv/URem/SDiv/SRem`). `RotL/RotR` have NO lift site —
+//! `rol`/`ror` are not in lift.rs — and they are covered here anyway, for one
+//! reason that is not "test everything": `emit_c` SPELLS rotates, so a rotate is
+//! C the emitter can produce, and the C compiler is a second implementation of
+//! the model that no IR test can reach. Writing that leg is what found the
+//! emitter's rotate expression to be arithmetically wrong (it masked the
+//! complement shift with `& w`, a power of two: at W32 a rotate by 3 emitted
+//! `(x<<3) | (x>>0)`). An op with no corpus site is a named hole (see
+//! `rot_emitter_c.rs`), not a reason to leave the spelling unchecked.
 //!
 //! Shift counts are fed RAW (0..2^64) on purpose: the lifter masks with
 //! `count_for`, but the interpreter is public — passes-fused and fuzz-built
@@ -97,6 +103,31 @@ fn reference(o: BinOp, w: Width, x: u64, y: u64) -> u64 {
             };
             trunc(w, (sx >> n) as u64)
         }
+        BinOp::RotL | BinOp::RotR => {
+            // THE REFERENCE IS A BIT LOOP, on purpose: the model rotates with
+            // shifts, the emitted C rotates with shifts, and a reference built
+            // from `(x << n) | (x >> (w - n))` would agree with a model that
+            // shifts by the width. Here the answer is assembled bit by bit, so
+            // it shares no mechanism with either implementation.
+            let b = w.bits() as usize;
+            let n = (y % b as u64) as usize;
+            let mut bit = [false; 64];
+            for (i, slot) in bit.iter_mut().take(b).enumerate() {
+                *slot = (x >> i) & 1 == 1;
+            }
+            let mut r = 0u64;
+            for i in 0..b {
+                let src = if o == BinOp::RotL {
+                    (i + b - n) % b
+                } else {
+                    (i + n) % b
+                };
+                if bit[src] {
+                    r |= 1u64 << i;
+                }
+            }
+            trunc(w, r)
+        }
         _ => unreachable!("suite is scoped to the liftable integer set"),
     }
 }
@@ -160,6 +191,20 @@ fn check(o: BinOp, w: Width) {
                 got, want,
                 "{o:?} {w:?} ({sx:?}) x={x:#x} y={y:#x}: model {got:#x}, machine {want:#x}"
             );
+        }
+    }
+}
+
+#[test]
+fn rotl_and_rotr_rotate_at_every_width() {
+    // Counts reach this suite RAW (0, 1, 2, MAX, MAX-1, 3000 randoms), which is
+    // exactly the pressure the rotate needs: count 0 is the shift-by-the-width
+    // case, and counts >= the width are the masking case. No lift site feeds
+    // them today (`rol`/`ror` are not in lift.rs) — this is a floor under the
+    // IR op and the emitted C, not a claim about corpus coverage.
+    for w in [Width::W8, Width::W16, Width::W32, Width::W64] {
+        for o in [BinOp::RotL, BinOp::RotR] {
+            check(o, w);
         }
     }
 }

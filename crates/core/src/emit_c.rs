@@ -817,8 +817,33 @@ impl<'a> Emitter<'a> {
                 };
                 format!("(({st}){x} >> {cnt})")
             }
-            BinOp::RotL => format!("(({x} << {cnt}) | ({x} >> (({w}ULL - {cnt}) & {w}_ULL)))"),
-            BinOp::RotR => format!("(({x} >> {cnt}) | ({x} << (({w}ULL - {cnt}) & {w}_ULL)))"),
+            BinOp::RotL | BinOp::RotR => {
+                // x86 `rol`/`ror` mask the COUNT to the width (`& 31`, `& 63`),
+                // so the complement shift is `(w - (cnt & (w-1))) & (w-1)`:
+                // always in [0, w-1], never the width itself. The spelling this
+                // replaces masked with `& w` — a POWER OF TWO, i.e. an
+                // arithmetically meaningless mask: at W32 with cnt=3 it emitted
+                // `(x<<3) | (x>>0)` (29 & 32 == 0), so a rotate-by-3 dropped the
+                // wrapped bits and OR'd in the value itself, and at cnt=0 it
+                // shifted by the width, which is UB in C. The VALUE is masked to
+                // `w` on both sides and the result masked, so a W32 rotate
+                // cannot answer with bits 32..63.
+                let m = if w >= 64 {
+                    "~0ULL".to_string()
+                } else {
+                    format!("0x{:x}ULL", (1u64 << w) - 1)
+                };
+                let wm = w - 1;
+                let (hi, lo) = if matches!(op, BinOp::RotL) {
+                    ("<<", ">>")
+                } else {
+                    (">>", "<<")
+                };
+                format!(
+                    "(((({x}) & {m}) {hi} (({cnt}) & {wm}ULL)) | \
+                     ((({x}) & {m}) {lo} (({w}ULL - (({cnt}) & {wm}ULL)) & {wm}ULL))) & {m}"
+                )
+            }
         };
         Some(s)
     }

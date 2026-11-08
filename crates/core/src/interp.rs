@@ -1140,13 +1140,37 @@ impl<'a> Interp<'a> {
             }
             BinOp::RotL => {
                 let b = w.bits().max(1);
+                // MASK THE VALUE AND THE RESULT. `x` arrives width-masked from
+                // its producer, but this node's own result is only meaningful
+                // at `w`: `(x << n)` spills past bit w-1 and the model's type
+                // says those bits do not exist (the `add`/`shl` arms all mask
+                // through `w.trunc`; an unmasked rotate answers a W32 question
+                // with a W64 value).
+                let m = w.mask();
+                let v = x & m;
+                // x86 `rol` masks the count (`& 31`/`& 63`), which for these
+                // power-of-two widths is `y % b`. n == 0 must return `v`:
+                // `x >> (b - 0)` is a shift by the width, i.e. a DEBUG PANIC at
+                // W64 and a silent release wrap (rotate-by-0 answered `x | x`
+                // in release and crashed in debug - the same op answering two
+                // different questions by profile).
                 let n = (y % b as u64) as u32;
-                (x << n) | (x >> (b - n))
+                if n == 0 {
+                    v
+                } else {
+                    ((v << n) | (v >> (b - n))) & m
+                }
             }
             BinOp::RotR => {
                 let b = w.bits().max(1);
+                let m = w.mask();
+                let v = x & m;
                 let n = (y % b as u64) as u32;
-                (x >> n) | (x << (b - n))
+                if n == 0 {
+                    v
+                } else {
+                    ((v >> n) | (v << (b - n))) & m
+                }
             }
             BinOp::UDiv => {
                 if y == 0 {
