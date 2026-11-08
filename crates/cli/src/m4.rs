@@ -257,6 +257,24 @@ pub(crate) fn clean(f: &mut Function) {
     }
 }
 
+/// Cap a census key WITHOUT inventing an identifier. The census key is the map
+/// of what to build next, and a raw character slice produces labels like
+/// `lea of an address we cannot name: __Imag` — measured, printed by this gate
+/// on the MSVC leg, where the real target is `__ImageBase`. Two harms: the key
+/// names a symbol that does not exist, and every distinct target whose first 40
+/// characters agree lands in ONE bucket, so the count is a count of prefixes.
+/// A clip that is announced with an ellipsis cannot do either silently.
+fn clip(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(n).collect();
+    match head.rfind(char::is_whitespace) {
+        Some(i) if i > n / 2 => format!("{}…", head[..i].trim_end()),
+        _ => format!("{head}…"),
+    }
+}
+
 /// One refusal key per class of gap, so the report says what to build next
 /// instead of dumping 200 sentences.
 ///
@@ -270,11 +288,11 @@ pub fn key(r: &Refusal) -> String {
     if let Some(rest) = s.strip_prefix("opaque:") {
         let rest = rest.trim();
         let cut = rest.find(" at ").unwrap_or(rest.len());
-        return format!("opaque: {}", rest[..cut.min(40)].trim());
+        return format!("opaque: {}", clip(rest[..cut].trim(), 64));
     }
     let low = s.to_lowercase();
     let cut = low.find(':').unwrap_or(low.len());
-    low[..cut.min(46)].trim().to_string()
+    clip(low[..cut].trim(), 72)
 }
 
 /// The one naming scheme for C identifiers built from symbol names. `rdec t2`
@@ -1009,4 +1027,49 @@ pub fn sse_line(sse: &std::collections::BTreeMap<String, u32>, zeroing: usize) -
         "  sse mnemonics counted: {tot} [{}] (scalar subset and packed data movement / lane-independent bitwise modelled, the rest refused by name; zeroing idiom: {zeroing})",
         parts.join(" ")
     )
+}
+
+#[cfg(test)]
+mod census_key_tests {
+    use super::{clip, key};
+    use rdec_core::emit_c::Refusal;
+
+    fn r(reason: &str) -> Refusal {
+        Refusal {
+            at: 0x2f,
+            reason: reason.to_string(),
+        }
+    }
+
+    /// The clip is a class label, not a symbol. Measured, printed by this very
+    /// gate on the MSVC leg: `opaque: lea of an address we cannot name: __Imag`,
+    /// where the target is `__ImageBase`. A raw slice invents an identifier and
+    /// merges every target sharing a prefix, so the census counts prefixes
+    /// instead of work items.
+    #[test]
+    fn a_clipped_key_announces_the_clip_and_never_looks_like_a_symbol() {
+        let long = "lea of an address we cannot name: __ImageBase_and_a_tail_that_keeps_going";
+        let k = clip(long, 40);
+        assert!(k.ends_with('…'), "the clip must be visible: {k}");
+        assert!(
+            !k.contains("__Imag"),
+            "a clipped key must not print a partial identifier: {k}"
+        );
+        assert!(
+            clip("lea of an address we cannot name: __ImageBase", 64).ends_with("__ImageBase"),
+            "the shipped cap must not clip the target it exists to name"
+        );
+    }
+
+    /// `key()` is shared with `rdec cpp`, so both gates' class lines are the same
+    /// map. This pins the MSVC leg's real refusal text end to end.
+    #[test]
+    fn the_lea_key_names_the_target_it_cannot_name() {
+        let k = key(&r("opaque: lea of an address we cannot name: __ImageBase"));
+        assert!(
+            k.ends_with("__ImageBase"),
+            "the census key names the full target, got {k}"
+        );
+        assert!(!k.contains(" at "), "the site sentence is cut: {k}");
+    }
 }
