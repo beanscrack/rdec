@@ -685,8 +685,19 @@ pub fn lift_all(files: &[String]) -> Result<Vec<Subject>, String> {
 
 pub fn cmd_c(args: &[String]) -> Result<i32, String> {
     let mut files: Vec<String> = Vec::new();
+    let mut skip_value = false;
     for a in args.iter().skip(1) {
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
         if a == "--corpus" {
+            // The clang corpus, read EXACTLY as before this leg existed: the MSVC
+            // leg is additive, and `rdec c --corpus` (a repo floor: 98 emitted /
+            // 42 refused / 0 invalid) must not feel it. This block was dropped
+            // once while the `--corpus-dir` plumbing went in, and `c --corpus`
+            // answered with the usage line and exit 2 - caught by running the
+            // clang floors after the change, not before it.
             let man = std::fs::read_to_string("corpus/manifest.tsv")
                 .map_err(|e| format!("corpus/manifest.tsv: {e}"))?;
             for line in man.lines() {
@@ -699,12 +710,25 @@ pub fn cmd_c(args: &[String]) -> Result<i32, String> {
             }
             continue;
         }
+        if a == "--emit" || a == "--corpus-dir" {
+            // The value belongs to the flag. Reading `--emit DIR`'s directory as
+            // an object path is how `c --corpus --emit DIR` died loading "DIR".
+            skip_value = true;
+            continue;
+        }
         if !a.starts_with("--") {
             files.push(a.clone());
         }
     }
+    // `--corpus-dir DIR` (see `crate::m1::corpus_objects`) points this gate at
+    // another generator's manifest — the MSVC leg — through the SAME pipeline,
+    // the same refusal classes and the same clang -Werror compile of the C.
+    files.extend(crate::m1::corpus_objects(args)?);
     if files.is_empty() {
-        return Err("usage: rdec c <object.obj> [...] [--corpus] [--emit DIR]".to_string());
+        return Err(
+            "usage: rdec c <object.obj> [...] [--corpus] [--corpus-dir DIR] [--emit DIR]"
+                .to_string(),
+        );
     }
     let out_dir = args
         .iter()

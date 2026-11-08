@@ -19,6 +19,38 @@ fn objdump_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("llvm-objdump"))
 }
 
+/// `--corpus-dir DIR`: point THIS gate at another generator's manifest.
+///
+/// `--corpus` stays the clang corpus at `corpus/manifest.tsv`, read exactly as
+/// before. `--corpus-dir corpus/msvc` runs the SAME code over the MSVC leg's
+/// manifest: one code path per gate, a different denominator. A gate forked per
+/// toolchain is where a leg quietly stops checking anything.
+///
+/// An empty manifest is an ERROR, not an empty file list: a corpus that yields 0
+/// objects turns every gate over it into a pass over nothing, and this repo has
+/// been burned by exactly that twice. The gates themselves keep their own floors
+/// ("no code symbols", "discovery checked nothing") - this is the layer under them.
+pub fn corpus_objects(args: &[String]) -> Result<Vec<String>, String> {
+    let Some(i) = args.iter().position(|a| a == "--corpus-dir") else {
+        return Ok(Vec::new());
+    };
+    let dir = args.get(i + 1).ok_or("--corpus-dir needs a directory")?;
+    let man = format!("{dir}/manifest.tsv");
+    let text = std::fs::read_to_string(&man)
+        .map_err(|e| format!("{man}: {e} - run `rdec corpus --msvc` first"))?;
+    let files: Vec<String> = text
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.starts_with("name\t"))
+        .filter_map(|l| l.split('\t').nth(2).map(|s| s.to_string()))
+        .collect();
+    if files.is_empty() {
+        return Err(format!(
+            "{man} lists 0 objects - a gate over it would check nothing"
+        ));
+    }
+    Ok(files)
+}
+
 /// Symbols worth disassembling: in a code section, not a section symbol, with
 /// a non-zero extent, and not pure padding.
 fn callable_symbols(obj: &loader::Object) -> Vec<usize> {
@@ -201,7 +233,7 @@ pub fn cmd_objdump_check(args: &[String]) -> Result<i32, String> {
     // Positional object paths, skipping the values that belong to flags:
     // collecting `--limit 60` as a file named `60` is how the first version of
     // this failed the `rdec status` row that runs it.
-    const TAKES_VALUE: [&str; 2] = ["--limit", "--syntax"];
+    const TAKES_VALUE: [&str; 3] = ["--limit", "--syntax", "--corpus-dir"];
     let mut files: Vec<String> = Vec::new();
     let mut skip_value = false;
     for a in args.iter().skip(1) {
@@ -231,6 +263,8 @@ pub fn cmd_objdump_check(args: &[String]) -> Result<i32, String> {
             }
         }
     }
+    // The MSVC leg's manifest, through the SAME code path (see `corpus_objects`).
+    files.extend(corpus_objects(args)?);
     let limit = args
         .iter()
         .position(|a| a == "--limit")
@@ -238,7 +272,9 @@ pub fn cmd_objdump_check(args: &[String]) -> Result<i32, String> {
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(usize::MAX);
     if files.is_empty() {
-        eprintln!("usage: rdec objdump-check <object.obj> [more.obj ...] [--limit N]");
+        eprintln!(
+            "usage: rdec objdump-check <object.obj> [more.obj ...] [--corpus] [--corpus-dir DIR] [--limit N]"
+        );
         return Ok(2);
     }
     let syntax = syntax_of(args);
@@ -335,7 +371,57 @@ pub fn cmd_objdump_check(args: &[String]) -> Result<i32, String> {
     }
 }
 
-/// `rdec discover <obj> [more...] [--corpus] [--limit N]`
+/// The architectural no-op family, as our decoder SPELLS it. `starts_with("nop")`
+/// is not this family: the 2-byte canonical NOP `66 90` decodes to `xchg ax,ax`,
+/// which is a NOP by encoding (exchanging AX with itself) and the fill MSVC emits
+/// for 2-byte alignment inside `.text$mn`, while clang aligns with `nopw`/`0f 1f`
+/// (whose prefix DOES match). So one toolchain's alignment was padding and the
+/// other's was missed code, on a mnemonic prefix.
+///
+/// Scale, measured on the 2026-11-08 MSVC leg, because the first version of this
+/// comment claimed the whole gap and does not own it: this rule reclassifies 2 of
+/// the leg's 116 uncovered bytes (coverage 98.35% -> 98.39%, 8 gap runs -> 7). The
+/// remaining 114 bytes are the `switch` thunks MSVC reaches through an indirect
+/// branch, which is M2's work and STAYS uncovered here on purpose.
+///
+/// Space-insensitive: the Intel printer's spacing is not a semantic property of the
+/// byte.
+fn is_nop_text(text: &str) -> bool {
+    let t = text.trim();
+    t.starts_with("nop") || t.replace(' ', "").eq_ignore_ascii_case("xchgax,ax")
+}
+
+/// Is an uncovered byte run padding rather than missed code? This is a SEMANTIC
+/// claim, so it asks the decoder rather than matching bytes: LLVM aligns with
+/// multi-byte NOPs (`0f 1f 84 00 ...`, `66 66 2e 0f 1f 84 00 ...`) and MSVC with
+/// `66 90`, and no byte-pattern rule names those. A run whose instructions are ALL
+/// no-ops is padding; so is `0xCC` (int3, any length, the tail fill of both
+/// toolchains) and a run of 4+ `0x00` (three zero bytes can be an instruction
+/// stream - `00 00 00` is `add [rax],al` - so the shorter run is charged as
+/// uncovered, not silently excused).
+///
+/// The claim is one-directional on purpose: a run that decodes to anything with a
+/// side effect (`mov`, `jmp`, a thunk) stays UNCOVERED and lands in the gap census,
+/// where M1's 99.5% floor sees it. Widening this predicate buys coverage on paper;
+/// that is why it is a function with tests, not an inline condition.
+pub fn is_padding_run(run: &[u8]) -> bool {
+    if run.is_empty() {
+        return false;
+    }
+    if run.iter().all(|&b| b == 0xCC) {
+        return true;
+    }
+    if run.iter().all(|&b| b == 0x00) {
+        return run.len() >= 4;
+    }
+    let ins = decode(run, 0, Syntax::Intel);
+    !ins.is_empty()
+        && ins
+            .iter()
+            .all(|i| i.valid() && i.text.as_deref().map(is_nop_text).unwrap_or(false))
+}
+
+/// `rdec discover <obj> [more...] [--corpus] [--corpus-dir DIR] [--limit N]`
 ///
 /// M1 step 2's gate. Ground truth is the object's own symbol table: every
 /// function symbol must be recovered by descent alone, from entry points and
@@ -349,7 +435,7 @@ pub fn cmd_discover(args: &[String]) -> Result<i32, String> {
     };
     use std::collections::HashMap;
 
-    const TAKES_VALUE: [&str; 2] = ["--limit", "--syntax"];
+    const TAKES_VALUE: [&str; 3] = ["--limit", "--syntax", "--corpus-dir"];
     let mut files: Vec<String> = Vec::new();
     let mut skip_value = false;
     for a in args.iter().skip(1) {
@@ -377,9 +463,12 @@ pub fn cmd_discover(args: &[String]) -> Result<i32, String> {
             }
         }
     }
+    // See `cmd_objdump_check`: the manifest is the driver, and one code path
+    // serves the clang corpus and the MSVC corpus.
+    files.extend(corpus_objects(args)?);
     if files.is_empty() {
         return Err(
-            "usage: rdec discover <object.obj> [more.obj ...] [--corpus] [--limit N]".to_string(),
+            "usage: rdec discover <object.obj> [more.obj ...] [--corpus] [--corpus-dir DIR] [--limit N]".to_string(),
         );
     }
     let limit = args
@@ -530,28 +619,7 @@ pub fn cmd_discover(args: &[String]) -> Result<i32, String> {
                     .map(|p| i + p)
                     .unwrap_or(hit.len());
                 let run = &r.bytes[i..j];
-                // int3 padding is 0xCC and can be any length; 0x00 fills are
-                // only padding when they are long enough that they cannot be
-                // an instruction stream.
-                // Padding is a *semantic* claim, so ask the decoder: LLVM
-                // aligns with multi-byte NOPs (`0f 1f 84 00 ...`, `66 66 2e 0f
-                // 1f ...`), which no byte-pattern rule names. A run whose
-                // instructions are all nops is padding; int3 (0xCC) and long
-                // 0x00 fills are padding too.
-                let all_cc = run.iter().all(|&b| b == 0xCC);
-                let all_00 = run.iter().all(|&b| b == 0x00);
-                let all_nop = {
-                    let ins = decode(run, 0, Syntax::Intel);
-                    !ins.is_empty()
-                        && ins.iter().all(|i| {
-                            i.valid()
-                                && i.text
-                                    .as_deref()
-                                    .map(|t| t.starts_with("nop"))
-                                    .unwrap_or(false)
-                        })
-                };
-                if all_cc || all_nop || (all_00 && run.len() >= 4) {
+                if is_padding_run(run) {
                     padding += run.len() as u64;
                 } else {
                     other_uncovered += run.len() as u64;
@@ -669,7 +737,7 @@ pub fn cmd_lift(args: &[String]) -> Result<i32, String> {
     use rdec_core::verify::verify_ssa;
     use std::collections::HashMap;
 
-    const TAKES_VALUE: [&str; 3] = ["--limit", "--ir", "--syntax"];
+    const TAKES_VALUE: [&str; 4] = ["--limit", "--ir", "--syntax", "--corpus-dir"];
     let mut files: Vec<String> = Vec::new();
     let mut ir_name: Option<String> = None;
     let mut skip_value = false;
@@ -701,9 +769,12 @@ pub fn cmd_lift(args: &[String]) -> Result<i32, String> {
             }
         }
     }
+    // The clang leg and the MSVC leg run the SAME lifting code through this one
+    // entry point (`corpus_objects`).
+    files.extend(corpus_objects(args)?);
     if files.is_empty() {
         return Err(
-            "usage: rdec lift <object.obj> [...] [--corpus] [--limit N] [--ir NAME]".to_string(),
+            "usage: rdec lift <object.obj> [...] [--corpus] [--corpus-dir DIR] [--limit N] [--ir NAME]".to_string(),
         );
     }
     let limit = args
@@ -1361,4 +1432,90 @@ pub fn cmd_pe_discover(args: &[String]) -> Result<i32, String> {
         boundary_gaps
     );
     Ok(0)
+}
+
+// Tests live at the BOTTOM of the file on purpose: `scripts/unwrap_ratchet.sh`
+// cuts each file at its first `#[cfg(test)]`, so a mid-file test module blinds the
+// panic-site count for everything below it. This module adds no panic site.
+#[cfg(test)]
+mod padding_run_tests {
+    use super::is_padding_run;
+    use rdec_arch_x86::decode::{decode, Syntax};
+
+    fn text(bytes: &[u8]) -> Vec<String> {
+        decode(bytes, 0, Syntax::Intel)
+            .iter()
+            .map(|i| i.text.clone().unwrap_or_default())
+            .collect()
+    }
+
+    /// The MSVC leg's whole coverage delta lives here. `66 90` IS the canonical
+    /// 2-byte NOP (exchange AX with itself), and MSVC pads 2-byte alignment inside
+    /// `.text$mn` with it; our decoder spells it `xchg ax, ax`, which
+    /// `starts_with("nop")` rejects, so a run of it was charged as missed code.
+    #[test]
+    fn the_two_byte_fill_msvc_pads_with_is_padding() {
+        assert!(
+            is_padding_run(&[0x66, 0x90, 0x66, 0x90]),
+            "66 90 66 90 is two canonical NOPs; decoder text was {:?}",
+            text(&[0x66, 0x90, 0x66, 0x90])
+        );
+        // And the claim is about the DECODER's spelling, not a byte rule: this is
+        // the fact the predicate keys on, so it is asserted, not assumed.
+        let t = text(&[0x66, 0x90]);
+        assert_eq!(t.len(), 1, "66 90 is one instruction: {t:?}");
+        let s = t[0].replace(' ', "");
+        assert!(
+            s.eq_ignore_ascii_case("xchgax,ax") || s.starts_with("nop"),
+            "expected the canonical NOP spelling, decoder said {t:?}"
+        );
+    }
+
+    #[test]
+    fn one_byte_and_multibyte_llvm_nops_are_padding() {
+        assert!(is_padding_run(&[0x90; 3]), "90 90 90 is three nops");
+        // `0f 1f 84 00 00000000` = nopw [rax+rax+0], LLVM's 8-byte alignment.
+        assert!(is_padding_run(&[0x0f, 0x1f, 0x84, 0x00, 0, 0, 0, 0]));
+        // `66 2e 0f 1f 84 00 00000000`, the 10-byte segment-override form.
+        assert!(is_padding_run(&[
+            0x66, 0x2e, 0x0f, 0x1f, 0x84, 0x00, 0, 0, 0, 0
+        ]));
+    }
+
+    #[test]
+    fn int3_pads_at_any_length_and_zeroes_need_four_bytes() {
+        assert!(is_padding_run(&[0xCC]), "one int3 is a tail fill");
+        assert!(is_padding_run(&[0xCC; 16]));
+        // Three zero bytes decode as `add [rax],al` - a real, if silly,
+        // instruction stream - so they are charged as uncovered, not excused.
+        assert!(
+            !is_padding_run(&[0x00, 0x00, 0x00]),
+            "decoder said {:?}",
+            text(&[0, 0, 0])
+        );
+        assert!(is_padding_run(&[0x00; 4]), "a 4-byte zero fill is not code");
+        assert!(!is_padding_run(&[]), "an empty run is not padding either");
+    }
+
+    /// The MSVC gap's other half must STAY uncovered: its switch lowering is a
+    /// `mov eax, k` + indirect `jmp` thunk inside `.text$mn`. Padding is the
+    /// innocent label; a thunk is a discovery hole, and M1's floor has to see it.
+    #[test]
+    fn a_run_that_moves_data_or_jumps_indirectly_is_code() {
+        // mov eax, dword ptr [0x402000] - the MSVC switch thunk's load.
+        assert!(!is_padding_run(&[0x8b, 0x04, 0x25, 0x00, 0x20, 0x40, 0x00]));
+        // jmp qword ptr [rip+0] - the indirect branch that reaches it.
+        assert!(!is_padding_run(&[0xff, 0x25, 0x00, 0x00, 0x00, 0x00]));
+        // push rbp; mov rbp, rsp - the prologue of a function we never reached.
+        assert!(!is_padding_run(&[0x55, 0x48, 0x89, 0xe5]));
+    }
+
+    /// One-directional: a `0xCC` (int3, a trap, semantically NOT a nop) mixed into
+    /// a nop run keeps the whole run uncovered. Widening this predicate is how
+    /// coverage goes up on paper, so the narrow edge is pinned.
+    #[test]
+    fn a_trap_inside_a_nop_run_is_not_padding() {
+        assert!(!is_padding_run(&[0x90, 0x90, 0xCC, 0x90]));
+        assert!(is_padding_run(&[0x90, 0x90, 0x90, 0x90]));
+    }
 }

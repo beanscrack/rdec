@@ -9,6 +9,7 @@ use rdec_core::ty::{Sx, Ty, Width};
 use rdec_core::verify;
 use rdec_verify::{hw, model_shim, Sabotage};
 
+mod corpus;
 mod fuzz;
 mod m1;
 mod m4;
@@ -24,10 +25,15 @@ fn main() {
         "corpus" => {
             if args.iter().any(|a| a == "--cpp") {
                 m8::cmd_corpus_cpp(&args[1..])
+            } else if args.iter().any(|a| a == "--msvc") {
+                corpus::cmd_corpus_msvc(&args[1..])
             } else {
                 cmd_corpus(&args[1..])
             }
         }
+        // The corpus matrix's MSVC leg: build the same sources with cl, print the
+        // flags, the exclusions and the stamp normalization, and gate over them.
+        "msvc-gates" => corpus::cmd_msvc_gates(&args[1..]),
         "demangle" => match m8::cmd_demangle(&args) {
             Ok(rc) => rc,
             Err(e) => {
@@ -125,6 +131,9 @@ fn print_help() {
          \x20 probe <op> <w> <a> <b>          print model+hardware flags for one case\n\
          \x20 selftest                        prove the IR verifier rejects broken IR\n\
          \x20 corpus [--out DIR] [--opt O0,O2]  build the clang corpus + hashed manifest\n\
+         \x20 corpus --msvc [--out DIR] [--opt Od,O1,O2,Os]  MSVC leg: same sources, cl /c\n\
+         \x20 msvc-gates [--corpus-dir DIR] [--limit N] [--full]  MSVC battery: objdump-check +\n\
+         \x20                                   discover + lift + refusal census by mnemonic\n\
          \x20 corpus --cpp [--out DIR]         build the C++ corpus (M8, clang++ MSVC ABI)\n\
          \x20 demangle --cpp                  M8 gate: MSVC C++ names vs llvm-nm\n\
          \x20 cpp --corpus                    M8 gate: the C++ corpus through the C\n\

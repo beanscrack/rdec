@@ -2400,3 +2400,244 @@ not verified function bodies (0x15ac is 4 bytes behind 0x15a8: at least one is n
 sweep decides, and its verdict is coverage, not a proof); the m7.exe legs skip LOUDLY when the probe
 is absent from the reaped temp dir.
 
+
+
+## Section 10: the MSVC leg of the corpus matrix (cl 19.44.35228, 128 objects, CI job `msvc`)
+
+Section 3 promised the matrix `{clang, gcc, MSVC}`; the corpus path was clang-only.
+`rdec corpus --msvc` (`crates/cli/src/corpus.rs`) compiles the SAME `corpus/src/*.c`
+with cl into COFF at `corpus/msvc/obj/<snippet>.<opt>.obj`, writes the same manifest
+shape, and every gate reaches it through ONE new flag, `--corpus-dir DIR`:
+`m1::corpus_objects` is the manifest reader, and objdump-check / discover / lift /
+`c` each gained the flag in the file that already owns their arg parsing. A gate
+forked per toolchain is where a leg quietly stops checking anything, so a gate over
+MSVC objects IS the gate over clang objects with a different denominator. The clang
+path is untouched: nothing here is called by `rdec_verify::corpus::generate`, and
+`git diff --exit-code corpus/manifest.tsv` is clean after a clang rebuild (measured).
+
+FLAGS, recorded per leg in the manifest header (`# flags[leg]:`): `/nologo /c /Gw-
+/GS- /Od`, `… /O1 …`, `… /O2 /GS …`, `… /O1 /Os …`. `/GS` (the security cookie) is ON
+for exactly one leg — pinned by `every_leg_has_flags_and_the_cookie_leg_is_named`.
+`/Oxs` and `/Ox` are NOT legs, and that is a measurement: their `.text` is
+byte-identical to `/O2` on 32/32 snippets (only `.drectve`/debug records differ), so
+a leg for them gates nothing. `/Os` IS a leg: its `.text` differs from `/O1` on 30/32
+and from `/O2` on 29/32. `/Gw` is spelled out because it only does anything under
+`/GL`, and `/GL` replaces per-function COFF code with an MSVC IL bitstream — there
+would be no `.text` to decompile at all. `/Gs` stays default: `__chkstk` needs a
+frame over 4096 bytes and no snippet has one.
+
+THE `/GS` RECORD, HONEST: on this corpus the cookie is a no-op — 0 objects reference
+`__security_cookie`, 0 reference `__chkstk`, and `/O2 /GS` `.text` is byte-identical
+to `/O2 /GS-` `.text`. The lifter therefore refuses NOTHING by those names, because
+no snippet has the local-buffer shape that makes MSVC install a cookie. The roadmap
+WANTS those shapes: the corpus needs a snippet with a stack buffer, and
+`corpus/src/*.c` is not this lane's file. Recorded as the next step.
+
+EXCLUDED BY NAME, not silently (manifest `# excluded:` lines, and `rdec corpus
+--msvc` refuses to report OK unless it built exactly 32×4): `call_helper.c`
+(clang-only `__attribute__((noinline))`; cl: C2143) and `mul_wide.c` (clang-only
+`__int128`; cl: C4235). Result: **128 objects, 101,212 bytes, 130 code symbols**.
+
+WHAT cl EMBEDS, measured (two builds of the same 32 sources into the same directory,
+2 s apart): the COFF `TimeDateStamp` at object **offset 4** moved in 32/32, and the
+8-byte payload at **`.chks64` + 8** moved with it, because that checksum is taken
+over the object *including the stamp*; `.chks64` bytes 0..8 (file identity) did not
+move. Zeroing BOTH is what makes the leg reproducible: 32/32 objects differ before
+normalization, 0/32 after. `.debug$S` (`S_OBJNAME`) and the FILE symbol's aux record
+carry the source and `.obj` PATHS, so the claim is "cl twice into ONE directory" —
+never two directories, and never cl-vs-clang bytes. Offsets pinned twice:
+`msvc_stamp_offsets_pin_the_real_fields` (unit, both fields + the non-AMD64 guard)
+and `the_normalization_rule_burns_off_a_real_clock` (integration: put a fake clock
+and a fake checksum into a real cl object, run the rule, require the on-disk bytes).
+
+MEASURED MSVC SHAPES the front end has to speak, asserted over generated objects:
+C symbols carry a leading underscore (`_f` in 128/128), every function is its own
+COMDAT (`.text$in$_f`; the corpus has exactly 128 code sections for 128 objects),
+and the section-definition symbol shares offset 0 with `.text` — the `is_code`
+dot-name skip is what keeps it out of the function list. `.bss` is 4 bytes with
+`PointerToRawData == 0`, which means **NO DATA IN FILE**, not data at offset 0: the
+assertion is on the loader's section bytes, never on the header field.
+
+GATES: `.github/workflows/ci.yml` job `msvc` (parallel to `gates`, so the clang
+job's ~21 min is untouched) runs `scripts/msvc-corpus.ps1` (cl, located by vswhere,
+banner printed; corpus twice; manifest sha256 must match) then
+`scripts/msvc-gates.ps1 -Limit 40`; nightly.yml runs `-Full`. `cl` is NOT on PATH on
+windows-latest, and `call vcvars64.bat` is a cmd builtin a Rust child process cannot
+call, so `scripts/msvc-env.ps1` writes a wrapper batch whose LAST LINE is `cl %*` —
+with a bare `%*`, cmd.exe eats cl's own switches and all 128 spawns die with
+`cl exit 1` (measured). Measured legs: objdump-check 40 symbols / 40 exact boundary
+matches / 0 mismatches; discover 130 functions / 0 missing / 0 extra starts; lift
+130/130 valid IR, 101 with no gaps and no exits; the emitted C TU compiles with
+`clang -Werror`. Every stage is vacuity-guarded (0 objects, 0 code symbols, 0
+functions, a refusal naming nothing, a pass that breaks SSA ⇒ exit 1), and
+`an_empty_msvc_corpus_fails_the_gates_with_their_vacuity_text` runs the shared gates
+over an empty manifest and requires them to FAIL with their vacuity text.
+
+REFUSAL CENSUS BY MNEMONIC over MSVC objects — the roadmap's "lifter priority comes
+from frequency", measured on a new toolchain for the first time (130 functions: 99
+emitted, 31 refused, 0 invalid):
+
+```
+12  cdq                                        4  clobbered by call
+ 4  div                                         3  cwde
+ 3  flag setting with an unmodelled first operand
+ 3  inc/dec on an unmodelled destination
+ 2  lea of an address we cannot name
+```
+
+`cdq` is 39% of MSVC's refusals and 2.4% of clang's (clang spells the same `x/y`
+source with `cqto`, refused once): MSVC's `idiv` lowering, not a new rdec gap.
+KEY LESSON (measured): a census keyed at the first `:` CANNOT see a mnemonic —
+`opaque: unmodelled instruction: cdq (memory operand)` is one bucket for every
+unmodelled instruction, which is right for the clang gate's class list and useless
+for "which instruction next". The MSVC census cuts one level deeper (`census_key`),
+keeps the class shape for reasons that name no instruction, and counts a keyless
+refusal as a FAILURE — an empty bucket cannot hide a dropped refusal.
+
+MEASURED, NOT GATED (proposal, with the numbers): MSVC lowers `switch` into a table
+of `mov eax,k; jmp` thunks INSIDE `.text$mn`, reached through an indirect branch
+(56 bytes at 0x2c in `switch_dense`; the reachability gap reads `indirect branch`),
+and pads with 2-byte `66 90` fills the padding classifier does not name. Coverage
+over the leg is 6932/7048 = **98.35%** (116 uncovered bytes in 8 runs), under the M1
+99.5% floor. `msvc-gates` runs the same `discover` code, parses `missing`/`extra`
+(0/0 — both gated) and prints the coverage with this reason. The floor is comparable
+on this leg after (a) `padding_run` names `66 90`/`90` fills (arch-x86) and (b) M2's
+indirect-branch/jump-table work claims the thunk table.
+
+WHAT THIS DOES NOT PROVE: no linked MSVC image (`/c` only, no CRT), so there is no
+`t2` on this leg — the value-verified decompilation of cl code is UNPROVEN; no
+`/GS` cookie or `__chkstk` site exists in the corpus, so the cookie path is
+unmeasured; 32 snippets is 32 snippets, and a mnemonic absent from them is absent
+from the census; no gcc leg; the MSVC manifest is generated in CI and not committed,
+so cross-runner byte identity is NOT claimed (cl versions differ across images) —
+same-toolchain determinism is.
+
+NEXT: a stack-buffer snippet (cookie + `__chkstk` shapes, then the census speaks
+them); the gcc leg of section 3; the two discover fixes above; then `cdq`/`cwde`
+sign-extension modelling, which the census just ranked first on MSVC.
+
+
+### 11. M1 slice 6: the padding claim becomes a function, and it learns the fill MSVC pads with (2026-11-08)
+
+The MSVC leg's coverage gap was partly a bug in this repo's own classifier.
+`discover --corpus-dir corpus/msvc` read 98.35% where the clang corpus reads 100.00%
+on the same sources, and the lane recorded the reason as "MSVC lowers `switch` into
+thunks plus 2-byte `66 90` fills the padding classifier does not name". The thunk half
+is a real M2 hole. The `66 90` half was a gap in one predicate, in this file, named by
+a mnemonic prefix — and the honest share it owns is MEASURED below: 2 bytes of 116, not
+the gap. The claim "MSVC's coverage was a discovery bug" is what this slice set out to
+test, and it came back mostly false.
+
+WHAT `66 90` IS. The canonical 2-byte NOP: `xchg ax, ax` — exchanging AX with
+itself, architecturally a no-op, and the fill MSVC emits for 2-byte alignment
+inside `.text$mn`. Our decoder prints it as `xchg ax,ax` (measured: the sabotage
+run below printed the decoder's own text as its witness). The padding classifier
+asked the decoder — good design, and the reason `0f 1f 84 00 ...` and
+`66 2e 0f 1f 84 00 ...` were already named — but then asked it the wrong question:
+`text.starts_with("nop")`. LLVM aligns with `nopw`/`0f 1f` (prefix matches); MSVC
+pads with `xchg` (prefix does not match). One toolchain's alignment is code and the
+other's is padding, on a mnemonic prefix.
+
+THE CHANGE. The inline predicate is now `m1::is_padding_run` + `is_nop_text`: the
+architectural no-op family, spelled as the decoder spells it, space-insensitive
+(the Intel printer's spacing is not a semantic property of the byte). Same three
+doors as before — all-`0xCC` at any length, a decoder-verified all-no-op run, and a
+run of 4+ `0x00` (three zero bytes are `add [rax],al`, a real instruction stream,
+so they stay charged as uncovered) — plus the `xchg ax,ax` spelling, and an empty
+run is padding nothing.
+
+It is a function with tests, not an inline condition, because widening the padding
+claim is the cheapest way to make coverage go up on paper: every byte reclassified
+as padding leaves the denominator. So the narrow edges are pinned as assertions
+(`crates/cli/src/m1.rs`, `mod padding_run_tests`, at the bottom of the file for the
+panic-site ratchet):
+
+- `the_two_byte_fill_msvc_pads_with_is_padding` — `66 90 66 90` is padding, AND the
+  decoder's spelling is asserted (`xchgax,ax` after space-stripping), so the
+  predicate is anchored to a measured fact about the decoder, not to a hope.
+- `one_byte_and_multibyte_llvm_nops_are_padding` — `90 90 90`, the 8-byte
+  `0f 1f 84 00 …`, the 10-byte `66 2e 0f 1f 84 00 …`.
+- `int3_pads_at_any_length_and_zeroes_need_four_bytes` — one `0xCC` pads, sixteen
+  pad, `00 00 00` does NOT (the assertion prints the decoder's text as the witness),
+  four `00` do, an empty run does not.
+- `a_run_that_moves_data_or_jumps_indirectly_is_code` — the MSVC switch thunk's
+  load (`8b 04 25 00 20 40 00` = `mov eax, [0x402000]`), the indirect branch that
+  reaches it (`ff 25 00 00 00 00`), and a `push rbp; mov rbp, rsp` prologue all
+  stay UNCOVERED, where M1's 99.5% floor can see them.
+- `a_trap_inside_a_nop_run_is_not_padding` — `90 90 CC 90` is not padding: `0xCC`
+  is a trap, not a no-op, and one trap inside a nop run keeps the whole run
+  uncovered. The claim is one-directional.
+
+PROVEN CAPABLE OF FAILING. Sabotage: the nop family neutered
+(`false && t.starts_with("nop") || …"xchgzz"`) → `cargo test -p rdec-cli
+padding_run_tests` exit 101, 3 of 5 tests red, and the failure message printed
+`66 90 66 90 is two canonical NOPs; decoder text was ["xchg ax,ax", "xchg ax,ax"]`
+— the sabotage is what established the decoder's spelling as a measured fact.
+Restored: 5 passed, exit 0.
+
+MEASURED, clang side unchanged (this slice must not buy clang coverage, and did
+not): `rdec discover --corpus` exit 0 — 148 objects, 156 symbol-table functions, 0
+missing, 0 extra starts, code bytes 7066, padding 70, **coverage 6996/6996 =
+100.00%**, 0 uncovered non-padding bytes in 0 runs. `cargo clippy -p rdec-cli
+--all-targets -- -D warnings` 0. `bash scripts/unwrap_ratchet.sh` 0 — crates/cli 14
+panic sites, exactly baseline: the new code adds no panic site, and the test module
+is at the bottom of the file so the ratchet still sees everything above it.
+
+MEASURED RE-READ on the merged tree (this slice's binary, 2026-11-08, cl
+19.44.35228, 132 objects). Every number below is printed by the gate named above it.
+
+- `discover --corpus-dir corpus/msvc` — 132 objects, 134 symbol-table functions, 0
+  missing, 0 extra starts; code bytes 7098, padding 5, **coverage 6979/7093 = 98.39%**
+  (the lane measured 6932/7048 = 98.35%), uncovered 114 bytes in 7 runs (the lane: 116
+  bytes in 8 runs). So the padding rule owns **2 bytes of 116 and one gap run of eight**.
+  The 114 that remain are the `switch` thunks reached through an indirect branch, and the
+  M1 99.5% floor that refuses to adopt this leg's number is unchanged: the leg is
+  measured, not gated.
+- `objdump-check --corpus-dir corpus/msvc` — 132 symbols, **132 exact boundary
+  matches**, 0 extent-boundary refusals, 0 mismatches.
+- `lift --corpus-dir corpus/msvc` — 134 lifted, **134 pass `verify_ssa`**, 118 with no
+  gaps and no exits.
+- `c --corpus-dir corpus/msvc` — 134 lifted, 115 emitted, **19 refused**, 0 invalid,
+  clang `-Werror` OK. Census, from `msvc-gates`, one key per line: 4 `clobbered by call`
+  | 3 `cwde` | 3 `flag setting with an unmodelled first operand` | 3 `inc/dec on an
+  unmodelled destination` | 3 `tail call to 'ext'` | 2 `lea of an address we cannot
+  name` | 1 `call to 'ext'`. Against the lane's 31 refusals: **`cdq` 12 → 0 and `div` 4 →
+  0**. Both of the leg's biggest classes were fixed by the M4 accumulator slice, which
+  never targeted MSVC — `cdq` was 39% of the leg's refusals because MSVC signs the `idiv`
+  dividend through the accumulator, and that is exactly the pair M4 lifted. `cwde` 3 is
+  the surviving sibling: `cwd`/`cdq`/`cqo` are modelled, `cwde` is not, and it is the
+  named next item on this leg. The 3 `tail call to 'ext'` + 1 `call to 'ext'` are new
+  here because the M3 witnesses arrived after the lane branched: the tail-call witness
+  compiles under cl (it uses no attribute), so the second leg inherited M3's coverage
+  for free.
+- `msvc-gates --limit 40` — exit 0, "132 objects, 134 code symbols, census printed,
+  nothing vacuous".
+- **The leg fails an exercise floor, legitimately.** `c --corpus-dir` exits 1 on "the
+  corpus contains 0 noreturn calls, so nothing in the corpus exercises the noreturn CFG
+  rule" — because `noreturn_call.c` is one of the four cl-excluded snippets. This is a
+  gap in the leg, not a floor to bypass: MSVC spells that declaration
+  `__declspec(noreturn)`, clang on the windows-msvc target accepts the same spelling, so
+  the leg gets its own witness in the next slice. Exempting the second leg from a floor
+  is the laundering this repo's discipline exists to prevent.
+- Full local suite on the merged tree: `cargo test` **48 suites / 426 tests / 0
+  failed**; `fmt --all --check`, `clippy --all-targets -- -D warnings`, the panic-site
+  ratchet (crates/cli 14 = baseline), `selftest`, `objdump-check --corpus`,
+  `discover --corpus` (clang 6996/6996 = 100.00%), `lift --corpus`, `flags`,
+  `t2 --corpus`, `t2 --cpp`, `pe-discover` on the linked image all exit 0.
+
+One print-shape finding, recorded not fixed: `c`'s `refusal classes:` line clips at the
+end of the line, and this leg's 7th key (`call to 'ext'`) was cut in that output. The
+counts are printed (19 records in 19 functions, 7 keys) and `msvc-gates` prints one key
+per line, so nothing is lost from the census — but a report that truncates its own list
+is the shape a real drop would hide in, and the clip goes with the next `m4` census
+touch.
+
+WHAT THIS DOES NOT FIX, named so the next slice inherits it honest: the indirect
+branch is still unclaimed — an MSVC `switch` reaches its `mov eax, k; jmp` thunks
+through a memory-indirect jump, so those runs stay uncovered and stay in the gap
+census (that is M2's indirect-branch jump-table work, the same owner the clang
+corpus's 2 recovered tables came from). The padding rule change makes the *denominator*
+honest for a second toolchain; it does not claim a single new instruction. And a
+fill is named for the encodings our decoder prints: a toolchain that pads with a
+form printing anything other than `nop*`/`xchg ax,ax` will show up as uncovered
+bytes, which is the loud direction, not the quiet one.

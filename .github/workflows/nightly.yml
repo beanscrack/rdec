@@ -39,5 +39,20 @@ jobs:
         run: |
           cargo run -q -p rdec-cli -- corpus
           cargo run -q -p rdec-cli -- corpus --cpp
+      - name: "MSVC leg (heavy form: every symbol boundary, full refusal census)"
+        # The heavy twin of ci.yml's `msvc` job: `--full` puts every symbol of every
+        # MSVC object through llvm-objdump, so the census denominators are the whole
+        # leg and not a 40-symbol sample.
+        # `scripts/msvc-corpus.ps1` generates FIRST, on the left of everything that
+        # reads the objects: the .obj files are generated and gitignored, and a gate
+        # over a corpus nobody built has gone red twice with "os error 3" (runs
+        # 41415743892 / 42148930772). cl is not on PATH on windows-latest, so the
+        # script locates it with vswhere and prints the banner it records.
+        # Determinism is same-toolchain (cl twice into one directory, identical
+        # manifest) - never cl-vs-clang byte equality.
+        shell: powershell
+        run: |
+          .\scripts\msvc-corpus.ps1
+          .\scripts\msvc-gates.ps1 -Full
       - name: full test suite in release (debug_asserts compiled out)
         run: cargo test --release --workspace

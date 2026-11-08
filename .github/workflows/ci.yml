@@ -130,6 +130,66 @@ jobs:
       - name: status (prints section 9's table from the commands above)
         run: cargo run -q -p rdec-cli -- status
 
+  msvc:
+    # Roadmap section 3 promises the corpus matrix `{clang, gcc, MSVC}`; until this
+    # job the corpus path was clang-only. Same corpus/src/*.c, compiled by cl, gated
+    # by the SAME commands through `--corpus-dir corpus/msvc` - one code path per
+    # gate, a different denominator, not a second and weaker copy of each gate.
+    #
+    # Two facts make this its own job:
+    #   * `cl` is NOT on PATH on windows-latest. `scripts/msvc-env.ps1` locates the
+    #     toolset with vswhere and writes a vcvars64 wrapper batch, because `call
+    #     vcvars64.bat` is a cmd builtin that a Rust child process cannot call. The
+    #     step prints the cl banner: a leg built with an unrecorded compiler is a
+    #     leg nobody can reproduce.
+    #   * The gate is SAME-toolchain determinism - cl twice into ONE directory,
+    #     identical manifest - never cross-compiler byte equality. The runner's
+    #     clang 20.1.8 vs a local 22.1.8 already moved a gate from 1364 to 1412
+    #     comparisons; cl-vs-clang object bytes would measure the vendors, not rdec.
+    #
+    # The objects are generated and gitignored (`*.obj`) exactly like the clang
+    # corpus, so generation is on the LEFT of every step that reads them - the
+    # "system cannot find the path specified" red of runs 41415743892 / 42148930772.
+    #
+    # The fast form runs here (objdump-check capped at 40 symbols = 40 objdump
+    # spawns); `--full` is nightly. The clang job's ~21 minutes is unchanged: this
+    # is a parallel job, not a step in that one.
+    needs: gates
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      CARGO_TARGET_DIR: D:\rdec-msvc-target
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
+      - name: "build rdec-cli"
+        run: cargo build -p rdec-cli
+
+      - name: "MSVC corpus (cl, located by vswhere; twice into one dir, manifest must match)"
+        shell: powershell
+        run: .\scripts\msvc-corpus.ps1
+
+      - name: "msvc_corpus suite (the corpus-reading tests, run WHERE their inputs exist)"
+        # This suite is part of `cargo test`, which runs in the `gates` job - a job
+        # with clang and no cl, so it can never generate corpus/msvc. Its five
+        # real-corpus legs therefore SKIP LOUDLY there (each prints the command that
+        # removes the skip) and PASS HERE, where the step above generated the
+        # objects. Running them only in a job that cannot produce their inputs is a
+        # green that proves nothing; failing them RED in the clang job is the
+        # "system cannot find the path specified" red of runs 41415743892 /
+        # 42148930772. This step is their honest home: 7 tests, real objects, real
+        # gates, exit code = verdict.
+        run: cargo test -p rdec-cli --test msvc_corpus
+
+      - name: "msvc-gates (fast: objdump-check + discover + lift + refusal census by mnemonic)"
+        # The census is MEASUREMENT and prints; what this step exits non-zero on is
+        # an empty corpus, a non-AMD64 object, a broken objdump boundary, an
+        # unreachable symbol-table function, IR a pass broke, a refusal counted
+        # under no key, and emitted C that clang -Werror rejects.
+        shell: powershell
+        run: .\scripts\msvc-gates.ps1 -Limit 40
+
   release-parity:
     # Release mode is what a user runs, and `--release` compiles OUT every
     # `debug_assert!` - including the ones in the decoder that keep iced's
