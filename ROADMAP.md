@@ -1344,6 +1344,8 @@ the date and the tree are in the heading: a row is a measurement with an expiry.
 | M1 step 1 decode/load | `rdec objdump-check --corpus` | **GREEN** — 124/124 boundary agreement | closed |
 | M1 step 2 discovery | `rdec discover --corpus` | **GREEN — closed** (re-read 2026-11-08; this row said RED at 97.88% while section `:1562` had already recorded the closure, so the row was the stale one): 136 objects, 140 symbol-table functions, **0 missing, 0 extra starts**, coverage **6764/6764 non-padding code bytes = 100.00%**, uncovered 0 bytes in 0 runs, jump tables **2 recovered from relocations (12 slots, 12 targets, 0 unresolved)**, gaps none, exit 0. The 126 bytes in 2 runs that held M1 open were the 2 switch bodies reached only through a jump table, closed by target resolution (`f2fe789`). The 99.5% threshold was never moved to fit a measurement. | closed |
 | M2 step 1 lifter | `rdec lift --corpus` | **CLOSED — recorded late.** Criterion was "every lifted function is valid IR"; it printed `FAIL: 40 lifted functions are not valid IR` at step 1, and now prints `141 functions lifted, 141 pass verify_ssa`, exit 0. It became true at `aa0d8e7` (M3 step 1) and the roadmap never said so. | closed |
+| M2 instruction breadth, MSVC leg | `rdec msvc-gates --limit 40` | **MOVING — measured 2026-11-08.** The leg now emits **121 of 134** lifted (the row written earlier today: 118 emitted / 16 refused), census keys 6 → **5**: the class `inc/dec on an unmodelled destination` (3 sites, **all `incl (%rcx)`, all in MSVC objects** — clang lowers the same C as `addl $1, (%rcx)`, which was already modelled, so a clang-only census calls this arm dead code, and llvm-objdump prints it as `incl`: the same AT&T-name trap that nearly census'd `cwde` to zero) is gone. The arm loads the cell, adds/subtracts 1, stores the SAME address expression back, and sets `FlagsOp::Inc/Dec`; `addr_of` returns `Some` only for an operand it can express, so `inc dword [rip+0]` with no relocation stays REFUSED (fixture-pinned) instead of loading from an invented address. Silicon-pinned fixtures (`inc_mem_probe.c`): cell 9→10 via `[rcx+8]`, dec 9→8, 0x7FFFFFFF→0x80000000 with OF set. | the leg's coverage stays measured, not adopted as the M1 floor; next class `flag setting with an unmodelled first operand` (3 sites, `array_walk.O2 @ 0x2f`) |
+| CF across `inc`/`dec` (SS1.2 item 3) | fixture `acc_forms.rs`, `c --corpus` refusal census | **NAMED GAP, BOUNDED BY A REFUSAL — found by this slice's fixture, and the boundary is the result.** x86 PRESERVES CF across `inc`/`dec`; measured on this host: `stc` then `inc [rcx+8]` then `setc` answers **12** (cell 10 + CF 1), the `clc` variant **6**, `dec` **10**, and OF on `0x7FFFFFFF + 1` gives **0x80000002**. This model leaves CF **undefined** there: the raw IR faults `UndefFlag(CF)`, the post-pass interpreter answers 0, and the emitter **refuses the whole function** naming the gap (`opaque: CF after inc/dec needs the previous flags as an operand (SS1.2 item 3)`, measured at 0x19) — so no emitted C carries a silent 0, and T2 can never compare a wrong CF against C, because a function that reads CF after `inc`/`dec` never emits. Sabotage proves the bound: spelling `inc`'s flags as `FlagsOp::Add` (the `add $1` temptation, which DEFINES CF=0) makes the function emit, and the fixture's leak assertion fires. Pre-existing (the register form has the same path); this slice inherits it and pins it, and cannot close it | thread the previous flags in as an operand (SS1.2 item 3); then the fixture's F1 answers silicon's 12 |
 | M3 step 1 SSA | `rdec lift --corpus` | **GREEN** — 141/141 valid IR; strict interpreter: 0 uses of a value never defined | closed |
 | M3 step 2 block splitting | `rdec lift --corpus` | **GREEN** — loops lift; Exits 64 -> 27, clean functions 63 -> 85 | closed |
 | M3 noreturn / tail calls / jump-table targets | census + three floors inside `rdec c --corpus` | **LANDED, corpus witnesses present** (2026-11-08; the row before this one said "NOT DONE — zero handling" on the evidence of a `grep -ric` that returned 0, where the live count in `lift.rs` is 53). Jump-table resolution closed M1. Census now: **`tail calls: 3 modelled | 3 with no callable callee | noreturn calls: 4`** (`0xf -> abort`, `0x12 -> abort` x3) from the `tailcall_local` / `tailcall_external` / `noreturn_call` snippets. `cmd_c` FAILS on `tail + tail_unnamed == 0`, on `noreturn == 0`, and on any census site whose name `noreturn_symbol` does not declare — floor 3 exists because a sabotage that declared EVERY import noreturn moved one corpus function into `__builtin_unreachable()` and passed every other gate. The fixture found the real hole: the noreturn arm needed a signature entry, imports have none (`U abort`: no section, no size, no address), and in a linked binary every name in the termination family IS an import — the declaration is now made from the relocation's name, for imports only, `typed: false`, defines nothing. The emitted C is `o100_abort(x0,x1,x2,x3); __builtin_unreachable();` under an `__attribute__((noreturn))` declaration. | C++ corpus sites (that corpus imports no family name — measured with `llvm-nm`), and the `jmp`-to-import refusal class growing past 3 |
@@ -2899,3 +2901,100 @@ constant", of which the count is unmeasured. T2 staying at 2452/2452 proves only
 *differentially-compared* function changed value — the class the fix targets is precisely
 the one T2 does not reach. `cwde`'s 3 MSVC sites are refusals→lifted, not
 value-verified: there is still no linked MSVC image, so no T2 leg over `cl` code exists.
+
+## 13. `inc`/`dec` on a memory destination, the flag the model refuses to guess, and a floor script that was lying (2026-11-08)
+
+**Census first, with AT&T names.** The MSVC leg's census carried
+`inc/dec on an unmodelled destination` at 3 sites. Counting them with Intel names
+(`grep -E '\b(inc|dec)\b'`) returns nothing useful, so the count was taken the way
+`cwde` was: over `corpus/msvc/obj/*.obj` with `llvm-objdump -d`, filtering the AT&T
+spellings. Result: **3 sites, all `incl (%rcx)`, all in MSVC objects**. clang lowers
+the same C as `addl $1, (%rcx)`, which the lifter already modelled — so on a
+clang-only corpus this arm is dead code, and a lane that census'd only `corpus/obj`
+would have "proven" the refusal class empty. The `cwde` lesson, applied two days
+later on the first try.
+
+**The arm.** Load the cell, add/subtract 1, store back through the SAME address
+expression, `set_flags(FlagsOp::Inc/Dec)`. The safety property is in `addr_of`: it
+returns `Some` only for a memory operand it can express — `None` for `RIP` with no
+relocation, `None` for no base — so a register destination can never be re-read
+through memory, and `inc dword [rip+0]` in a harness with no relocation table stays
+**refused** (fixture-pinned) instead of loading from an invented address. A silently
+wrong address invents memory the program never had; a refusal does not.
+
+**Silicon first (`inc_mem_probe.c`, VirtualAlloc RWX).** Each body returns
+`(flag << 1) | cell`, so one run answers arithmetic and flags together:
+
+```text
+F1  cmp->CF=1 ; inc dword [rcx+8]  (cell 9 -> 10)   -> 12   (CF PRESERVED as 1)
+F2  cmp->CF=1 ; dec dword [rcx+8]  (cell 9 ->  8)   -> 10   (CF PRESERVED as 1)
+F3              inc dword [rcx]    (0x7FFFFFFF)     -> 0x80000002   (OF set, cell wraps)
+F4  cmp->CF=0 ; inc dword [rcx]    (cell 5 ->  6)   ->  6   (CF PRESERVED as 0)
+```
+
+F1/F4 are a pair because one row cannot separate "CF preserved" from "CF forced":
+F1 rules out forced-0, F4 rules out forced-1. F1/F2 carry `[rcx+8]`, so the address
+expression under test is base+disp, not base+0. The probe had its own bug, worth the
+sentence: the first version put the cells at the entry `[rsp]`, which is the **return
+address**, and `ret` jumped to 5 — a segfault that reads like a bad encoding. Every
+body now opens `sub rsp,0x20` and closes `add rsp,0x20`.
+
+**The fixture found two things the plan did not contain.**
+
+1. **`stc` and `clc` are refused by this lifter** (measured: the fixture's first
+   version named `unmodelled instruction: stc` in its own refusal). CF has to be set
+   by a comparison — `cmp ecx,edx` with `(0,1)` gives CF=1, with `(1,0)` gives 0 —
+   which is the same trick the `cdq` fixture uses, and is what real code does before
+   an `inc`-then-`adc` sequence anyway.
+2. **The model does not preserve CF across `inc`/`dec`; it leaves CF undefined**, and
+   that turns out to be the right shape of answer. Raw IR: reading CF faults
+   `UndefFlag(CF)`. After the standard passes, the interpreter answers **0** — which
+   is where a lesser fixture would have written `assert_eq!(v, 10)` and called the
+   model done. The real question is what reaches generated code, and the emitter
+   answers it:
+
+   ```text
+   Refusal { at: 19, reason: "opaque: CF after inc/dec needs the previous flags as an
+          operand (SS1.2 item 3)" }
+   ```
+
+   The function is REFUSED, by name. So the interpreter's 0 never reaches C, and T2
+   can never compare a wrong CF against compiled C, because a program that reads CF
+   after `inc`/`dec` never emits at all. This is SS1.2 item 3 (thread the previous
+   flags in as an operand), pre-existing — the register form has the same path — and
+   this slice inherits it and pins it rather than closing it. The fixture asserts the
+   leak direction: a CF-reading case MUST be refused, an OF-reading case must emit.
+
+**Sabotage, both directions.** Spell `inc`'s flags as `FlagsOp::Add` — the `add $1`
+temptation, which *defines* CF, as 0 — and the function emits, firing the leak
+assertion ("a function that reads CF after inc/dec EMITTED C"). Store the
+un-incremented `lhs` instead of `r` and the arithmetic assertion reddens. Both
+restored; `acc_forms` 13/13.
+
+**Leg movement, measured.** `msvc-gates --limit 40`: **121 of 134 emitted** (was 118),
+**13 refused** (was 16), census keys **6 → 5**, and the `inc/dec` class is gone. The
+3-function delta is exactly the 3 witnesses — the census denominator accounts for it,
+it is not a vibe. Next class on the leg: `flag setting with an unmodelled first
+operand` (3 sites, `array_walk.O2 @ 0x2f`) — memory-operand `test`/`cmp`, same shape
+of work.
+
+**The floor script was lying, and the sabotage run caught it.** The first
+`floor_m6.sh` run printed `FLOOR_EXIT=0` while its clippy gate exited **101** (five
+`needless_borrow` in the new fixture: `&cells[0]` is `&&[u8]`). The script's exit was
+the LAST gate's exit, not an aggregate over the gates — so the headline number and
+the pass condition could disagree, the exact defect class this repo has a rule
+against, present in my own harness and invisible until a red gate happened to be
+mid-list. `run` now takes `--expect N`, every gate declares the exit code it must
+produce (`types --corpus` declares 1, by design, the 4 named `carry_chain` lies),
+mismatches accumulate, and the script's exit is the aggregate. The floor in the
+commit message below is that corrected script's verdict.
+
+**NOT PROVEN, stated plainly.** (1) T2 has no leg over MSVC objects, so this arm's
+arithmetic is silicon-fixture-pinned, not machine-differential; the observable on the
+corpus is the census/refusal movement, not a value comparison. (2) The arm is written
+generically over operand width, so `inc byte [rcx]` (`FE /0`) would lift, with **zero
+corpus sites** — same no-witness rule that keeps `cbw`/`cdqe` refused, and no
+fixture is claimed for it. (3) The 3 sites live in functions that emit, so their
+values reach the emitted C; they are covered by leg-level emission, not by a
+per-site differential. (4) `stc`/`clc` remain unmodelled: if a corpus ever grows a
+site, the census will name it.

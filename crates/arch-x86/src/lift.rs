@@ -3161,7 +3161,57 @@ impl<'a> Lifter<'a> {
                 let (d, dw) = match self.reg_op(ins, 0) {
                     Some(x) => x,
                     None => {
-                        self.gap("inc/dec on an unmodelled destination", ty_u(w));
+                        // `inc`/`dec` on a MEMORY destination: read the cell,
+                        // add/subtract one, write the SAME address back, and set
+                        // the same flags as the register form. Measured
+                        // witnesses: 3 sites, every one `incl (%rcx)`, every one
+                        // in an MSVC object — clang lowers the same C as
+                        // `addl $1, (%rcx)`, which is modelled, so a
+                        // clang-only census calls this arm dead code (and
+                        // objdump prints it as `incl`, not `inc`).
+                        //
+                        // The flags are the load-bearing claim, not the
+                        // arithmetic: `inc`/`dec` PRESERVE CF (the ices-eye view
+                        // and the SDM agree, and the fixture pins it with
+                        // `stc ; incl (%rcx) ; setc al`, which the machine
+                        // answers 1), so FlagsOp::Inc/Dec — which write
+                        // SF/ZF/OF/AF/PF and leave CF alone — is the same
+                        // operator as the register form uses. A `add $1`
+                        // modelling of the same bytes would clobber CF and
+                        // change a later `setc`/`adc` answer.
+                        //
+                        // `addr_of` returns Some ONLY for a memory operand it
+                        // can express (None for RIP without a relocation, None
+                        // for no base), so a register destination can never
+                        // reach this arm and be read through memory.
+                        match self.addr_of(ins, 0) {
+                            Some(a) => {
+                                let t = ty_u(w);
+                                let lhs =
+                                    self.f
+                                        .emit(self.cur, Op::Load(t.clone(), a), t, self.addr());
+                                let one = self.const_of(1, w);
+                                let r = self.bin(
+                                    if m == Mnemonic::Inc {
+                                        BinOp::Add
+                                    } else {
+                                        BinOp::Sub
+                                    },
+                                    lhs,
+                                    one,
+                                );
+                                self.f
+                                    .emit_void(self.cur, Op::Store(ty_u(w), a, r), self.addr());
+                                self.set_flags(if m == Mnemonic::Inc {
+                                    FlagsOp::Inc { a: lhs }
+                                } else {
+                                    FlagsOp::Dec { a: lhs }
+                                });
+                            }
+                            None => {
+                                self.gap("inc/dec on an unmodelled destination", ty_u(w));
+                            }
+                        }
                         return;
                     }
                 };

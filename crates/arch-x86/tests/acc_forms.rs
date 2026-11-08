@@ -564,3 +564,211 @@ fn cbw_and_cdqe_stay_refused_until_a_corpus_site_exists() {
         );
     }
 }
+
+/// `inc`/`dec` with a MEMORY destination, and the flag they do NOT touch.
+///
+/// Corpus witnesses: 3 sites, every one `incl (%rcx)`, every one in an MSVC
+/// object (clang lowers the same C as `addl $1, (%rcx)`, which the lifter
+/// already modelled, so the census on a clang-only corpus reports this arm as
+/// dead code — and llvm-objdump prints it as `incl`, the same AT&T-name trap
+/// that nearly census'd `cwde` to zero).
+///
+/// The arithmetic is the easy half; the fixture's teeth are in F1/F4 as a PAIR.
+/// `inc`/`dec` PRESERVE CF, so modelling the bytes as `add $1` — which clobbers
+/// CF — is a different machine, and any later `setc`/`adc` reads it. F1 enters
+/// with CF=1 (`stc`) and F4 with CF=0 (`clc`); each returns `(CF << 1) | cell`:
+///
+/// ```text
+/// F1  stc ; inc dword [rcx+8]  (cell 9 -> 10, CF)  -> 12          (CF stayed 1)
+/// F2  stc ; dec dword [rcx+8]  (cell 9 ->  8, CF)  -> 10          (CF stayed 1)
+/// F3  inc dword [rcx]          (0x7FFFFFFF -> 0x80000000, OF)     -> 0x80000002
+/// F4  clc ; inc dword [rcx]    (cell 5 ->  6, CF)  ->  6          (CF stayed 0)
+/// ```
+///
+/// measured on this host (`inc_mem_probe.c`, VirtualAlloc PAGE_EXECUTE_READWRITE,
+/// cells in a frame the body takes with `sub rsp,0x20`). One row alone cannot
+/// separate "CF preserved" from "CF forced": F1 rules out forced-0, F4 rules out
+/// forced-1.
+///
+/// THOSE ARE SILICON ANSWERS, and the model does not reproduce F1/F2 — see the
+/// flag block in the loop: CF after `inc`/`dec` is left UNDEFINED by this model
+/// (SS1.2 item 3), the IR faults on reading it, and the emitter refuses the whole
+/// function. The numbers asserted per case are the post-pass interpreter values,
+/// with the silicon number in each case's own label.
+///
+/// F3 is the signed-overflow half: 0x7FFFFFFF + 1 lands on INT_MIN, `seto`
+/// answers 1, and the cell wraps to 0x80000000 — a saturating or
+/// sign-preserving model gets 0x7FFFFFFF or 0x80000000+0 there.
+///
+/// F1/F2 also carry a displacement (`[rcx+8]`), so the address expression under
+/// test is base+disp, not just base+0.
+#[test]
+fn inc_dec_on_memory_write_the_cell_back_and_preserve_cf() {
+    const FRAME: &[u8] = &[0x48, 0x83, 0xEC, 0x20]; // sub rsp,0x20 - the cells must NOT
+                                                    // sit at entry [rsp], which is the
+                                                    // return address: a first version of
+                                                    // the probe wrote [rsp] and `ret`
+                                                    // jumped to 5.
+    const UNFRAME: &[u8] = &[0x48, 0x83, 0xC4, 0x20]; // add rsp,0x20
+    fn body(mid: &[&[u8]]) -> Vec<u8> {
+        let mut v = FRAME.to_vec();
+        for m in mid {
+            v.extend_from_slice(m);
+        }
+        v.extend_from_slice(UNFRAME);
+        v.push(0xC3);
+        v
+    }
+    let cells = [
+        &[0x48u8, 0xC7, 0x04, 0x24, 0x05, 0x00, 0x00, 0x00][..], // mov qword [rsp], 5
+        &[0x48u8, 0xC7, 0x44, 0x24, 0x08, 0x09, 0x00, 0x00, 0x00][..], // mov qword [rsp+8], 9
+    ];
+    let read_cf = &[0x0Fu8, 0x92, 0xC0, 0x0F, 0xB6, 0xC0, 0x01, 0xC0][..]; // setc al; movzx eax,al; add eax,eax
+    let read_of = &[0x0Fu8, 0x90, 0xC0, 0x0F, 0xB6, 0xC0, 0x01, 0xC0][..]; // seto al;  movzx eax,al; add eax,eax
+
+    // CF is set by a COMPARISON, not by `stc`/`clc`: this lifter refuses
+    // `stc` (measured - the fixture's first version named it in its own refusal),
+    // and a comparison is what real code uses to set CF before an `inc`-then-`adc`
+    // sequence anyway. `cmp ecx,edx` answers CF=1 when ecx < edx unsigned, so
+    // (0,1) enters the inc with CF=1 and (1,0) enters it with CF=0. The
+    // comparison is also what gives the flag node a predecessor: `inc`/`dec`
+    // PRESERVE CF, which the model represents by threading the previous flags in
+    // as an operand, and on a block with no flag producer there is no previous
+    // CF to preserve - the arm refuses, correctly, and says so.
+    let setcf = &[0x39u8, 0xD1][..]; // cmp ecx,edx
+    let cases: Vec<(Vec<u8>, u64, [u64; 4], &str)> = vec![
+        (
+            body(&[
+                cells[0],
+                cells[1],
+                &[0x48, 0x89, 0xE1][..], // mov rcx,rsp
+                setcf,
+                &[0xFF, 0x41, 0x08], // inc dword [rcx+8]
+                read_cf,
+                &[0x03, 0x41, 0x08], // add eax, [rcx+8]
+            ]),
+            10,
+            [0, 1, 0, 0],
+            "F1: cell 9->10; silicon answers 12 because CF is PRESERVED, the model leaves \
+             it undefined and reads of it refuse",
+        ),
+        (
+            body(&[
+                cells[0],
+                cells[1],
+                &[0x48, 0x89, 0xE1][..],
+                setcf,
+                &[0xFF, 0x49, 0x08], // dec dword [rcx+8]
+                read_cf,
+                &[0x03, 0x41, 0x08], // add eax, [rcx+8]
+            ]),
+            8,
+            [0, 1, 0, 0],
+            "F2: cell 9->8; silicon answers 10 (CF preserved as 1), same undefined-CF story",
+        ),
+        (
+            body(&[
+                &[0xC7, 0x04, 0x24, 0xFF, 0xFF, 0xFF, 0x7F][..], // mov dword [rsp], 0x7FFFFFFF
+                &[0x48, 0x89, 0xE1][..],                         // mov rcx,rsp
+                setcf,
+                &[0xFF, 0x01], // inc dword [rcx]
+                read_of,
+                &[0x03, 0x01], // add eax, [rcx]
+            ]),
+            0x8000_0002,
+            [0, 1, 0, 0],
+            "F3: 0x7FFFFFFF wraps to 0x80000000 and OF is set",
+        ),
+        (
+            body(&[
+                cells[0],
+                &[0x48, 0x89, 0xE1][..],
+                setcf,
+                &[0xFF, 0x01], // inc dword [rcx]
+                read_cf,
+                &[0x03, 0x01], // add eax, [rcx]
+            ]),
+            6,
+            [1, 0, 0, 0],
+            "F4: cell 5->6 with CF preserved as 0",
+        ),
+    ];
+
+    for (bytes, want, ins, why) in cases {
+        let (f, rep) = lift(&bytes);
+        verify_ssa(&f).expect("valid SSA");
+        assert_eq!(
+            rep.gaps,
+            0,
+            "{why}: memory inc/dec is modelled; opaque texts: {:?}",
+            opaque_texts(&f)
+        );
+        match answer(&f, &ins) {
+            Outcome::Ret(v) => assert_eq!(
+                v.bits(),
+                want,
+                "{why}: silicon value from inc_mem_probe.c; the expected value also pins \
+                 that the LAST write is a 32-bit op, so bits 63:32 are zeroed"
+            ),
+            Outcome::Fault(fl) => {
+                panic!(
+                    "{why}: faulted as {fl:?} — opaque texts: {:?}",
+                    opaque_texts(&f)
+                )
+            }
+            other => panic!("{why}: unexpected {other:?}"),
+        }
+
+        // The flag half of the contract, and the reason the numbers above are
+        // not the silicon numbers: a function that READS CF after an inc/dec is
+        // REFUSED by the emitter, naming the gap. Silicon preserves CF, the
+        // model leaves it undefined, and `fuse`'s own rule is that an undefined
+        // bit keeps its getflag so the emitter refuses. Measured on this shape:
+        //     Refusal { at: 19, reason: "opaque: CF after inc/dec needs the
+        //                previous flags as an operand (SS1.2 item 3)" }
+        // The interpreter's 0 for CF (the pipeline values above) is therefore
+        // unreachable in any emitted function - a program that reads CF after
+        // inc/dec never emits, so T2 can never compare a wrong CF against C.
+        // Closing SS1.2 item 3 (thread the previous flags in as an operand) is
+        // what would let F1 answer silicon's 12.
+        let reads_cf = why.contains("CF");
+        match emit_c(&f) {
+            Err(rs) => {
+                let named = rs.iter().any(|r| r.reason.contains("SS1.2 item 3"));
+                assert!(
+                    reads_cf && named,
+                    "{why}: expected the SS1.2 item 3 refusal (silicon preserves CF); got {rs:?}"
+                );
+            }
+            Ok(_) => assert!(
+                !reads_cf,
+                "{why}: a function that reads CF after inc/dec EMITTED C — the gap leaked \
+                 into generated code, where a silent 0 would outlive any test"
+            ),
+        }
+    }
+}
+
+/// The arm must keep REFUSING what it cannot address. `FF 05 00 00 00 00` is
+/// `inc dword [rip+0]`, and this harness carries no relocation table, so the
+/// RIP-relative cell has no name — the gap path is the right answer, and the
+/// test's point is that the new memory arm does not swallow it into a load from
+/// a made-up address. A silently-wrong address is worse than a refusal: it
+/// invents memory the program never had.
+#[test]
+fn inc_on_an_unnameable_rip_relative_cell_stays_refused() {
+    let bytes: &[u8] = &[0xFF, 0x05, 0x00, 0x00, 0x00, 0x00, 0xC3]; // inc dword [rip+0] ; ret
+    let (f, rep) = lift(bytes);
+    assert!(
+        rep.gaps > 0,
+        "a RIP-relative inc with no relocation must stay refused; opaque texts: {:?}",
+        opaque_texts(&f)
+    );
+    assert!(
+        opaque_texts(&f)
+            .iter()
+            .any(|t| t.contains("inc/dec on an unmodelled destination")),
+        "the refusal must NAME itself, not a generic gap: {:?}",
+        opaque_texts(&f)
+    );
+}
