@@ -1,23 +1,32 @@
 # `rdec types --corpus --baseline` — the KNOWN over-truth claims of M6 type
 # recovery, counted per `subject|kind` family. The families and the counts are
-# produced by the scorer in `crates/cli/src/m6.rs` against `corpus/truth.tsv`
-# (measured 2026-11-08 in lane m6e at the merge of master d295999).
+# produced by the scorer in `crates/cli/src/m6.rs` against `corpus/truth.tsv`.
 #
-# Same rule as `.gate/unwrap-baseline`: a RISE is a red build (the pass invented a
-# claim it cannot witness), a FALL is red too (lower the number in this same
-# commit, so the census on disk cannot drift from the census in the code), and a
-# lie family with no row here is red by definition. `crates/cli/src/m6.rs`'s
-# `baseline_ratchet_tests` pins all four directions.
+# The marker below is load-bearing: the loader (`load_types_baseline`) refuses a file
+# with no `# known-lies: N` line, refuses a marker that disagrees with the sum of its
+# rows, and refuses a rows-less file whose marker is not 0. In this state every lie
+# the scorer prints is a RISE against zero, and the raw `types --corpus` gate (CI
+# asserts exit 0) is the checker.
+# known-lies: 0
 #
-# The 4 rows below are ONE family: the `carry_chain` void-return lies (O0, O1, O2,
-# Oz — one per opt level; the file stem is the truth key, the function is `f`).
-# `corpus/src/carry_chain.c` declares
-# `void f(unsigned long a, unsigned long b, unsigned long *lo, unsigned long *hi)`;
-# in all four opt levels the tail reloads a spilled slot into RAX and the LIFTER
-# records `Return(value)` for a function that returns nothing. The type
-# pass then faithfully reports a claim over the RAX cell — the lie is in the IR
-# shape, and its owner is the lifter's void-return model, not type recovery. The
-# fix that closes this family is a lifter change (record a void return when the
-# tail value is a spilled slot with no reader, and have `verify` bound it); the fix
-# that is NOT allowed is a scorer that stops looking at declared-void sites.
-carry_chain|void-return 4
+# History, so nobody re-opens this from memory: until 2026-11-08 this file carried
+# `carry_chain|void-return 4` — one per opt level (O0, O1, O2, Oz) of a function whose
+# source declares `void f(unsigned long a, unsigned long b, unsigned long *lo,
+# unsigned long *hi)` while the tail leaves a value in RAX and the lifter records
+# `Return(value)`. The family closed with the CONSUMED-RETURN rule in
+# `crates/core/src/tyinfer.rs` (`Fact::StoreAddr` + `Fact::StoredValue`, probes
+# `probe_return_consumed_withdraws` / `probe_return_unconsumed_keeps_claim`): a
+# returned value the body consumes — stored through as an address (-O0's leg, measured
+# `store-address@0x48` on the returned cell) or stored as a value (-O1/-O2's leg,
+# `Store(Int W32, p3, Trunc(W32, v24))`) — has its only positive role evidence inside
+# the body, so the return claim is withdrawn (silent), which the UNCHANGED scorer
+# accepts.
+#
+# What is still a LIE to do here: a scorer that stops looking at declared-void sites
+# (the rule the previous header named, still binding), and a baseline row that
+# reappears without the pass change that forces it. The known deeper gap is NOT this
+# file's business: the LIFTER still records `Return(value)` for these functions, so the
+# emitted C of a `void` source function prints a `return` with a value. It is invisible
+# to T2 (all four legs are outside the compared set: `not run [memory outside the
+# modelled frame]`), and its owner is M4's void-return model, not type recovery. Closing
+# it is a lifter change plus a `verify` bound — see the ROADMAP M6 row.

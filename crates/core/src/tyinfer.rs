@@ -74,7 +74,7 @@
 /// Register gate: total 280-bytes in the probe batteries below; the count
 /// of register-rule fact claims is pinned against it. A probe that decouples
 /// (registers merged/disabled) makes the selftest print 0/22 and FAIL.
-pub const PROBE_RULES_TOTAL: usize = 22;
+pub const PROBE_RULES_TOTAL: usize = 25;
 /// Recovery sites and fact claims, a probe's kind; a meaningful recovery drill down-
 /// pins every positive claim on every probe inbound, on the open site fixed.
 pub const ABI_RECOVERY_SITES: usize = 172;
@@ -99,6 +99,21 @@ pub enum Fact {
     ReadAt(Width),
     /// Root of a memory address.
     Address,
+    /// Read as the DESTINATION address of a store. `Address` says the cell is
+    /// used as a pointer; this says the body stored THROUGH it, which is the
+    /// role the measured void-return twin turns on: in the void tail, RAX's
+    /// last write is read as a store address and nothing writes RAX after it;
+    /// in the returning twin the appended `movq 0x18(%rsp), %rax` is never
+    /// read (it IS the answer). The rule fires on one leg only.
+    StoreAddr,
+    /// The value is the SOURCE operand of a store: the body put it in memory.
+    /// Measured on `carry_chain` -O1/-O2: the tail leaves the computed sum in
+    /// RAX as a side effect of the computation and stores a truncated copy
+    /// through an out-parameter (`Store(Int W32, p3, Trunc(W32, v24))`), so the
+    /// cell's only role in the object is "consumed by the body". With no
+    /// prototype in a COFF object, answering `int32_t` there prints a return
+    /// type the machine never showed.
+    StoredValue,
     /// Used in the float domain at this precision.
     Float(FWidth),
 }
@@ -110,6 +125,8 @@ impl Fact {
             Fact::Unsigned => "unsigned",
             Fact::ReadAt(_) => "read-width",
             Fact::Address => "address",
+            Fact::StoreAddr => "store-address",
+            Fact::StoredValue => "stored-value",
             Fact::Float(_) => "float",
         }
     }
@@ -157,6 +174,14 @@ pub struct Claim {
     /// The value's stack slot is touched as both float and int: a union, not a
     /// signature, so the float claim is withdrawn.
     pub slot_conflict: bool,
+    /// A RETURN claim withdrawn because the body CONSUMED the returned value:
+    /// it is read as a store destination (`Fact::StoreAddr`, measured on
+    /// `carry_chain` -O0) or stored as a value (`Fact::StoredValue`, measured on
+    /// the -O1/-O2 legs, where RAX's tail is the computed sum that the body also
+    /// stores through an out-parameter). In both, the cell's proven role is
+    /// inside the body and a COFF object carries no prototype to say it is an
+    /// answer, so the honest output is silence, not a printed return type.
+    pub ret_consumed_silent: bool,
 }
 
 impl Claim {
@@ -459,7 +484,7 @@ impl<'a> Hole<'a> {
                         self.add(y, fact, a, d.as_str());
                     }
                     Op::Load(ty, at) => {
-                        self.address_fact(*at, a, d.as_str());
+                        self.address_fact(*at, a, d.as_str(), Fact::Address);
                         // The value read is an inhabitant of the slot it was
                         // read from: the union rule must see it.
                         let lk = self.slot_key(*at);
@@ -475,9 +500,15 @@ impl<'a> Hole<'a> {
                         }
                     }
                     Op::Store(ty, at, val) => {
-                        self.address_fact(*at, a, d.as_str());
+                        self.address_fact(*at, a, d.as_str(), Fact::Address);
+                        // The destination role is its own fact: a cell the body
+                        // stores THROUGH is a working pointer, and if that same
+                        // cell is what the function returns, the object shows no
+                        // fact that it is an ANSWER (see Fact::StoreAddr).
+                        self.address_fact(*at, a, d.as_str(), Fact::StoreAddr);
                         let lk = self.slot_key(*at);
                         self.value_slot.extend(lk.map(|k| (*val, k)));
+                        self.add(*val, Fact::StoredValue, a, d.as_str());
                         if let Some(w) = float_width_of(ty) {
                             self.add(*val, Fact::Float(w), a, d.as_str());
                             self.touch_slot(*at, Some(w), a);
@@ -560,7 +591,7 @@ impl<'a> Hole<'a> {
     }
 
     /// The `Address` fact, walked to the root of the address expression.
-    fn address_fact(&mut self, at: VId, addr: u64, def: &str) {
+    fn address_fact(&mut self, at: VId, addr: u64, def: &str, fact: Fact) {
         /// What the analysis decides about one node, computed before any
         /// mutation: `op_of` borrows `self`, `add` mutates it.
         enum Move {
@@ -594,10 +625,10 @@ impl<'a> Hole<'a> {
                 _ => Move::Mark,
             };
             match mv {
-                Move::Mark => self.add(v, Fact::Address, addr, def),
+                Move::Mark => self.add(v, fact, addr, def),
                 Move::Follow(x) => stack.push(x),
                 Move::MarkFollow(x) => {
-                    self.add(v, Fact::Address, addr, def);
+                    self.add(v, fact, addr, def);
                     stack.push(x);
                 }
             }
@@ -611,13 +642,13 @@ impl<'a> Hole<'a> {
         let mut sig = Signature::default();
         for i in 0..self.f.params.len() {
             let p = self.f.params[i];
-            sig.params.push(self.claim_of(p));
+            sig.params.push(self.claim_of(p, false));
         }
         let mut rets: Vec<Claim> = Vec::new();
         for b in &self.f.blocks {
             if let Terminator::Return(v) = &b.term {
                 if *v != NO_VAL {
-                    rets.push(self.claim_of(*v));
+                    rets.push(self.claim_of(*v, true));
                 }
             }
         }
@@ -647,7 +678,7 @@ impl<'a> Hole<'a> {
 
     /// Facts about `seed` - its own, and those reached along the transparent
     /// chain - folded into a claim.
-    fn claim_of(&self, seed: VId) -> Claim {
+    fn claim_of(&self, seed: VId, for_return: bool) -> Claim {
         let mut own: Vec<Fact> = Vec::new();
         let mut chain: Vec<Fact> = Vec::new();
         let mut seen: HashSet<VId> = HashSet::new();
@@ -709,7 +740,7 @@ impl<'a> Hole<'a> {
                 }
             }
         }
-        let mut claim = claim_from(&own, &chain);
+        let mut claim = claim_from(&own, &chain, for_return);
         // The float-typed-ness of the value itself is authoritative: `Ty::Float`
         // in the IR comes from an instruction that can only exist on floats.
         if claim.flt.is_none() {
@@ -790,7 +821,7 @@ fn float_width_of(t: &crate::ty::Ty) -> Option<FWidth> {
 /// facts earn an `Address` claim (the pointer fact is about the value that IS
 /// the address); signedness and width travel the chain, because a `sext` of a
 /// truncated parameter is a statement about the parameter.
-fn claim_from(own: &[Fact], chain: &[Fact]) -> Claim {
+fn claim_from(own: &[Fact], chain: &[Fact], for_return: bool) -> Claim {
     let all: Vec<Fact> = own.iter().chain(chain.iter()).copied().collect();
     let signed = all.contains(&Fact::Signed);
     let unsigned = all.contains(&Fact::Unsigned);
@@ -829,6 +860,29 @@ fn claim_from(own: &[Fact], chain: &[Fact]) -> Claim {
     if c.ptr || c.flt.is_some() {
         c.sx = None;
         c.width = None;
+    }
+    // THE CONSUMED-RETURN RULE, last so it silences every field above.
+    // Measured on all four `carry_chain` legs (source declares `void f(...)`):
+    // -O0 returns the cell the loop stores THROUGH (`store-address@0x48` on the
+    // returned value); -O1/-O2 return the computed cell whose TRUNC COPY the body
+    // stores through an out-parameter (`Store(Int W32, p3, Trunc(W32, v24))` —
+    // the `stored-value` fact lands on the copy, which is why the chain counts:
+    // the chain walk follows USES, so a materialisation of the returned value
+    // being stored is the body consuming it). A COFF object carries no prototype
+    // to say the cell is an answer, so printing its type as a return type is the
+    // over-truth claim the scorer calls `return claim over declared void`.
+    // Scope of the loss, plainly: a C function that both stores a value and
+    // returns it loses the RETURN claim (the cell keeps every fact it earned as a
+    // parameter/site, and the site census is unchanged); a returned value the body
+    // never consumes keeps its claim, pinned by the battery's pair legs.
+    if for_return
+        && (own.contains(&Fact::StoreAddr)
+            || own.contains(&Fact::StoredValue)
+            || chain.contains(&Fact::StoreAddr)
+            || chain.contains(&Fact::StoredValue))
+    {
+        c = Claim::default();
+        c.ret_consumed_silent = true;
     }
     c
 }

@@ -62,15 +62,17 @@ jobs:
         # generation lived in another job/stage shipped red CI (runs 41415743892,
         # 42148930772), so the ordering is pinned by a test:
         # crates/cli/tests/types_ci_wiring.rs.
-        # The raw gate is RED by design (exit 1) while the named carry_chain
-        # void-return lies stand, so its code is ASSERTED, not dropped; the battery
-        # must be green; the step's verdict is the `.gate/types-baseline` ratchet,
-        # which is red on a rise, on a fall, and on any family with no row.
+        # The raw gate is GREEN by design since 2026-11-08: the `carry_chain`
+        # void-return family closed (tyinfer's consumed-return withdrawal), so the
+        # census must print zero lies and its exit code is ASSERTED as 0 — a rise
+        # redden the raw gate, not just the ratchet. The battery must be green; the
+        # step's second verdict is the `.gate/types-baseline` ratchet, which is red
+        # on a rise, on a fall, and on any family with no row.
         shell: powershell
         run: |
           cargo run -q -p rdec-cli -- types --corpus
-          Write-Host "types --corpus raw verdict exit $LASTEXITCODE (1 = the named lies in .gate/types-baseline are still standing)"
-          if ($LASTEXITCODE -ne 1) { throw "types --corpus raw verdict changed: expected 1 while the 4 named lies stand, got $LASTEXITCODE (update .gate/types-baseline and the ROADMAP ledger in the same commit)" }
+          Write-Host "types --corpus raw verdict exit $LASTEXITCODE (0 = no over-truth claim stands)"
+          if ($LASTEXITCODE -ne 0) { throw "types --corpus raw verdict changed: expected 0 with .gate/types-baseline declaring zero known lies, got $LASTEXITCODE (a new over-truth claim: fix the pass, or name it in the baseline in the same commit)" }
           cargo run -q -p rdec-cli -- types --selftest
           if ($LASTEXITCODE -ne 0) { throw "types --selftest failed" }
           cargo run -q -p rdec-cli -- types --corpus --baseline .gate/types-baseline

@@ -310,6 +310,12 @@ fn lie_family(text: &str) -> String {
 }
 
 /// Read a `subject|kind COUNT` baseline (blank and `#` lines ignored).
+///
+/// A file with ZERO rows is legal only when a `# known-lies: N` header line
+/// declares N = 0: the closed-census state, where every lie the scorer prints is a
+/// RISE. A file with rows must declare the sum of those rows, so the marker cannot
+/// drift from the rows (an all-comments file with a stale `known-lies: 4` is a
+/// gate that checks nothing, and is refused).
 fn load_types_baseline(path: &str) -> Result<BTreeMap<String, usize>, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
     let mut out: BTreeMap<String, usize> = BTreeMap::new();
@@ -330,6 +336,32 @@ fn load_types_baseline(path: &str) -> Result<BTreeMap<String, usize>, String> {
             return Err(format!("{path}: extra columns in baseline row: {line}"));
         }
         out.insert(key.to_string(), n);
+    }
+    // The declared zero state: `# known-lies: N` must equal the sum of the rows.
+    let declared: Option<usize> = text
+        .lines()
+        .filter_map(|l| {
+            let l = l.trim();
+            l.strip_prefix("# known-lies:")
+                .map(|rest| rest.trim().parse::<usize>().ok())
+                .unwrap_or(None)
+        })
+        .next();
+    let total: usize = out.values().sum();
+    match declared {
+        None => return Err(format!("{path}: no `# known-lies: N` header line")),
+        Some(d) if d != total => {
+            return Err(format!(
+                "{path}: declares {d} known lies, its rows sum to {total}"
+            ))
+        }
+        Some(_) => {}
+    }
+    if out.is_empty() && total == 0 {
+        // The closed-census state is NOT "a gate that checks nothing": the raw
+        // `types --corpus` gate (exit 0 required) is the checker, and every lie
+        // the scorer prints is a rise against this file.
+        return Ok(out);
     }
     if out.is_empty() {
         return Err(format!(
@@ -804,6 +836,19 @@ impl Probe {
     /// Bind the ABI the recovery and the verifier both insist on: every block
     /// that is still `Unreachable` answers with `answer`, `params` names the
     /// cells in signature order, and the return cell is W64.
+    /// Terminate the ENTRY block with a value, so a probe can state what the
+    /// function RETURNS. `finish` fills only `Unreachable` blocks, which is right
+    /// for the parameter probes and a trap for a return probe: the entry keeps
+    /// `Return(NO_VAL)`, so the function is a VOID function (`void_return = true`,
+    /// a default silent `ret` claim) and every assertion about `sig.ret` passes for
+    /// the wrong reason. Measured: all three consumed-return probes read as void.
+    fn finish_ret(&mut self, answer: rdec_core::ir::VId) {
+        let e = self.f.entry;
+        self.f.block_mut(e).term = Terminator::Return(answer);
+        self.f.params = self.cells.clone();
+        self.f.ret_ty = Ty::u64();
+    }
+
     fn finish(&mut self, answer: rdec_core::ir::VId) {
         for i in 0..self.f.blocks.len() {
             let b = self.f.blocks[i].id;
@@ -1187,6 +1232,59 @@ fn probe_unforced_claim_prints_nothing() -> bool {
     tyinfer::recover(&p.f).params[0].is_silent()
 }
 
+fn probe_return_consumed_via_copy_withdraws() -> bool {
+    // The measured -O1/-O2 `carry_chain` legs: the returned cell's TRUNC COPY is
+    // stored through an out-parameter (`Store(Int W32, p3, Trunc(W32, v24))`).
+    // The `stored-value` fact lands on the copy, and the chain walk follows uses,
+    // so consumption reaches the returned value and its claim is withdrawn.
+    let mut p = Probe::new(2);
+    let (a, out) = (p.cells[0], p.cells[1]);
+    p.cell_w32(0);
+    p.cell_ptr(1);
+    let e = p.ins(Op::Cast(CastKind::SExt, Ty::u64(), a), Ty::u64());
+    let tr = p.ins(Op::Cast(CastKind::Trunc, Ty::u32(), e), Ty::u32());
+    p.ins_void(Op::Store(Ty::u32(), out, tr));
+    p.finish_ret(e);
+    if !rdec_core::verify::verify(&p.f).is_ok() {
+        return false;
+    }
+    let sig = tyinfer::recover(&p.f);
+    sig.ret.is_silent() && sig.ret.ret_consumed_silent
+}
+
+fn probe_return_consumed_direct_withdraws() -> bool {
+    // The direct consumption leg: the returned value IS the stored value
+    // (`Fact::StoredValue` on its own cell) — the -O0 sibling of the copy shape.
+    let mut p = Probe::new(2);
+    let (a, out) = (p.cells[0], p.cells[1]);
+    p.cell_w32(0);
+    p.cell_ptr(1);
+    let tr = p.ins(Op::Cast(CastKind::Trunc, Ty::u32(), a), Ty::u32());
+    p.ins_void(Op::Store(Ty::u32(), out, tr));
+    p.finish_ret(tr);
+    if !rdec_core::verify::verify(&p.f).is_ok() {
+        return false;
+    }
+    let sig = tyinfer::recover(&p.f);
+    sig.ret.is_silent() && sig.ret.ret_consumed_silent
+}
+
+fn probe_return_unconsumed_keeps_claim() -> bool {
+    // The pair leg: the SAME 32-bit cell, no store anywhere. The cell's own width
+    // is a machine fact, so the return claim stands as `int32_t`. A rule that
+    // silenced this leg would be a scorer that stopped looking at return claims.
+    let mut p = Probe::new(1);
+    let a = p.cells[0];
+    p.cell_w32(0);
+    p.ins(Op::Cast(CastKind::SExt, Ty::u64(), a), Ty::u64());
+    p.finish_ret(a);
+    if !rdec_core::verify::verify(&p.f).is_ok() {
+        return false;
+    }
+    let sig = tyinfer::recover(&p.f);
+    !sig.ret.is_silent() && sig.ret.width == Some(Width::W32) && !sig.ret.ret_consumed_silent
+}
+
 pub fn types_selftest() -> i32 {
     // (rule, probe). Every entry binds one rule of the recovery module.
     let oks: Vec<(&str, bool)> = vec![
@@ -1271,6 +1369,18 @@ pub fn types_selftest() -> i32 {
         (
             "abi: an unforced claim prints nothing",
             probe_unforced_claim_prints_nothing(),
+        ),
+        (
+            "tyinfer: a return claim consumed by the body through a stored copy is withdrawn",
+            probe_return_consumed_via_copy_withdraws(),
+        ),
+        (
+            "tyinfer: a return claim the body stores directly is withdrawn",
+            probe_return_consumed_direct_withdraws(),
+        ),
+        (
+            "tyinfer: a return claim the body never consumed keeps its type",
+            probe_return_unconsumed_keeps_claim(),
         ),
     ];
     for (name, ok) in oks.iter() {

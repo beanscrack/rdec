@@ -1360,7 +1360,7 @@ the date and the tree are in the heading: a row is a measurement with an expiry.
 | M8 remainder | — | **NOT DONE** — packed SIMD (refused by name: `paddd/paddq/psubd/pmuludq/pcmpeqd/shufps`, mask `andps/orps`, GPR `movd/movq`), vtable dispatch and virtual calls. Measured: this clang build names ZERO vftable symbols in `.obj`, so vtable identity needs `.rdata` + REL32 relocation recovery | relocation reader, then vtable identity, then `call [this+k]` |
 | M5 control-flow structuring | `e0dafc6` | **LANDED** — if/while/switch recovery; jump-table switch sites close M1's last gap; M6 readability on top: 75 goto / 202 labels (from 123/217) | remaining fall-through gotos are back edges + multi-parent joins |
 | M6 readability | `47b9076` `bfe8156` | **PARTIAL** — early-return printing, layout-then-prune, return-tail materialization (refusals 29→0) | Ghidra baseline is a user install decision |
-| M6 type recovery (tyinfer + `types`) | `8447945` `bd3f68b` + lane m6e | **LANDED, GATED, IN CI** — re-measured 2026-11-08 on the MERGED tree (148 objects, not the lane's 136): 128 functions scored, 640 sites, 324 unscoreable; signedness LIE 0 (exact 150, canonical-over-unsigned 30, sound-silent 132), width 153 exact + 27 narrower + WIDER 0, ptr 21/0, float 0/0, void-return LIE 4, conflicts 25 loud; `types --selftest` battery 22/22 + register 4/4; `--baseline .gate/types-baseline` **GREEN with 0 new families** — the M3 slice's 12 objects added scoreable sites and no type claim, so the ratchet needed no edit; CI runs the ratchet in `gates` and `release-parity` | the 4 named `carry_chain` void-return lies (a lifter return-model gap: a COFF object carries no signature and `lift.rs` returns RAX unconditionally); Ghidra baseline |
+| M6 type recovery (tyinfer + `types`) | `8447945` `bd3f68b` + lane m6e + 2026-11-08 | **LANDED, GATED, IN CI, CENSUS CLEAN** — re-measured 2026-11-08 on the MERGED tree (148 objects, not the lane's 136): 128 functions scored, 640 sites, 324 unscoreable; signedness LIE 0 (exact 150, canonical-over-unsigned 30, sound-silent 132), width 153 exact + 27 narrower + WIDER 0, ptr 21/0, float 0/0, **void-return matches 4 / LIE 0** (the `carry_chain` family CLOSED — section 16), conflicts 25 loud; `types --selftest` battery **25/25** + register 4/4; `types --corpus` exits **0** (CI asserts 0 now, was 1); `--baseline .gate/types-baseline` **GREEN** on a baseline that declares `known-lies: 0`; CI runs the ratchet in `gates` and `release-parity` | the LIFTER's void-return model (a COFF object carries no signature, `lift.rs:4415` records `Return(read64(Rax))` unconditionally, so the emitted C of a `void` source function prints a `return` with a value — invisible to T2: all four legs are outside the compared set); Ghidra baseline |
 | M7 whole binary | `rdec pe-discover <exe>` (+ `pe-info`) | **GATE EXISTS (2026-11-08)** — on the real linked image: 418 functions, 56266/61431 .text bytes covered = **91.59%**, `overlap_free: true`, VERDICT line printing **213 gaps (213 descent + 0 reloc boundary)**; a 0-function run exits 1 with its coverage declared void. Seeds from three named sources with per-source provenance: `.pdata` (328 of 336 entries seeded, 4 chained + 4 version-2 refused and COUNTED — the seed census is the witness, measured: seeding a refused entry does not move the function count, because the linear sweep decodes with the same engine a seed uses), the entry point, and `.reloc` DIR64 code targets (47 targets in `.text`, 38 distinct, 7 `.reloc`-only with printed provenance). `.reloc` reader (`crates/arch-x86/src/reloc.rs`) asserts a PARTITION — padding + absolute + relative + unreadable-site + refused-kind == entries — cross-checked against a python raw-byte walk sharing no code (6 blocks, 782 entries = 3 ABSOLUTE + 779 DIR64, `sum(SizeOfBlock) == dir size`). NOT DONE: imports/IAT unread (160 indirect-call gaps stay anonymous, `is this gap an import?` unmeasured), PE32 has no `.reloc` leg (refused by name), the half-address relocation family is named not paired, ELF not started, frame-model interpretation not started | imports/IAT, then CRT signatures; the 7 `.reloc`-only starts are addresses, not verified bodies |
 | M9 production | `289645b` `c08a894` | **PARTIAL** — fuzzing lane (0 crashes/0 hangs over 20k-input censuses ×3 seeds), nightly hardening workflow, release parity, panic-site ratchet, pass-pipeline + verify_ssa linear-time; the analyst loop is not built | analyst loop; fuzz generator extension to shift ops with raw counts (the P-track defect's domain) |
 | P track (proof) | seed | **EXTENDED 2026-11-08** — the oracle has its own oracle: `interp_arith_reference.rs`, an independent machine-semantics reference, now over the 9 original liftable BinOps **plus the accumulator ops that landed**: `UDiv/URem/SDiv/SRem` at all four widths and `MulHi/MulSmul` at W64 (boundary set + 3000 deterministic cases per op x width, both `Sx` displays, raw shift counts, zero-divisor fault pinned). The multiply-high reference is a LIMB DECOMPOSITION, so interpreter (`u128`), table (limbs) and the shipped C helper are three implementations; `mulhi_helpers.rs` is the C-leg (PRELUDE helpers vs `__int128` over 300+ vectors, compiled with the floor gate's own flags, and the emitter's W64-emits / W32-refuses claim). First run found two real defects, both fixed in the interpreter: `Shr`/`Sar` UB for counts 64..=128 (debug panic, RELEASE WRAP) and `shift_left` disagreeing with the machine's count masking at raw 32..63 (W32) | extend for `RotL/RotR` as sites land; C-emitter equivalence proofs beyond the multiply-high leg |
@@ -3256,3 +3256,103 @@ Rules this slice leaves behind
 3. **Preserve-within-a-block is the honest half.** Closing the join needs flag
    phis (SS1.2 item 2); naming that as the prerequisite is the result, not a
    deferral.
+
+## Slice 16 (2026-11-08) — M6: the last LIE in the ledger, closed by a CONSUMED-RETURN rule
+
+`types --corpus` carried exactly one red family for two slices: `carry_chain|void-return 4`,
+one per opt level of a function whose source declares
+
+```c
+void f(unsigned long a, unsigned long b, unsigned long *lo, unsigned long *hi)
+```
+
+while the compiled tail leaves a value in RAX and the lifter records `Return(value)`.
+The type pass then faithfully reported a claim over that cell and the scorer called it a
+LIE (`return claim over declared void`) — an over-truth claim, the only one left in the
+census. It is now 0, and the gate exits 0.
+
+### The two measured legs (facts, not adjectives)
+
+The four legs are two shapes, and `--explain` naming each witness is what made that
+visible:
+
+* **-O0** returns the cell the loop stores **through**. `--explain carry_chain.O0`:
+  `return bb0 v84` with `store-address@0x48` on the returned value — the value's own role
+  is a store destination.
+* **-O1/-O2** return the computed cell whose **trunc copy** the body stores through an
+  out-parameter: `Store(Int W32, 3, v27)` with `v27 = Cast(Trunc, W32, v24)`, and
+  `return bb0 v24`. The `stored-value` fact lands on `v27`, not on the returned `v24`.
+
+That second shape is the whole lesson of the slice. The claim walk follows **uses**
+(the value's materialisations), so consumption of a *copy* is consumption of the value —
+and a rule written against the seed's OWN facts fixed one leg and left three red
+(measured: `void-return matches 1 LIE 3`). `Fact::StoreAddr` (destination role) and
+`Fact::StoredValue` (stored source) are checked on **own OR chain**, and the withdrawal
+runs LAST in `claim_from`, after every field is computed: the first version reset the
+claim in the middle of the function, so the width bound was computed back onto the
+"withdrawn" claim (`silent=false, consumed=true`) and the probe failed. A "silence
+everything" statement has to be the last statement.
+
+The rule is stated where it lives: a returned value the body consumes has its only
+positive role evidence inside the body, and a COFF object carries no prototype to say the
+cell is an answer, so printing its type as a return type prints information the machine
+never showed. **Cost, said plainly:** a C function that both stores a value and returns it
+(`*out = s; return s;`) loses its RETURN claim (the cell keeps every fact it earned as a
+parameter or site, and the site census is unchanged — measured: signedness/width/ptr
+buckets byte-identical, 150/30/132, 153/27, 21/0). A returned value the body never
+consumes keeps its claim; that leg is a probe, not prose.
+
+### The probe-builder trap that made three probes pass for the wrong reason
+
+`crates/cli/src/m6.rs`'s `Probe::finish` fills blocks whose terminator is `Unreachable`.
+`Probe::new` gives the entry `Return(NO_VAL)`, so a probe that "returns" a value through
+`finish` is a **void function**: `void_return = true`, `ret` a default silent claim, and
+every assertion about `sig.ret` passes for reasons unrelated to the rule under test. Added
+`finish_ret`, which sets the ENTRY terminator, and the three consumed-return probes use it.
+Any future probe that asserts on `sig.ret` needs it.
+
+### The baseline's new contract: a declared zero
+
+`.gate/types-baseline` no longer carries a row. A rows-less file used to be the "gate that
+checks nothing" and was refused; now the file must carry a `# known-lies: N` header whose
+value equals the sum of its rows, so:
+
+* zero rows + `known-lies: 0` = the closed-census state, legal, and non-vacuous — every
+  printed lie is a RISE against zero, and the RAW gate (which CI now asserts exits **0**,
+  was 1) is the checker;
+* rows + a marker that disagrees with their sum = refused (a baseline cannot drift from
+  its own declaration);
+* no marker = refused, same as the old empty-file rule.
+
+`crates/cli/tests/types_ci_wiring.rs` enforces the pairing: a baseline that declares zero
+forces ci.yml's raw-gate step to assert exit 0 (it reads the step's own line and quotes it
+in the failure). The old "scorer that stops looking at declared-void sites" prohibition is
+inherited unchanged — the scorer's `void_return || ret.is_silent()` test is untouched, and
+the withdrawal happens in the claim layer, where silence is the module's honest output.
+
+### Sabotage pairs (each direction has a witness)
+
+* Drop the chain terms → `a return claim consumed by the body through a stored copy is
+  withdrawn` FAILS and the corpus goes RED with `void-return matches 1 LIE 3`.
+* Fire on every return → `a return claim the body never consumed keeps its type` FAILS.
+  The corpus cannot witness this direction (`void-return matches 4 LIE 0`,
+  `pointer on-ptr 21` unchanged — no scored corpus site returns an unconsumed pointer),
+  which is exactly why the pair probe is load-bearing and not decorative.
+
+### Measurements
+
+`types --corpus`: 128 functions, 640 sites, LIE 0 in every bucket,
+`void-return matches 4 LIE 0`, exit 0. `types --selftest`: battery **25/25**
+(`PROBE_RULES_TOTAL` 22 → 25, three new probes), register 4/4, exit 0.
+`types --corpus --baseline .gate/types-baseline`: GREEN, 0 named, 0 new.
+Emitted C is untouched by this slice by construction: `tyinfer::recover` is called only
+from the gate, so T2's tuple and the C census are unchanged by the same argument the
+m6e merge row used.
+
+### What this did NOT close
+
+The LIFTER still records `Return(read64(Rax))` for these functions
+(`crates/arch-x86/src/lift.rs:4415`), so the emitted C of a `void` source function prints
+a `return` with a value. T2 cannot see it — all four legs are outside the compared set
+(`not run [memory outside the modelled frame]`) — and its owner is M4's void-return model:
+a `RetKind::Void`/no-value terminator with a `verify` bound, not a type-recovery rule.

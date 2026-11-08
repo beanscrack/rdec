@@ -263,10 +263,16 @@ fn the_types_step_checks_the_gate_exit_code() {
 }
 
 #[test]
-fn the_types_baseline_file_exists_and_is_not_a_comment_block() {
+fn the_types_baseline_file_exists_and_declares_its_lie_count() {
     // The CI step's exit code comes from this file. Missing file = the step errors
     // (good); a file of only comments = a gate that checks nothing, so the ratchet
     // loader refuses it and this test says so from the repo root too.
+    //
+    // The contract since 2026-11-08 is the DECLARED COUNT, not the row count: every
+    // row's family must be printable, and a `# known-lies: N` line must equal the sum
+    // of the rows. That keeps the closed-census state (zero rows, marker 0) legal and
+    // non-vacuous — every printed lie is then a rise against zero — while an
+    // undeclared, rows-less file stays the "gate that checks nothing" it always was.
     // `.github/workflows` -> `.github` -> the repo root: TWO pops. The version of
     // this test that got it wrong is the evidence for writing it this way: it looked
     // for `.github/.gate/types-baseline` and reported the baseline missing.
@@ -288,17 +294,32 @@ fn the_types_baseline_file_exists_and_is_not_a_comment_block() {
         .map(|l| l.trim())
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .collect();
-    assert!(!rows.is_empty(), "{} has no data rows", path.display());
+    let declared: Vec<usize> = text
+        .lines()
+        .filter_map(|l| {
+            l.trim()
+                .strip_prefix("# known-lies:")
+                .map(|rest| rest.trim().parse::<usize>().ok())
+        })
+        .map(|o| o.expect("baseline `# known-lies:` marker is not a number"))
+        .collect();
+    assert_eq!(
+        declared.len(),
+        1,
+        "{} must carry exactly one `# known-lies: N` line, found {}",
+        path.display(),
+        declared.len()
+    );
+    let mut sum = 0usize;
     for r in &rows {
         let mut cols = r.split_whitespace();
         let (Some(key), Some(cnt)) = (cols.next(), cols.next()) else {
             panic!("{}: baseline row too short: {r}", path.display());
         };
-        assert!(
-            cnt.parse::<usize>().is_ok(),
-            "{}: baseline count is not a number: {r}",
-            path.display()
-        );
+        let n: usize = cnt
+            .parse()
+            .unwrap_or_else(|_| panic!("{}: baseline count is not a number: {r}", path.display()));
+        sum += n;
         let printable = ["signedness", "width", "pointer", "float", "void-return"]
             .iter()
             .any(|known| key.ends_with(&format!("|{known}")));
@@ -308,6 +329,29 @@ fn the_types_baseline_file_exists_and_is_not_a_comment_block() {
         panic!(
             "{}: baseline names a family the scorer cannot print: {key}",
             path.display()
+        );
+    }
+    assert_eq!(
+        declared[0],
+        sum,
+        "{} declares {} known lies, its rows sum to {}",
+        path.display(),
+        declared[0],
+        sum
+    );
+    if declared[0] == 0 {
+        // The closed-census state is only honest while CI also asserts the RAW gate
+        // exits 0 — the baseline of nothing checks nothing on its own.
+        let wf_text = std::fs::read_to_string(wf.join("ci.yml"))
+            .expect("read .github/workflows/ci.yml from the workflows dir");
+        let raw = wf_text
+            .lines()
+            .find(|l| l.contains("types --corpus raw verdict changed"))
+            .expect("ci.yml has no asserted raw `types --corpus` verdict");
+        assert!(
+            raw.contains("-ne 0") && raw.contains("expected 0"),
+            "types-baseline declares zero known lies, so ci.yml must assert the raw \
+             `types --corpus` gate exits 0; the step reads: {raw}"
         );
     }
 }
