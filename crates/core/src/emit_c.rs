@@ -137,18 +137,38 @@ pub type Protos = HashMap<String, CalleeDecl>;
 /// The DECLARED C parameter types of a function, exactly as `run` spells its
 /// definition: the ABI's declared type when there is one, the value's own type
 /// otherwise, and the emitter's `max(1)` rule — a C function with no parameters
-/// is spelled with one, so the prototype has to say the same thing.
+/// is spelled with one, so the prototype has to say the same thing. A function
+/// whose arity the pipeline RECOVERED (`Function::nparams`) is spelled with
+/// exactly that many: the definition, the prototype and every call site are the
+/// same number, computed from the same `Function`, which is what keeps
+/// `clang -Werror` from ever seeing an argument-count mismatch.
 pub fn c_param_tys(f: &Function) -> Vec<Ty> {
-    let n = f.params.len().max(1);
-    (0..n)
-        .map(|i| {
-            f.param_tys
-                .get(i)
-                .cloned()
-                .or_else(|| f.params.get(i).and_then(|v| f.ty_of(*v)))
-                .unwrap_or(Ty::u64())
-        })
-        .collect()
+    let n = match f.nparams {
+        // A recovered arity: exactly k parameters, k = 0 spelled `(void)`.
+        Some(k) => k,
+        // The model as it has always been: every seeded parameter, at least one.
+        None => f.params.len().max(1),
+    };
+    (0..n).map(|i| c_param_ty_at(f, i)).collect()
+}
+
+/// The declared type of parameter `i`, the rule `c_param_tys` applies per slot.
+fn c_param_ty_at(f: &Function, i: usize) -> Ty {
+    f.param_tys
+        .get(i)
+        .cloned()
+        .or_else(|| f.params.get(i).and_then(|v| f.ty_of(*v)))
+        .unwrap_or(Ty::u64())
+}
+
+/// The arity of `f`'s EMITTED C signature: the number of arguments a call to
+/// the generated text passes, and the number its definition declares. The t2
+/// drivers call the emitted C through this number — the wrapper and the
+/// definition are spelled from the same `Function`, so a driver that called
+/// "the ABI's four" at a definition the arity shrank would not compile, and
+/// that is exactly what this function keeps in one place.
+pub fn emitted_arity(f: &Function) -> usize {
+    c_param_tys(f).len()
 }
 
 /// The declared shape of `f` as a callee: built from the function itself, so a
@@ -587,6 +607,17 @@ impl<'a> Emitter<'a> {
             if matches!(ins.op, Op::Phi(_)) {
                 continue;
             }
+            // An entry `Op::Param` whose DECLARED parameters the recovered
+            // arity dropped: same skip as `block_params`, because this shape
+            // (an -O0 frame slot initialised before the parameters, so the
+            // params are NOT the leading instructions) reaches the parameters
+            // through the walk, and `a3` is not declared.
+            if matches!(ins.op, Op::Param)
+                && param_index(self.f, ins.dest).unwrap_or(0)
+                    >= self.f.nparams.unwrap_or(usize::MAX)
+            {
+                continue;
+            }
             self.instr(ins)?;
             self.bail()?;
         }
@@ -606,8 +637,18 @@ impl<'a> Emitter<'a> {
     fn block_params(&mut self, bb: BbId) -> Result<(), Vec<Refusal>> {
         self.tail = crate::ir::NO_VAL;
         self.noret = false;
+        // A RECOVERED arity declares `f.nparams` parameters; the entry params
+        // beyond it are UNREAD by the max-index rule (`args_read`), so their
+        // assignments are skipped: `a3` is not declared, and printing
+        // `x12 = a3;` would name a C parameter that does not exist. The values
+        // keep their (unread, `__attribute__((unused))`) declarations, which is
+        // the same treatment every dead local gets.
+        let lim = self.f.nparams.unwrap_or(usize::MAX);
         for ins in &self.f.blocks[bb as usize].instrs {
             if !matches!(ins.op, Op::Param) {
+                break;
+            }
+            if param_index(self.f, ins.dest).unwrap_or(0) >= lim {
                 break;
             }
             self.instr(ins)?;
@@ -622,6 +663,13 @@ impl<'a> Emitter<'a> {
         let _ = writeln!(self.body, "/* function {} @ {a0:#x} */", self.f.name);
         let _ = write!(self.body, "{ret} {}(", self.f.name);
         let tys = c_param_tys(self.f);
+        if tys.is_empty() {
+            // A RECOVERED arity of zero: `(void)`, not `()`. An empty
+            // parameter list is a declaration with NO prototype, and `-Wextra
+            // -Werror` in C17 calls that an error — the same reason `proto_text`
+            // spells the callee's prototype `(void)`.
+            let _ = write!(self.body, "void");
+        }
         let n = tys.len();
         for (i, t) in tys.iter().enumerate() {
             // The DECLARED type wins: a Windows x64 float parameter is a bit

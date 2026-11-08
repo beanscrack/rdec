@@ -367,12 +367,32 @@ pub struct Subject {
 /// target (the COFF symbol at that address) and say what its signature declares.
 /// `FnShape::typed == false` is the loud case - a signature the demangler could
 /// not fully type - and a call to such a callee stays refused.
+///
+/// THE TWO-PASS. Pass 1 lifts every subject with the callee table as it is
+/// (every callee at the default four pairs). For every symbol this object
+/// DEFINES - one whose body pass 1 lifted - the body itself says how many
+/// argument cells it reads (`Function::args_read`), and that number becomes the
+/// callee's `nargs` in the table. Pass 2 re-lifts every function with the
+/// enriched table, and the pass-2 subjects are what this returns: the census
+/// counters, the emitted C, and the arity all come from the SAME pass.
+/// Recursion is covered by the same rule: `f`'s own pass-1 body is the evidence
+/// for `f`'s calls to itself (that is `fib_rec`). Callees the pipeline cannot
+/// see - imports, relocations naming no symbol of this object, defined symbols
+/// with no lifted body - keep `nargs = 4`, the loud default (see
+/// `CalleeSig::nargs`). The `arity:` line printed at the end states the counts
+/// of that enrichment; it is printed from the same counters that set the table.
 pub fn lift_all_named_shapes(
     files: &[String],
     name_of: &dyn Fn(usize, &str) -> String,
     shape_of: &dyn Fn(usize, &str) -> FnShape,
 ) -> Result<Vec<Subject>, String> {
     let mut out: Vec<Subject> = Vec::new();
+    // The arity census, summed over objects: N entries ENRICHED from a lifted
+    // body, M defined-in-object callee symbols (the recovered denominator), K
+    // table entries left at the default four pairs. The `arity:` line prints
+    // exactly these, and the table the two-pass builds is built from the same
+    // numbers - a printed count and its pass condition, from one source.
+    let (mut arity_n, mut arity_m, mut arity_k) = (0usize, 0usize, 0usize);
     for (oi, file) in files.iter().enumerate() {
         let obj = rdec_arch_x86::loader::load(Path::new(file))?;
         let mut ranges: Vec<Code> = Vec::new();
@@ -477,6 +497,10 @@ pub fn lift_all_named_shapes(
                     // stays reachable) - the model never invents a noreturn from a
                     // guess about a name.
                     noreturn: rdec_arch_x86::lift::noreturn_symbol(raw),
+                    // Start at the default four pairs; the two-pass below LOWERS
+                    // this for a callee whose own lifted body reads fewer cells.
+                    // Nothing here lowers it from a name, an ABI, or a guess.
+                    nargs: 4,
                 },
             );
         }
@@ -524,44 +548,103 @@ pub fn lift_all_named_shapes(
         }
         let relocs_parsed = obj.reloc_census().parsed;
 
-        for (k, &start) in plan.functions.iter().enumerate() {
-            let Some((_, rg)) = ranges
-                .iter()
-                .enumerate()
-                .find(|(_, r)| start >= r.base && start < r.base + r.bytes.len() as u64)
-            else {
+        // THE TWO-PASS: pass 1 lifts every subject with the table as it is
+        // (every callee at the default four pairs); the pass-1 bodies then
+        // LOWER `nargs` for the callees this object defines; pass 2 re-lifts
+        // with the enriched table and its subjects are what gets returned.
+        // One closure run twice, not a copy of the loop: a second copy would
+        // be a second pipeline, and the two passes would measure different
+        // code.
+        let lift_pass = |table: &CalleeTable| -> Vec<Subject> {
+            let mut v: Vec<Subject> = Vec::new();
+            for (k, &start) in plan.functions.iter().enumerate() {
+                let Some((_, rg)) = ranges
+                    .iter()
+                    .enumerate()
+                    .find(|(_, r)| start >= r.base && start < r.base + r.bytes.len() as u64)
+                else {
+                    continue;
+                };
+                let end = plan.functions[k + 1..]
+                    .iter()
+                    .find(|a| **a >= rg.base && **a < rg.base + rg.bytes.len() as u64)
+                    .copied()
+                    .unwrap_or(rg.base + rg.bytes.len() as u64);
+                // Unique per object: the corpus has 120 objects that all define `f`,
+                // and one C file with 120 definitions of `f` is a redefinition error.
+                let raw = names
+                    .get(&start)
+                    .cloned()
+                    .unwrap_or_else(|| format!("fn_{start:x}"));
+                let name = name_of(oi, &raw);
+                let abi = shape_of(oi, &raw).abi;
+                let (mut f, rep) = lift_one_sigs(
+                    &name, rg.bytes, rg.base, start, end, &plan, &names, &abi, table, &relocs,
+                    &tables,
+                );
+                clean(&mut f);
+                v.push(Subject {
+                    obj: file.clone(),
+                    sym: raw,
+                    cname: name,
+                    start,
+                    external: external.contains(&start),
+                    relocs_parsed,
+                    f,
+                    abi,
+                    rep,
+                });
+            }
+            v
+        };
+        let pass1 = lift_pass(&sigs);
+
+        // THE ARITY FACT, from the pass-1 body. A callee's lifted body names
+        // the argument cells it reads (`Function::args_read`: max index of a
+        // READ parameter plus one, terminator reads included - the soundness
+        // direction is that over-estimating keeps today's loud refusal and
+        // under-estimating would be the miscompile, so this is never a count
+        // of leading reads). Only a symbol THIS OBJECT DEFINES qualifies:
+        // `names` is the object's symbol table for code it defines (an import
+        // has no address and never enters it, and a synthetic `fn_<addr>`
+        // start is not a table name), so the anti-invention floor - a callee
+        // with no body in this object keeps the default four pairs - is the
+        // shape of the set, not a filter on it. `Subject::external` is NOT
+        // this filter: in COFF, EXTERNAL storage on a code symbol with a
+        // section means DEFINED-and-linkable (the `f` of `fib_rec`), and it is
+        // the body that is the evidence, not the link name.
+        let defined: HashSet<&str> = names.values().map(|n| n.as_str()).collect();
+        let mut arity_of: HashMap<String, usize> = HashMap::new();
+        for s in &pass1 {
+            if !defined.contains(s.sym.as_str()) {
                 continue;
-            };
-            let end = plan.functions[k + 1..]
-                .iter()
-                .find(|a| **a >= rg.base && **a < rg.base + rg.bytes.len() as u64)
-                .copied()
-                .unwrap_or(rg.base + rg.bytes.len() as u64);
-            // Unique per object: the corpus has 120 objects that all define `f`,
-            // and one C file with 120 definitions of `f` is a redefinition error.
-            let raw = names
-                .get(&start)
-                .cloned()
-                .unwrap_or_else(|| format!("fn_{start:x}"));
-            let name = name_of(oi, &raw);
-            let abi = shape_of(oi, &raw).abi;
-            let (mut f, rep) = lift_one_sigs(
-                &name, rg.bytes, rg.base, start, end, &plan, &names, &abi, &sigs, &relocs, &tables,
-            );
-            clean(&mut f);
-            out.push(Subject {
-                obj: file.clone(),
-                sym: raw,
-                cname: name,
-                start,
-                external: external.contains(&start),
-                relocs_parsed,
-                f,
-                abi,
-                rep,
-            });
+            }
+            if let Some(sg) = sigs.get_mut(&s.sym) {
+                sg.nargs = s.f.args_read();
+                arity_of.insert(s.sym.clone(), sg.nargs);
+            }
+        }
+        arity_n += arity_of.len();
+        arity_m += defined.len();
+        arity_k += sigs.len() - arity_of.len();
+
+        let pass2 = lift_pass(&sigs);
+        // The definition spells the SAME count the call sites pass: min of the
+        // recovered nargs and the pairs the callee's own shape seeds. One
+        // number per function, in the Function, read by `c_param_tys`,
+        // `callee_decl`, the emitter's entry-params loop, and the t2 drivers.
+        for s in pass2 {
+            let mut s = s;
+            if let Some(&n) = arity_of.get(&s.sym) {
+                s.f.nparams = Some(n.min(s.abi.seeded_pairs().len()));
+            }
+            out.push(s);
         }
     }
+    println!(
+        "arity: {arity_n} of {arity_m} in-object callees recovered from the callee's own body, \
+         {arity_k} left at the 4-pair default"
+    );
     Ok(out)
 }
 

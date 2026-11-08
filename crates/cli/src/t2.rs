@@ -404,10 +404,20 @@ fn job_tables(jobs: &[(usize, usize)]) -> String {
 ///
 /// The arguments are the ABI's four, cast down to the emitted signature's
 /// `int64_t` - spelled here rather than hidden in a function-pointer cast.
-fn c_wrapper(idx: usize, cname: &str) -> String {
+/// The CALL passes `n_args` of them: the arity of the function's EMITTED C
+/// signature (`emit_c::emitted_arity`, the number its definition declares).
+/// A recovered arity shrinks that definition; a driver that kept passing four
+/// arguments at a one-parameter definition would not compile, and the machine
+/// side is untouched - its extern keeps the ABI's four, and the callee simply
+/// does not read the rest.
+fn c_wrapper(idx: usize, cname: &str, n_args: usize) -> String {
+    let args: Vec<String> = (0..n_args.min(4))
+        .map(|k| ["(int64_t)a", "(int64_t)b", "(int64_t)c", "(int64_t)d"][k].to_string())
+        .collect();
     format!(
         "static uint64_t w{idx}(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {{\n\
-         \x20 return (uint64_t){cname}((int64_t)a, (int64_t)b, (int64_t)c, (int64_t)d);\n}}\n"
+         \x20 return (uint64_t){cname}({});\n}}\n",
+        args.join(", ")
     )
 }
 
@@ -464,14 +474,26 @@ fn main_body_mem(n_jobs: usize, seed: &str) -> String {
 /// `x = 0x2000 + delta`, and `RDEC_ADDR` is the identity on the window -
 /// native buffer byte k IS `rdec_mem[0x2000 + k]`. The return is widened
 /// from the declared type exactly as `c_wrapper` does.
-fn c_wrapper_mem(idx: usize, cname: &str) -> String {
+fn c_wrapper_mem(idx: usize, cname: &str, n_args: usize) -> String {
+    // The window is argument 0 of the emitted signature; V[j][1..3] fill the
+    // rest, and the CALL passes `n_args` in total - the arity the emitted text
+    // declares (see `c_wrapper`). A zero-arity window function keeps its
+    // preloaded window and is called `(void)`: the emitted body reads no cell,
+    // and the window preload is the harness's, not the callee's argument.
+    let mut args: Vec<String> = Vec::new();
+    if n_args >= 1 {
+        args.push(format!("(int64_t)RDEC_ADDR({WIN_ADDR}ULL)"));
+    }
+    for k in 1..n_args.min(4) {
+        args.push(format!("(int64_t)V[j][{k}]"));
+    }
     format!(
         "static uint64_t v{idx}(unsigned j, uint64_t* out) {{\n\
          \x20 memcpy(&rdec_mem[RDEC_ADDR({WIN_ADDR}ULL)], W[j], sizeof W[j]);\n\
-         \x20 uint64_t r = (uint64_t){cname}((int64_t)RDEC_ADDR({WIN_ADDR}ULL),\n\
-         \x20                            (int64_t)V[j][1], (int64_t)V[j][2], (int64_t)V[j][3]);\n\
+         \x20 uint64_t r = (uint64_t){cname}({});\n\
          \x20 for (int k = 0; k < 512; ++k) out[k] = load_8(RDEC_ADDR({WIN_ADDR}ULL + 8 * (uint64_t)k));\n\
-         \x20 return r;\n}}\n"
+         \x20 return r;\n}}\n",
+        args.join(", ")
     )
 }
 
@@ -1243,7 +1265,11 @@ pub fn cmd_t2(args: &[String]) -> Result<i32, String> {
     }
     decomp.push_str("typedef uint64_t (*Fn)(uint64_t, uint64_t, uint64_t, uint64_t);\n");
     for sb in &subs {
-        decomp.push_str(&c_wrapper(sb.c_sym, &sb.s.cname));
+        decomp.push_str(&c_wrapper(
+            sb.c_sym,
+            &sb.s.cname,
+            rdec_core::emit_c::emitted_arity(&sb.s.f),
+        ));
     }
     decomp.push_str("static const Fn FN[] = {\n");
     for sb in &subs {
@@ -1260,7 +1286,11 @@ pub fn cmd_t2(args: &[String]) -> Result<i32, String> {
         decomp.push_str("typedef uint64_t (*FnW)(unsigned, uint64_t*);\n");
         for sb in &subs {
             if sb.win {
-                decomp.push_str(&c_wrapper_mem(sb.c_sym, &sb.s.cname));
+                decomp.push_str(&c_wrapper_mem(
+                    sb.c_sym,
+                    &sb.s.cname,
+                    rdec_core::emit_c::emitted_arity(&sb.s.f),
+                ));
             }
         }
         decomp.push_str("static const FnW FNW[] = {\n");
@@ -3450,7 +3480,10 @@ pub(crate) fn t2_cpp_run(
             src.push_str(&c_wrapper_cpp(
                 sb.c_sym,
                 &sb.s.cname,
-                sb.s.f.params.len(),
+                // The EMITTED arity: the number the definition declares after
+                // the two-pass (see `c_wrapper`). For the all-leaf C++ corpus
+                // this is the declared parameter count, unchanged.
+                rdec_core::emit_c::emitted_arity(&sb.s.f),
                 sabotage,
             ));
         }
@@ -3482,7 +3515,7 @@ pub(crate) fn t2_cpp_run(
             src.push_str(&c_wrapper_win(
                 sb.c_sym,
                 &sb.s.cname,
-                sb.s.f.params.len(),
+                rdec_core::emit_c::emitted_arity(&sb.s.f),
                 false,
             ));
         }
@@ -3521,7 +3554,13 @@ pub(crate) fn t2_cpp_run(
             src.push_str(&c_wrapper_x(
                 sb.c_sym,
                 &sb.s.cname,
-                &sb.xargs,
+                // Truncate to the EMITTED arity: the emitted definition declares
+                // the cells its body reads; the wrapper passes exactly those
+                // (see `c_wrapper`). A leaf at its declared shape passes them all.
+                &sb.xargs[..sb
+                    .xargs
+                    .len()
+                    .min(rdec_core::emit_c::emitted_arity(&sb.s.f))],
                 sb.xret,
                 false,
                 sabotage,
@@ -3556,7 +3595,11 @@ pub(crate) fn t2_cpp_run(
             src.push_str(&c_wrapper_x(
                 sb.c_sym,
                 &sb.s.cname,
-                &sb.xargs,
+                // Truncated to the emitted arity, as in the RAX class above.
+                &sb.xargs[..sb
+                    .xargs
+                    .len()
+                    .min(rdec_core::emit_c::emitted_arity(&sb.s.f))],
                 sb.xret,
                 true,
                 sabotage,
@@ -5076,7 +5119,7 @@ mod tests {
     /// that compares bits the ABI leaves unspecified.
     #[test]
     fn the_c_side_is_widened_from_its_declared_return_type() {
-        let w = c_wrapper(3, "o7_f");
+        let w = c_wrapper(3, "o7_f", 4);
         assert!(w.contains("static uint64_t w3("), "{w}");
         assert!(w.contains("(uint64_t)o7_f(("), "{w}");
         assert!(!w.contains('*'), "no function-pointer cast: {w}");
