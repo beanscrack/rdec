@@ -81,14 +81,17 @@ fn the_named_clobbered_by_call_sites_are_gone_and_the_counts_move_by_eight() {
     assert_eq!(nums.len(), 4, "four counts in `{emit_line}`");
     let (lifted, emitted, refused, invalid) = (nums[0], nums[1], nums[2], nums[3]);
     assert_eq!(invalid, 0, "`0 invalid` after passes: {emit_line}");
-    assert_eq!(
-        emitted, 137,
-        "129 + 8 closures (measured at 57747c0): {emit_line}"
-    );
-    assert_eq!(
-        refused, 19,
-        "27 - 8 closures (measured at 57747c0): {emit_line}"
-    );
+    // Floors moved 137/19 -> 135/21 on 2026-11-08 (branch `frame-activation`,
+    // this tree): the frame-activation refusal took `call_helper.O0::f` and
+    // `fib_rec.O0::f` OUT of the emitted set - their C computes a wrong
+    // answer when a callee/recursion clobbers a frame slot the caller is
+    // live on (one frame per function in the model, one per activation on
+    // the machine; `frame_activation.rs` beside this file names the
+    // witnesses, the census class and the t2 confirmation). The eight
+    // clobber closures this row owns stay closed: the refusal class they
+    // name stays gone, asserted below on the record dump.
+    assert_eq!(emitted, 135, "137 - 2 frame refusals: {emit_line}");
+    assert_eq!(refused, 21, "19 + 2 frame refusals: {emit_line}");
     assert_eq!(lifted, 156, "the lift count is untouched: {emit_line}");
 
     // The class census, same run: `clobbered by call` is GONE and the class

@@ -10,9 +10,11 @@
 //!  3. the passes that run before emission must not break SSA - checked with the
 //!     same verifier, not with trust.
 use rdec_arch_x86::discover::Code;
-use rdec_arch_x86::lift::{lift_one_sigs, CalleeSig, CalleeTable, FnShape, RelocMap, RelocTarget};
+use rdec_arch_x86::lift::{
+    lift_one_sigs, CalleeSig, CalleeTable, FnShape, RelocMap, RelocTarget, STACK_BASE,
+};
 use rdec_core::emit_c::{callee_decl, emit_c_sig, text_census, Protos, Refusal, PRELUDE};
-use rdec_core::ir::Function;
+use rdec_core::ir::{BinOp, Callee, Function, Op, VId};
 use rdec_core::structure::{sum_reports, Report};
 use rdec_core::verify::verify_ssa;
 use std::collections::{HashMap, HashSet};
@@ -675,6 +677,276 @@ pub fn protos_of(subjects: &[Subject]) -> Protos {
         .collect()
 }
 
+/// Width of the frame window inspected by [`frame_touched`]: the slots below
+/// the model's entry RSP (`STACK_BASE = 1 << 19`) that an `-O0` frame uses.
+/// The window matches the model's own geometry - a rsp-relative frame at
+/// entry RSP = STACK_BASE lives strictly below STACK_BASE, and the corpus's
+/// deepest frame is far under 4 KiB.
+pub const FRAME_WINDOW: u64 = 0x1000;
+
+/// Resolve an operand to a constant address. The lifter materialises frame
+/// addresses as plain constants (`%9 = 0x7fffc ; store %9 = ...`), so `Const`
+/// is the corpus shape; `Copy` and `add`/`sub` over constants cover the
+/// shapes the passes leave behind (bounded recursion, depth 8). Anything
+/// else - a `Param`, a computed address - is `None`: the check claims only
+/// addresses it can resolve, and a caller-buffer access (Param-rooted, the
+/// shape `t2`'s memory comparison covers) is by construction outside it.
+fn const_addr(f: &Function, v: VId, depth: u8) -> Option<u64> {
+    if depth > 8 {
+        return None;
+    }
+    let ins = f
+        .blocks
+        .iter()
+        .find_map(|b| b.instrs.iter().find(|i| i.dest == v))?;
+    match &ins.op {
+        Op::Const(c) => Some(*c),
+        Op::Copy(x) => const_addr(f, *x, depth + 1),
+        Op::Bin(BinOp::Add, a, b) => {
+            Some(const_addr(f, *a, depth + 1)?.wrapping_add(const_addr(f, *b, depth + 1)?))
+        }
+        Op::Bin(BinOp::Sub, a, b) => {
+            Some(const_addr(f, *a, depth + 1)?.wrapping_sub(const_addr(f, *b, depth + 1)?))
+        }
+        _ => None,
+    }
+}
+
+/// The model addresses this function touches inside the frame window
+/// `[STACK_BASE - FRAME_WINDOW, STACK_BASE)`: the frame slots of its
+/// activation, every `Load`/`Store` whose address resolves to a constant in
+/// the window. Sorted and deduped on purpose: the shared address a refusal
+/// names is the LOWEST one, so the refusal text is deterministic for one
+/// input (the pipeline's determinism contract covers the census text too).
+pub fn frame_touched(f: &Function) -> Vec<u64> {
+    let mut v: Vec<u64> = Vec::new();
+    for b in &f.blocks {
+        for ins in &b.instrs {
+            let addr = match &ins.op {
+                Op::Load(_, a) | Op::Store(_, a, _) => *a,
+                _ => continue,
+            };
+            if let Some(x) = const_addr(f, addr, 0) {
+                if (STACK_BASE - FRAME_WINDOW..STACK_BASE).contains(&x) {
+                    v.push(x);
+                }
+            }
+        }
+    }
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// THE FRAME-ACTIVATION CHECK. The model gives every function ONE frame:
+/// entry RSP is the `STACK_BASE` constant, so a caller's frame slots and a
+/// callee's frame slots are the SAME addresses in the model's flat memory.
+/// The machine gives every ACTIVATION a frame - the model has one per
+/// function, the machine has one per activation. Witness (measured,
+/// `corpus/c/all.c` at `arity-wip` def1647, reproducible outside the
+/// harness): `o8_f` (`call_helper.O0::f`) spills to `0x7fff8`/`0x7fffc`,
+/// its callee `o8_h` spills to `0x7fffc`/`0x7fff8` - the same addresses -
+/// and the -O0 leg answers `3*(a*a+1)` where the machine answers
+/// `3*(a*a+b)`: h's frame clobbered f's slot for b. Recursion is the same
+/// defect through a self-call: every activation past the first shares one
+/// frame.
+///
+/// The rule, per subject `f` that touches at least one frame slot: for
+/// every `Op::Call { callee: Callee::Symbol(sym), .. }` naming a body this
+/// pipeline lifted, if `sym` is `f`'s own name (recursion) or `f`'s
+/// touched set intersects the callee's touched set, `f` is REFUSED. A
+/// callee with no lifted body - an import, a relocation naming no symbol -
+/// is NOT refused: nothing is known about its frame, and over-refusing on
+/// imports would punish every function that calls `memcpy`. The refusal is
+/// the whole slice: a frame model (an activation-keyed frame, the frame as
+/// an implicit parameter) is the named next step, not this change.
+///
+/// One reach refinement, MEASURED at corpus level (2026-11-08): the literal
+/// set-intersection above also refused `tailcall_local.O0::f`, and t2
+/// MATCHED that function at `arity-wip` def1647 - it is one of the base
+/// 2452 comparisons the comparison set must keep. Its IR (dumped from this
+/// very gate) stores `b`/`a` to `0x7fffc`/`0x7fff8`, RELOADS BOTH BEFORE the
+/// call, calls `helper` at 0x34 and returns the call's value: the caller
+/// reads no shared slot after the call, so the callee's clobber is
+/// unobservable, and the refusal would cost what the defect's reach does
+/// not cover (the PE-slice rule: a refusal may only cost what its defect's
+/// reach covers, measured, not caution). So the rule is liveness-aware: a
+/// call site refuses its caller only if some LOAD of a shared address
+/// executes CONTROL-WISE AFTER the call - in the same block, at a later
+/// instruction, or in any block forward-reachable from the call's
+/// successors. That is exactly "the callee's activation overwrites a cell
+/// the caller is live on across the call", which is the defect. A call
+/// whose value is a `TailReturn` terminator (a modelled `jmp callee`:
+/// tailcall_local O1/O2/Oz, where clang really does tail-call) is skipped:
+/// the caller's activation dies at the jump, so nothing can be live across
+/// it. The `tail_call_leg` / `pre_load_caller` fixtures and the corpus
+/// census pin both directions.
+///
+/// Keyed by `Subject::cname`, which embeds the object index (`o8_f`), so a
+/// callee name resolves within its own object by construction - the same
+/// global map `protos_of` uses, and `Op::Call` carries that same name.
+pub fn frame_alias_map(subjects: &[Subject]) -> HashMap<String, Refusal> {
+    let touched: HashMap<&str, Vec<u64>> = subjects
+        .iter()
+        .map(|s| (s.cname.as_str(), frame_touched(&s.f)))
+        .collect();
+    let mut out: HashMap<String, Refusal> = HashMap::new();
+    for s in subjects {
+        let mine = &touched[s.cname.as_str()];
+        // No frame slots: nothing of this activation's can be aliased (the
+        // call_helper O1/O2/Oz legs - calls, no frame - keep emitting).
+        if mine.is_empty() {
+            continue;
+        }
+        // Frame-address LOADS with their control position, and the block
+        // successor graph the "after the call" reachability runs on.
+        let mut loads: Vec<(usize, usize, u64)> = Vec::new();
+        for (bi, b) in s.f.blocks.iter().enumerate() {
+            for (ii, ins) in b.instrs.iter().enumerate() {
+                if let Op::Load(_, a) = &ins.op {
+                    if let Some(x) = const_addr(&s.f, *a, 0) {
+                        if (STACK_BASE - FRAME_WINDOW..STACK_BASE).contains(&x) {
+                            loads.push((bi, ii, x));
+                        }
+                    }
+                }
+            }
+        }
+        let succ: Vec<Vec<rdec_core::ir::BbId>> =
+            s.f.blocks
+                .iter()
+                .map(|b| {
+                    let mut v = Vec::new();
+                    b.term.successors(&mut v);
+                    v
+                })
+                .collect();
+        'calls: for (bi, b) in s.f.blocks.iter().enumerate() {
+            // The call whose value the block's TAIL RETURN returns: the
+            // caller's activation dies at the machine's `jmp callee`, so
+            // clobbering its slots is unobservable - see the reach note.
+            let tail = match &b.term {
+                rdec_core::ir::Terminator::TailReturn(v) => *v,
+                _ => u32::MAX,
+            };
+            for (ii, ins) in b.instrs.iter().enumerate() {
+                let Op::Call {
+                    callee: Callee::Symbol(sym),
+                    ..
+                } = &ins.op
+                else {
+                    continue;
+                };
+                if ins.dest == tail {
+                    continue;
+                }
+                // Shared slots: self-recursion shares EVERY slot the
+                // function touches (one frame, two activations); an
+                // ordinary callee shares the intersection; an import (no
+                // lifted body) shares NOTHING - the model knows no frame
+                // for it, and over-refusing on imports would punish every
+                // function that calls `memcpy` (the anti-over-fire case).
+                let self_call = sym == &s.cname;
+                match touched.get(sym.as_str()) {
+                    Some(theirs) => {
+                        let inter: Vec<u64> = mine
+                            .iter()
+                            .filter(|a| theirs.contains(a))
+                            .copied()
+                            .collect();
+                        if inter.is_empty() {
+                            continue;
+                        }
+                        let low = inter[0];
+                        if !live_load_after(&loads, &succ, bi, ii, &inter) {
+                            continue;
+                        }
+                        // A self-call is in this arm too (the subject's own
+                        // body is keyed by its own cname) - it gets the
+                        // recursion text, which names the self-call.
+                        let reason = if self_call {
+                            format!(
+                                "frame slots alias the callee's: {cname} calls itself and both \
+                                 frames use {low:#x} - the model has one frame per function, \
+                                 the machine has one per activation (recursion: activation 2 \
+                                 overwrites activation 1's slots)",
+                                cname = s.cname,
+                            )
+                        } else {
+                            format!(
+                                "frame slots alias the callee's: {} and {} both use {low:#x} - \
+                                 the model has one frame per function, the machine has one per \
+                                 activation",
+                                s.cname, sym,
+                            )
+                        };
+                        out.entry(s.cname.clone()).or_insert(Refusal {
+                            at: ins.addr,
+                            reason,
+                        });
+                        break 'calls;
+                    }
+                    None => {
+                        if !self_call {
+                            continue;
+                        }
+                        // Recursion: the second activation's frame IS the
+                        // first one. Same liveness bound: the recursive
+                        // call's spills overwrite the slots the caller reads
+                        // back on the way (the fib_rec shape).
+                        if !live_load_after(&loads, &succ, bi, ii, mine) {
+                            continue;
+                        }
+                        out.entry(s.cname.clone()).or_insert(Refusal {
+                            at: ins.addr,
+                            reason: format!(
+                                "frame slots alias the callee's: {cname} calls itself and both \
+                                 frames use {addr:#x} - the model has one frame per function, \
+                                 the machine has one per activation (recursion: activation 2 \
+                                 overwrites activation 1's slots)",
+                                cname = s.cname,
+                                addr = mine[0],
+                            ),
+                        });
+                        break 'calls;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Does a LOAD of any address in `shared` execute CONTROL-WISE AFTER the
+/// call at (block `bi`, instruction `ii`)? Same block at a later
+/// instruction, or any block forward-reachable from the call's successors.
+/// Forward reachability over-approximates "executes after" by the block
+/// (a load in a reachable block is a candidate; loops make it reach more,
+/// which is the sound direction for a refusal), and the within-block bound
+/// is what keeps `tailcall_local.O0::f` - all its loads before the call,
+/// no successor blocks - out of the refusal.
+fn live_load_after(
+    loads: &[(usize, usize, u64)],
+    succ: &[Vec<rdec_core::ir::BbId>],
+    bi: usize,
+    ii: usize,
+    shared: &[u64],
+) -> bool {
+    let mut reach: Vec<bool> = vec![false; succ.len()];
+    let mut stack: Vec<rdec_core::ir::BbId> = succ.get(bi).cloned().unwrap_or_default();
+    while let Some(b) = stack.pop() {
+        let b = b as usize;
+        if b < reach.len() && !reach[b] {
+            reach[b] = true;
+            stack.extend(succ[b].iter().copied());
+        }
+    }
+    loads.iter().any(|(lb, li, a)| {
+        shared.contains(a)
+            && ((lb == &bi && li > &ii) || (lb != &bi && reach.get(*lb).copied().unwrap_or(false)))
+    })
+}
+
 /// The call census, on the same footing as the SSE census: counted by the lifter
 /// at its own call site, so the modelled number and each refused class are
 /// auditable, and the refused classes are the work list. Summed over the
@@ -840,6 +1112,11 @@ pub fn cmd_c(args: &[String]) -> Result<i32, String> {
     std::fs::create_dir_all(&out_dir).map_err(|e| format!("{out_dir}: {e}"))?;
 
     let subjects = lift_all(&files)?;
+    // The frame-activation refusals, computed ONCE over the whole subject
+    // set (a callee's body has to be lifted before its caller can be judged)
+    // and consumed in the loop below, so the refused count, the class census
+    // and the record dump are the gate's own counters, not a second tally.
+    let frame_alias = frame_alias_map(&subjects);
     println!("{}", calls_line(&subjects));
     println!("{}", tail_line(&subjects));
     println!("{}", relocs_line(&subjects));
@@ -881,6 +1158,36 @@ pub fn cmd_c(args: &[String]) -> Result<i32, String> {
             }
             if first_pass_break.is_none() {
                 first_pass_break = Some(format!("{} :: {}: {}", s.obj, s.sym, errs.join("; ")));
+            }
+            continue;
+        }
+        // The frame-activation refusal (see `frame_alias_map`): a function
+        // whose frame slots alias its callee's - or alias its own recursion -
+        // emits C that computes the WRONG answer (one frame per function in
+        // the model, one per activation on the machine), so it must not reach
+        // the emitted set, and `rdec t2` (same rule, same map) keeps it out
+        // of the comparison. Refused, with the caller, the callee and a
+        // shared address named - never emitted, never silent.
+        if let Some(r) = frame_alias.get(&s.cname) {
+            refused += 1;
+            // Same record dump as an emitter refusal: the post-pass IR is the
+            // diagnosis of the aliasing, slot by slot.
+            if refused <= 3 {
+                let dump = format!("{out_dir}/refused_{refused}.ir");
+                let _ = std::fs::write(&dump, rdec_core::fmt_ir::format_function(&s.f));
+            }
+            *keys.entry(key(r)).or_default() += 1;
+            if all_classes {
+                println!(
+                    "refusal record: {} :: {} @ {:#x}: {}",
+                    s.obj, s.sym, r.at, r.reason
+                );
+            }
+            if first_refusal.is_none() {
+                first_refusal = Some(format!(
+                    "{} :: {} @ {:#x}: {}",
+                    s.obj, s.sym, r.at, r.reason
+                ));
             }
             continue;
         }
@@ -1110,6 +1417,269 @@ pub fn sse_line(sse: &std::collections::BTreeMap<String, u32>, zeroing: usize) -
         "  sse mnemonics counted: {tot} [{}] (scalar subset and packed data movement / lane-independent bitwise modelled, the rest refused by name; zeroing idiom: {zeroing})",
         parts.join(" ")
     )
+}
+
+#[cfg(test)]
+mod frame_alias_tests {
+    use super::{frame_alias_map, frame_touched, key, Subject};
+    use rdec_arch_x86::lift::{FnAbi, Report, STACK_BASE};
+    use rdec_core::emit_c::Refusal;
+    use rdec_core::ir::{Callee, Function, Op, Terminator};
+    use rdec_core::ty::Ty;
+    use std::collections::HashMap;
+
+    // The corpus's own slot addresses (measured in `corpus/c/all.c`:
+    // `call_helper.O0::f` spills to 0x7fff8/0x7fffc, `h` to the same pair).
+    const SLOT_A: u64 = STACK_BASE - 4; // 0x7fffc
+    const SLOT_B: u64 = STACK_BASE - 8; // 0x7fff8
+
+    fn subject(cname: &str, f: Function) -> Subject {
+        Subject {
+            obj: "fixture.obj".to_string(),
+            sym: cname.rsplit('_').next().unwrap_or(cname).to_string(),
+            cname: cname.to_string(),
+            start: 0x1000,
+            external: true,
+            f,
+            abi: FnAbi::integer(),
+            rep: Report::default(),
+            relocs_parsed: 0,
+        }
+    }
+
+    /// The `-O0` spill shape, minimal: store the parameter into the frame
+    /// slot `slot`, call each name in `callees` (result read, so the call
+    /// survives DCE-shaped passes), reload the slot and return it. Exactly
+    /// the shape `rdec c` emitted for `call_helper.O0::f`.
+    fn caller(cname: &str, slot: u64, callees: &[&str]) -> Function {
+        let mut f = Function::new(cname, 0x1000);
+        f.ret_ty = Ty::u64();
+        let bb = f.entry;
+        let p = f.emit(bb, Op::Param, Ty::u64(), 0x1000);
+        f.params.push(p);
+        f.param_tys.push(Ty::u64());
+        let a = f.emit(bb, Op::Const(slot), Ty::u64(), 0x1001);
+        f.emit_void(bb, Op::Store(Ty::u64(), a, p), 0x1002);
+        for (i, c) in callees.iter().enumerate() {
+            f.emit(
+                bb,
+                Op::Call {
+                    callee: Callee::Symbol(c.to_string()),
+                    ret_ty: Ty::u64(),
+                    args: Box::new([p]),
+                    pure: false,
+                },
+                Ty::u64(),
+                0x1010 + i as u64,
+            );
+        }
+        let a2 = f.emit(bb, Op::Const(slot), Ty::u64(), 0x1020);
+        let v = f.emit(bb, Op::Load(Ty::u64(), a2), Ty::u64(), 0x1021);
+        f.block_mut(bb).term = Terminator::Return(v);
+        f
+    }
+
+    /// A leaf: spills its parameter into each of `slots`, reads them back,
+    /// returns the last read. `&[]` is the no-frame leg (call_helper O1/O2/Oz).
+    fn leaf(cname: &str, slots: &[u64]) -> Function {
+        let mut f = Function::new(cname, 0x2000);
+        f.ret_ty = Ty::u64();
+        let bb = f.entry;
+        let p = f.emit(bb, Op::Param, Ty::u64(), 0x2000);
+        f.params.push(p);
+        f.param_tys.push(Ty::u64());
+        let mut last = p;
+        for s in slots {
+            let a = f.emit(bb, Op::Const(*s), Ty::u64(), 0x2001);
+            f.emit_void(bb, Op::Store(Ty::u64(), a, p), 0x2002);
+            let a2 = f.emit(bb, Op::Const(*s), Ty::u64(), 0x2003);
+            last = f.emit(bb, Op::Load(Ty::u64(), a2), Ty::u64(), 0x2004);
+        }
+        f.block_mut(bb).term = Terminator::Return(last);
+        f
+    }
+
+    /// A MODELLED TAIL CALL: the block ends in `TailReturn(the call)`, so
+    /// the machine's `jmp callee` kills the caller's activation at the call.
+    /// `tailcall_local.O0::f` is this shape (t2 matched it at def1647).
+    fn tail_caller(cname: &str, slot: u64, callee: &str) -> Function {
+        let mut f = Function::new(cname, 0x1000);
+        f.ret_ty = Ty::u64();
+        let bb = f.entry;
+        let p = f.emit(bb, Op::Param, Ty::u64(), 0x1000);
+        f.params.push(p);
+        f.param_tys.push(Ty::u64());
+        let a = f.emit(bb, Op::Const(slot), Ty::u64(), 0x1001);
+        f.emit_void(bb, Op::Store(Ty::u64(), a, p), 0x1002);
+        let c = f.emit(
+            bb,
+            Op::Call {
+                callee: Callee::Symbol(callee.to_string()),
+                ret_ty: Ty::u64(),
+                args: Box::new([p]),
+                pure: false,
+            },
+            Ty::u64(),
+            0x1010,
+        );
+        f.block_mut(bb).term = Terminator::TailReturn(c);
+        f
+    }
+
+    /// The MEASURED corpus leg, hermetic twin: a PLAIN call (clang at -O0
+    /// does not tail-call) whose caller reloads the slot BEFORE the call and
+    /// returns the callee's answer - `tailcall_local.O0::f`. The callee
+    /// clobbers the slot, and nobody reads it after.
+    fn pre_load_caller(cname: &str, slot: u64, callee: &str) -> Function {
+        let mut f = Function::new(cname, 0x1000);
+        f.ret_ty = Ty::u64();
+        let bb = f.entry;
+        let p = f.emit(bb, Op::Param, Ty::u64(), 0x1000);
+        f.params.push(p);
+        f.param_tys.push(Ty::u64());
+        let a = f.emit(bb, Op::Const(slot), Ty::u64(), 0x1001);
+        f.emit_void(bb, Op::Store(Ty::u64(), a, p), 0x1002);
+        let a2 = f.emit(bb, Op::Const(slot), Ty::u64(), 0x1003);
+        f.emit(bb, Op::Load(Ty::u64(), a2), Ty::u64(), 0x1004);
+        let c = f.emit(
+            bb,
+            Op::Call {
+                callee: Callee::Symbol(callee.to_string()),
+                ret_ty: Ty::u64(),
+                args: Box::new([p]),
+                pure: false,
+            },
+            Ty::u64(),
+            0x1010,
+        );
+        f.block_mut(bb).term = Terminator::Return(c);
+        f
+    }
+
+    /// (a) The aliasing direction: a caller with a frame slot at
+    /// STACK_BASE-4 calling a callee that touches the same address is
+    /// refused, and the refusal names the callee and the shared address -
+    /// the text is the map, "which function, which address" is the whole
+    /// question a frame-activation refusal has to answer.
+    #[test]
+    fn a_caller_whose_frame_slot_aliases_its_callees_is_refused_naming_both() {
+        let subjects = vec![
+            subject("o8_f", caller("o8_f", SLOT_A, &["o8_h"])),
+            subject("o8_h", leaf("o8_h", &[SLOT_A, SLOT_B])),
+        ];
+        let m = frame_alias_map(&subjects);
+        let r: &Refusal = m
+            .get("o8_f")
+            .expect("the caller must be refused: frame slots alias the callee's");
+        assert_eq!(key(r), "frame slots alias the callee's");
+        assert!(
+            r.reason.contains("o8_f and o8_h"),
+            "the refusal names caller and callee: {}",
+            r.reason
+        );
+        assert!(
+            r.reason.contains(&format!("{SLOT_A:#x}")),
+            "the refusal names a shared address: {}",
+            r.reason
+        );
+        // The callee calls nothing: it is not refused for being aliased INTO.
+        assert!(!m.contains_key("o8_h"));
+        // The touched sets the check runs on, in the window's sorted order.
+        assert_eq!(frame_touched(&subjects[0].f), vec![SLOT_A]);
+        assert_eq!(frame_touched(&subjects[1].f), vec![SLOT_B, SLOT_A]);
+    }
+
+    /// (b) The anti-over-fire direction, all three shapes: a callee whose
+    /// lifted body touches NO frame slot, a callee that is an import (no
+    /// lifted body at all - nothing is known about its frame), and disjoint
+    /// frames. None of these may cost the caller an emission; a check that
+    /// refuses every function with frame slots reddens this test, and the
+    /// corpus's `memcpy` callers are the shape it would punish.
+    #[test]
+    fn a_caller_is_not_refused_when_the_callee_touches_no_slot_or_has_no_body() {
+        let no_frame_callee = vec![
+            subject("o2_f", caller("o2_f", SLOT_A, &["o2_g"])),
+            subject("o2_g", leaf("o2_g", &[])),
+        ];
+        assert!(
+            !frame_alias_map(&no_frame_callee).contains_key("o2_f"),
+            "a callee with no frame slots aliases nothing"
+        );
+        let import_callee = vec![subject("o3_f", caller("o3_f", SLOT_A, &["printf"]))];
+        assert!(
+            !frame_alias_map(&import_callee).contains_key("o3_f"),
+            "an import callee (no lifted body) must not cause a refusal"
+        );
+        let disjoint = vec![
+            subject("o5_f", caller("o5_f", SLOT_A, &["o5_g"])),
+            subject("o5_g", leaf("o5_g", &[SLOT_B])),
+        ];
+        assert!(
+            !frame_alias_map(&disjoint).contains_key("o5_f"),
+            "disjoint frames do not alias"
+        );
+        // The reach refinement, hermetic twin: a MODELLED TAIL CALL into the
+        // same slot. The caller's activation is dead at the machine's
+        // `jmp callee`, the emitted C (`return o7_g(...)`) has the same
+        // property, and `tailcall_local.O0::f` is a BASE t2 comparison - the
+        // refusal may not cost what the defect's reach does not cover.
+        let tail = vec![
+            subject("o7_f", tail_caller("o7_f", SLOT_A, "o7_g")),
+            subject("o7_g", leaf("o7_g", &[SLOT_A])),
+        ];
+        assert!(
+            !frame_alias_map(&tail).contains_key("o7_f"),
+            "a modelled tail call shares slots the caller cannot live to read"
+        );
+        // The -O0 measured leg: a PLAIN call whose caller loaded the shared
+        // slot BEFORE the call. `tailcall_local.O0::f` is exactly this IR
+        // (dumped from the gate): all its frame loads precede the call, so
+        // the callee's clobber is unobservable and the emission stands.
+        let pre_load = vec![
+            subject("o7_h", pre_load_caller("o7_h", SLOT_A, "o7_i")),
+            subject("o7_i", leaf("o7_i", &[SLOT_A])),
+        ];
+        assert!(
+            !frame_alias_map(&pre_load).contains_key("o7_h"),
+            "a shared slot the caller reads only BEFORE the call is not a live clobber"
+        );
+    }
+
+    /// (c) The recursion leg: `f` calling `f` with frame slots shares one
+    /// frame between activations, and the text must say so (self), not name
+    /// a second function. A recursion WITHOUT frame slots aliases no slot
+    /// and must keep emitting (the fib_rec non-frame legs are that shape).
+    #[test]
+    fn a_self_recursive_function_with_frame_slots_is_refused_naming_the_self_call() {
+        let subjects = vec![subject("o9_f", caller("o9_f", SLOT_B, &["o9_f"]))];
+        let m = frame_alias_map(&subjects);
+        let r = m
+            .get("o9_f")
+            .expect("recursion aliases the caller's own frame");
+        assert_eq!(key(r), "frame slots alias the callee's");
+        assert!(
+            r.reason.contains("calls itself"),
+            "the recursion text must name the self call: {}",
+            r.reason
+        );
+        assert!(
+            r.reason.contains(&format!("{SLOT_B:#x}")),
+            "the recursion text names a shared slot: {}",
+            r.reason
+        );
+        // Recursion with no frame slots: nothing of the activation's to alias.
+        // The store sits ABOVE the window (the data region), so `f` touches
+        // no frame slot at all.
+        let no_frame = vec![subject(
+            "o9_g",
+            caller("o9_g", STACK_BASE + 0x1000, &["o9_g"]),
+        )];
+        let m2: HashMap<String, Refusal> = frame_alias_map(&no_frame);
+        assert!(
+            !m2.contains_key("o9_g"),
+            "recursion without frame slots aliases no slot: {m2:?}"
+        );
+    }
 }
 
 #[cfg(test)]

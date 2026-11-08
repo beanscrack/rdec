@@ -981,12 +981,24 @@ pub fn cmd_t2(args: &[String]) -> Result<i32, String> {
     let protos = m4::protos_of(&subjects);
     let texts: Vec<Result<rdec_core::emit_c::Out, Vec<rdec_core::emit_c::Refusal>>> =
         subjects.iter().map(|s| emit_c_sig(&s.f, &protos)).collect();
+    // The frame-activation refusals, THE SAME MAP `rdec c` consumes: a
+    // function whose frame slots alias its callee's (or its own recursion)
+    // emits C that computes the wrong answer, so T2 must not compare it -
+    // counted as refused by the emitter, and kept OUT of the includable
+    // definitions below, so a caller of a refused callee lands in the loud
+    // "calls a symbol we do not model" bucket instead of running the
+    // aliasing frame.
+    let frame_alias = m4::frame_alias_map(&subjects);
     // Which definitions may sit in the one TU: a definition only if EVERY
     // symbol its text calls extern is itself an includable definition (the
     // least fixpoint: drop a text whose extern names a dropped text, repeat).
     // `extern int f(void);` without a definition links nowhere, and a T2 side
     // that does not link compares nothing.
-    let mut include: Vec<bool> = texts.iter().map(|t| t.is_ok()).collect();
+    let mut include: Vec<bool> = texts
+        .iter()
+        .enumerate()
+        .map(|(i, t)| t.is_ok() && !frame_alias.contains_key(&subjects[i].cname))
+        .collect();
     let idx_of: std::collections::HashMap<&str, usize> = subjects
         .iter()
         .enumerate()
@@ -1056,6 +1068,16 @@ pub fn cmd_t2(args: &[String]) -> Result<i32, String> {
             refused += 1;
             continue;
         };
+        if frame_alias.contains_key(&s.cname) {
+            // The frame-activation refusal, same rule and same map as
+            // `rdec c`: this function's emitted C answers wrong when it runs
+            // (the callee's activation overwrites the caller's frame slots -
+            // the model has one frame per function, the machine one per
+            // activation), so its vectors are NOT compared. Counted in the
+            // emitter-refused bucket, which the gate prints verbatim.
+            refused += 1;
+            continue;
+        }
         if let Some(miss) = out
             .externs
             .iter()
