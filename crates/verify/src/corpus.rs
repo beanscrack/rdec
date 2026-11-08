@@ -227,6 +227,48 @@ pub const SNIPPETS: &[Snippet] = &[
         exercises: "read-mostly over a caller buffer: MUST NOT write; a spurious store is a miscompile",
         code: "long long f(const long long *b) { long long s = b[0] + b[1] * 2 + b[2] * 3 + b[3] * 4; return s; }",
     },
+    // THE TAIL-CALL / NORETURN WITNESSES (M3's exercise floor, `cmd_c`). The
+    // model shipped pinned by hand-built bytes in `crates/arch-x86/tests/
+    // tail_calls.rs` while every floor printed `tail calls: 0 | noreturn calls:
+    // 0` — an unexercised feature is an unmeasured one, and the gate now fails
+    // on that. Shapes MEASURED on clang 22, `llvm-objdump -d -r` as ground
+    // truth, per -O level:
+    //   tailcall_local    O0 `callq helper`; O1/O2/Oz `jmp helper` with
+    //                       IMAGE_REL_AMD64_REL32 -> `helper`, a symbol THIS
+    //                       object DEFINES -> the modelled tail-call bucket.
+    //                       `noinline` is load-bearing: clang inlines a visible
+    //                       helper at O1+ and the `jmp` never exists.
+    //   tailcall_external O0 `callq ext`; O1/O2/Oz `jmp ext` with REL32 ->
+    //                       `ext`, which this object does NOT define -> the "no
+    //                       callable callee" bucket, where the honest answer is
+    //                       a refusal: emitting `return ext(a + 1);` needs a
+    //                       prototype, and inventing one is a silent miscompile.
+    //   noreturn_call     all four levels `callq abort` with REL32 -> `abort`.
+    //                       The abort leg is `x > 100`, which the differential's
+    //                       vectors never drive, so the function stays
+    //                       value-comparable while its CFG still needs the
+    //                       noreturn rule: the block ENDS at the call, and
+    //                       discovery does not run off the end of `f` into
+    //                       whatever follows in .text. `abort` is declared here
+    //                       with the noreturn attribute, so the corpus stays
+    //                       header-free and the front end is the one that
+    //                       declared it — the model reads noreturn from the
+    //                       callee's name, it never infers it from IR shape.
+    Snippet {
+        name: "tailcall_local",
+        exercises: "sibling call to a function this object defines: `jmp helper` + a relocation naming it, the tail-call CFG and the return-with-callee's-answer model",
+        code: "__attribute__((noinline)) long helper(long a, long b) { return a * 3 + b; } long f(long a, long b) { return helper(a, b); }",
+    },
+    Snippet {
+        name: "tailcall_external",
+        exercises: "sibling call to a symbol this object does NOT define: `jmp ext` - the refusal bucket, where a prototype would have to be invented",
+        code: "extern long ext(long); long f(long a) { return ext(a + 1); }",
+    },
+    Snippet {
+        name: "noreturn_call",
+        exercises: "call to a noreturn callee mid-function: `call abort` on a leg the vectors never take, so CFG must end the block at the call",
+        code: "__attribute__((noreturn)) void abort(void); long f(long x) { if (x > 100) abort(); return x * 2; }",
+    },
 ];
 
 pub const OPTS: &[&str] = &["O0", "O1", "O2", "Oz"];

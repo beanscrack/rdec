@@ -1328,28 +1328,31 @@ relocations is the only route, which is why vtable dispatch stays last.
 2. T2 for C++: float/pointer args in the differential - emission is not value-equivalence.
 3. The 57 C refusals (call-clobber, `cdq`, `imul`, `div`, `lea` naming) and the 23 C++ ones.
 
-## Gate ledger — every gate, one line, measured 2026-11-02 (tree `77e363c`)
+## Gate ledger — every gate, one line, opened 2026-11-02 (tree `77e363c`), rows re-read from the gates 2026-11-08
 
 Written because the roadmap recorded milestones as they were opened and left several of
 their gate verdicts unstated. Each row is the command, the verdict from running it, and
-what closing means. `grep -ric "noreturn\|tail_call\|jump_table" crates/arch-x86/src/
-lift.rs crates/arch-x86/src/discover.rs` returns 0 — that is the evidence for M3's
-"not done" items below, not a memory.
+what closing means. Rows are re-read from the command, not from memory, and a row that
+disagrees with a section below it is a bug in the row: the sections are dated records,
+this table is the live contract. The 2026-11-08 re-read found three rows stale — M1
+discovery (RED at 97.88% -> GREEN at 100.00%), M3 noreturn/tail calls (NOT DONE ->
+landed, with a corpus that exercises none of it), and the T2 fault story — which is why
+the date and the tree are in the heading: a row is a measurement with an expiry.
 
 | gate | command | verdict | closing condition |
 |---|---|---|---|
 | M1 step 1 decode/load | `rdec objdump-check --corpus` | **GREEN** — 124/124 boundary agreement | closed |
-| M1 step 2 discovery | `rdec discover --corpus` | **RED, by design** — 124/124 functions, coverage 97.88% vs the 99.5% requirement, 126 bytes in 2 runs, 2 indirect branches unclassified | jump-table recovery resolves those 2 sites; the threshold is not moved |
+| M1 step 2 discovery | `rdec discover --corpus` | **GREEN — closed** (re-read 2026-11-08; this row said RED at 97.88% while section `:1562` had already recorded the closure, so the row was the stale one): 136 objects, 140 symbol-table functions, **0 missing, 0 extra starts**, coverage **6764/6764 non-padding code bytes = 100.00%**, uncovered 0 bytes in 0 runs, jump tables **2 recovered from relocations (12 slots, 12 targets, 0 unresolved)**, gaps none, exit 0. The 126 bytes in 2 runs that held M1 open were the 2 switch bodies reached only through a jump table, closed by target resolution (`f2fe789`). The 99.5% threshold was never moved to fit a measurement. | closed |
 | M2 step 1 lifter | `rdec lift --corpus` | **CLOSED — recorded late.** Criterion was "every lifted function is valid IR"; it printed `FAIL: 40 lifted functions are not valid IR` at step 1, and now prints `141 functions lifted, 141 pass verify_ssa`, exit 0. It became true at `aa0d8e7` (M3 step 1) and the roadmap never said so. | closed |
 | M3 step 1 SSA | `rdec lift --corpus` | **GREEN** — 141/141 valid IR; strict interpreter: 0 uses of a value never defined | closed |
 | M3 step 2 block splitting | `rdec lift --corpus` | **GREEN** — loops lift; Exits 64 -> 27, clean functions 63 -> 85 | closed |
-| M3 noreturn / tail calls / jump-table targets | (no gate exists yet) | **NOT DONE** — zero handling in the lifter or discovery; the roadmap moved these into M3 (`ROADMAP.md:363-367`) and they were never built. A `jmp` to a known entry is still a call-shaped exit; `abort`/`__fastfail` are not noreturn, so CFG recovery is wrong at those. | gate first, then the feature: a fixture per item, red, then green |
+| M3 noreturn / tail calls / jump-table targets | census + three floors inside `rdec c --corpus` | **LANDED, corpus witnesses present** (2026-11-08; the row before this one said "NOT DONE — zero handling" on the evidence of a `grep -ric` that returned 0, where the live count in `lift.rs` is 53). Jump-table resolution closed M1. Census now: **`tail calls: 3 modelled | 3 with no callable callee | noreturn calls: 4`** (`0xf -> abort`, `0x12 -> abort` x3) from the `tailcall_local` / `tailcall_external` / `noreturn_call` snippets. `cmd_c` FAILS on `tail + tail_unnamed == 0`, on `noreturn == 0`, and on any census site whose name `noreturn_symbol` does not declare — floor 3 exists because a sabotage that declared EVERY import noreturn moved one corpus function into `__builtin_unreachable()` and passed every other gate. The fixture found the real hole: the noreturn arm needed a signature entry, imports have none (`U abort`: no section, no size, no address), and in a linked binary every name in the termination family IS an import — the declaration is now made from the relocation's name, for imports only, `typed: false`, defines nothing. The emitted C is `o100_abort(x0,x1,x2,x3); __builtin_unreachable();` under an `__attribute__((noreturn))` declaration. | C++ corpus sites (that corpus imports no family name — measured with `llvm-nm`), and the `jmp`-to-import refusal class growing past 3 |
 | M3 stable IDs | (no gate exists yet) | **NOT DONE** — IR value numbers are per-function and not stable across passes, so cross-pass diffing is not available | needs a stable-id invariant pinned by a test |
-| M4 C emitter | `rdec c --corpus` | **RED, by design** — 140 lifted / **119 emitted** / **21 refused** / 0 invalid after passes; clang -Werror OK. Classes now: 8 call-clobber, 6 `lea` of an unnameable address, 4 `lea` naming `.rdata`, 2 live-in `Rsp`, 1 `shufps` (packed SIMD, M8). The arithmetic classes are **gone**: 10 `cdq`, 6 `imul`, 4 `div` landed 2026-11-08 (accumulator forms, silicon-quoted fixtures in `acc_forms.rs`). Remaining named gaps: the 128-bit `rdx:rax` dividend of `div`/`idiv r/m64`, quotient overflow (`#DE`), CF/OF after a 32-bit `mul`/`imul` (declared undefined) | refusals -> 0 with every gap named in between |
-| T2 differential, C | `rdec t2 --corpus` | **GREEN as a sample** — 107 native drivers, compared **2260**, match **2260**, mismatch **0**. The 20 not-compared runs are ALL machine-side `#DE` (`exit 0xc0000094`, STATUS_INTEGER_DIVIDE_BY_ZERO) on `div_unsigned`/`divmod_signed` at vectors 1 and 22 — the zero-divisor vectors, where the machine traps, the interpreter faults `Fault::DivZero`, and the emitted C answers 0. The harness names the faulting side and excludes them from the match count, so "2260/2260" is a claim about the division cases the machine survives. Memory axis **408/408**, IR leg **408/408**. The +464 comparisons since 2026-11-07 are the four division/multiply families (`div_pow2`, `div_unsigned`, `divmod_signed`, `mul_wide` x 4 opt levels) that were refused before: signed `/` and `%`, unsigned `/`, the 64-bit `imul` high half and the magic-constant `imul r64,r/m64,imm32` are now machine-verified. | XMM0 class, more coverage, memory effects beyond the caller window |
+| M4 C emitter | `rdec c --corpus` | **RED, by design** — 156 lifted / **125 emitted** / **27 refused** / 0 invalid after passes; clang -Werror OK. Classes (measured with `RDEC_C_CENSUS_ALL=1`, each site named): 8 call-clobber, 6 `lea` of an unnameable address, 6 `lea` naming `.rdata` (all six are `switch_dense`/`switch_fallthrough` at O1/O2/Oz — the jump-table base), **3 `tail call to 'ext'`** + **1 `call to 'ext'`** (the new `tailcall_external` witnesses, one per -O level: the honest answer is a refusal, a prototype for an unnamed callee would be invented), 2 live-in `Rsp`, 1 `shufps` (packed SIMD, M8). Counts moved 140 -> 156 lifted and 21 -> 27 refused because the corpus grew 16 functions, 4 of them refusal witnesses. The arithmetic classes stay gone: 10 `cdq`, 6 `imul`, 4 `div` landed 2026-11-08 (`acc_forms.rs`). Remaining named gaps: the 128-bit `rdx:rax` dividend of `div`/`idiv r/m64`, quotient overflow (`#DE`), CF/OF after a 32-bit `mul`/`imul` (declared undefined) | refusals -> 0 with every gap named in between |
+| T2 differential, C | `rdec t2 --corpus` | **GREEN as a sample** — 111 native drivers, compared **2452**, match **2452**, mismatch **0**, differing only above bit 31: **0**. The 20 not-compared runs are ALL machine-side `#DE` (`exit 0xc0000094`, STATUS_INTEGER_DIVIDE_BY_ZERO) on `div_unsigned`/`divmod_signed` at vectors 1 and 22 — the zero-divisor vectors, where the machine traps, the interpreter faults `Fault::DivZero`, and the emitted C answers 0. The harness names the faulting side and excludes them from the match count, so "2452/2452" is a claim about the division cases the machine survives. Memory axis **408/408**, IR leg **408/408** (unchanged: the new snippets are pure return-value shapes). The **+192 since the 2260 measurement earlier today** is exactly 8 functions x 24 vectors — `tailcall_local::f` at four -O levels (its emitted C answers with `return helper(a, b);`, compared against the machine's sibling-call answer) and `noreturn_call::f` at four (the `abort(); __builtin_unreachable();` leg present, never driven, the return leg compared). The earlier +464 is recorded in the M4 slice below. | XMM0 class, more coverage, memory effects beyond the caller window |
 | T2 differential, C++ | `rdec t2 --cpp` | **GREEN as a sample** (measured 2026-11-08, after this slice's emitter change) — compared **856**, match **856**, mismatch **0**, not-compared **0**, over 18 RAX-class + 16 window-class + 5 XMM0-class functions; 22 native drivers, 2 decompiled runners, 0 restarts after faults. Return value and XMM0 bit pattern; the window class compares the return, not memory. This row re-reads the gate because `SDiv`/`SRem` now read their operands with the op's signedness, and the C++ corpus is where signed `/` and `%` reach the emitter from C++ types — the change is green on 856 C++ machine runs, not only on the C corpus. | memory effects; the window class compares the return, not the window |
 | M8 step 0 demangler | `rdec demangle --cpp` | **GREEN** — 68/68 supported symbols agree with `llvm-nm`, 1 template unsupported (named) | closed for the corpus; templates open |
-| M8 step 1-2 C++ through the pipeline | `rdec cpp --corpus` | **RED by design, improving** — lifted 78, valid 78/78, emitted C 62, refused 16; clang -Werror OK | refusals -> 0 |
+| M8 step 1-2 C++ through the pipeline | `rdec cpp --corpus` | **GREEN as a sample** (re-read 2026-11-08; the row said "RED by design — lifted 78, emitted 62, refused 16", which is a dated tree: the gate today prints **69 measured / 69 lifted / valid IR 69/69 / emitted C 64 / refused 5** and EXITS 0 with "the rest are named gaps"). Refusal classes: 4 `indirect call` (vtable dispatch, M8's next step), 1 call-clobber. This slice moved nothing here — measured: the C++ corpus imports no name in the noreturn family (`llvm-nm` over `corpus/cpp/*.obj`), and `corpus/cpp` is untouched by the slice, so the shared sig-table change cannot reach it. The row's old numbers are a corpus/gate history this table never recorded, which is what a dated row is for. | refusals -> 0 (4 vtable dispatches + 1) |
 | M8 step 3 C++ value-verified | `rdec t2 --cpp` | **GREEN as a sample** (row above) | — |
 | M8 remainder | — | **NOT DONE** — packed SIMD (refused by name: `paddd/paddq/psubd/pmuludq/pcmpeqd/shufps`, mask `andps/orps`, GPR `movd/movq`), vtable dispatch and virtual calls. Measured: this clang build names ZERO vftable symbols in `.obj`, so vtable identity needs `.rdata` + REL32 relocation recovery | relocation reader, then vtable identity, then `call [this+k]` |
 | M5 control-flow structuring | `e0dafc6` | **LANDED** — if/while/switch recovery; jump-table switch sites close M1's last gap; M6 readability on top: 75 goto / 202 labels (from 123/217) | remaining fall-through gotos are back edges + multi-parent joins |
@@ -1360,10 +1363,13 @@ lift.rs crates/arch-x86/src/discover.rs` returns 0 — that is the evidence for 
 
 The honest headline (updated 2026-11-08, floors above): closed structural gates
 (decode, lift, SSA — verify_ssa linear-time), a differential that proves returned
-values on the full emitted corpus (2260 comparisons, 0 mismatches, caller-buffer
-memory 408/408) and 856 C++ vectors, control-flow structuring landed (75 goto /
-202 labels across 97 emitted functions), the integer division and multiply
-families emitting and machine-verified (43 C refusals -> 21), a PE32+ loader
+values on the full emitted corpus (2452 comparisons, 0 mismatches, caller-buffer
+memory 408/408) and 856 C++ vectors, the corpus's first tail-call and noreturn
+witnesses sitting on an exercise floor that fails the build when a model has no
+corpus site, control-flow structuring landed (75 goto / 202 labels across 97
+emitted functions), the integer division and multiply
+families emitting and machine-verified (arithmetic refusals gone: 43 -> 21 on the
+old corpus, 27 on the 16-functions-larger one), a PE32+ loader
 reading a real linked EXE, and a proof track that now covers the ops the lifter
 can emit, three implementations deep. What remains: type recovery, whole-binary
 discovery, packed arithmetic + vtables, and the analyst loop — correctness is
@@ -2218,3 +2224,107 @@ faults, exactly as the machine #DEs), and the emitter's refusal claim was assert
 against text containing `/* refusal` when `emit_c` returns refusals as `Err` — so
 that leg had never run. Both tests were rewritten to read the real contract, and
 the rewritten legs are green.
+
+---
+
+### M3 slice 5 - the corpus grows its first tail-call and noreturn witnesses (2026-11-08)
+
+**The gap was the evidence, not the feature.** The tail-call and noreturn model
+shipped pinned by hand-built bytes in `crates/arch-x86/tests/tail_calls.rs`,
+whose own header records that the corpus had no site for them. Every floor since
+printed `tail calls: 0 modelled | noreturn calls: 0`, and the census doc comment
+stated it in the present tense as if that were a stable property. A feature no
+corpus reaches is a feature no gate measures.
+
+**Gate first.** `cmd_c` now carries three floors, all reading `tail_counts` —
+the same function that produced the census line printed above them, so a verdict
+and a print cannot disagree:
+1. *exercise*: `tail + tail_unnamed == 0` fails, naming the counts and the C
+   shape that would fix it. Run against the pre-slice corpus it printed the FAIL
+   verbatim — that red had to exist before any fixture was written.
+2. *noreturn exercise*: `noreturn calls == 0` fails.
+3. *anti-invention*: every symbol the noreturn census names must be a name
+   `lift::noreturn_symbol` declares. Floor 3 exists because of a sabotage, see
+   below.
+
+**The witnesses** (`crates/verify/src/corpus.rs`; manifest +12 objects, and no
+existing object hash moved, which is the deterministic-corpus design doing its
+job — a corpus change arrives as a manifest diff, not a silent behaviour
+change). Shapes measured per -O level with `llvm-objdump -d -r` as ground truth,
+quoted in the source comment:
+
+| snippet | measured | bucket |
+|---|---|---|
+| `tailcall_local` | O0 `callq helper`; O1/O2/Oz `jmp helper` + `IMAGE_REL_AMD64_REL32 helper`, a symbol this object DEFINES | the modelled tail call: `return helper(a, b);` |
+| `tailcall_external` | O0 `callq ext`; O1/O2/Oz `jmp ext` -> `ext`, NOT defined here | the refusal bucket: the object gives no callee, and inventing a prototype is a silent miscompile |
+| `noreturn_call` | all four levels `callq abort` -> `abort` (`U` in `llvm-nm`) | termination: the block ends at the call |
+
+`noinline` on `helper` is load-bearing: clang inlines a visible helper at O1+
+and the `jmp` never exists. The abort leg is `x > 100`, which the differential's
+vectors never drive, so the function stays value-comparable *while* its CFG needs
+the noreturn rule — a witness that pays for itself in two gates.
+
+**The fixture found a real hole.** `noreturn calls` stayed **0** while the CFG
+rule visibly fired (the census's `bytes past the end of bb2 … not lifted` lines
+appeared at exactly the post-`call` addresses). Cause: the noreturn arm requires
+a signature entry, and an import has none — `U abort` carries no section, no
+size, no address, so it never reaches the symbol table the declaration loop
+reads. M3's noreturn line names `abort exit _exit __stack_chk_fail __fastfail
+ExitProcess`, and in a linked binary **every one of those is an import**, so the
+feature was unreachable exactly where the milestone asked for it. The
+declaration is now made where declarations are made — the CLI's front-end table —
+from the NAME the relocation carries, for imports only (a defined symbol's entry
+wins), and only for names the table declares. `typed: false` + default ABI:
+declaring termination is a statement about CONTROL, not a return type the object
+never gave, so the call reads and clobbers the six argument registers and defines
+nothing.
+
+**What the emitted C says** (`corpus/c/all.c`, the point of the whole slice):
+
+```c
+extern void o100_abort(int64_t, int64_t, int64_t, int64_t) __attribute__((noreturn));
+...
+l1: /* at 0xf */
+    o100_abort((int64_t)x0, (int64_t)x1, (int64_t)x2, (int64_t)x3);
+    __builtin_unreachable(); /* rdec: the call never returns */
+```
+
+The arguments the machine code put in the registers, named; the block ends; the
+`return` survives on the leg that takes it. No fall-through into code that is not
+this function's.
+
+**MEASURED** (parent-run, un-piped, exit code = verdict):
+- `c --corpus`: 156 lifted / **125 emitted / 27 refused** / 0 invalid after
+  passes, clang -Werror OK. Refusals 21 -> 27 because the corpus grew 140 -> 156
+  functions, 4 of which are new refusal witnesses; the `noreturn_call` functions
+  EMIT. Classes: 8 call-clobber, 6 + 6 `lea` of an unnameable address (2 of them
+  `.rdata`), **3 `tail call to 'ext'`**, 2 live-in `Rsp`, 1 `call to 'ext'`, 1
+  `shufps`.
+- census: **`tail calls: 3 modelled | 3 with no callable callee | noreturn
+  calls: 4 | 0xf -> abort | 0x12 -> abort x3`**.
+- `objdump-check`: 156 symbols, 156 exact boundary matches, 0 mismatches.
+- `discover`: 148 objects, 156 functions, 0 missing, 0 extra starts, coverage
+  **6996/6996 = 100.00%**, and a new NAMED gap class — `call to a symbol this
+  object does not define (an import: the name is known, the code is not) 8` = 4
+  x `ext` + 4 x `abort`, counted rather than absorbed.
+- structuring census gains named goto reasons: `4 noreturn call`, `3 tail call`.
+
+**SABOTAGE, and the hole it opened.**
+- `noreturn: true` -> `false` in the new declaration: census reads 0, floor 2
+  goes RED with its message verbatim. The corpus witness, not a comment, is what
+  satisfies the gate.
+- Declare **every** import noreturn (delete the name-table condition) — the
+  invention direction, the dangerous one: census `noreturn calls: 5`
+  (`0xf -> ext`), emitted 130 / refused 26, coverage unchanged 100.00%,
+  discover exit 0. **Every gate above floor 3 passed.** One corpus function
+  changed from `Exit` to `__builtin_unreachable()`, and nothing measured it.
+  Floor 3 was written the same hour and reddens it: `FAIL: anti-invention floor
+  - the noreturn census names ["ext"], and the front end does not declare those
+  noreturn.`
+
+**Ledger consequence.** The M3 row flips from `NOT DONE — zero handling` — the
+row whose stated evidence was a `grep -ric` that returned 0, where the live
+count is 53 — to LANDED with corpus witnesses and a named remaining gap: the C++
+corpus is still all-zero on this line, because its functions are leaf arithmetic
+and the demangler's noreturn knowledge has no corpus site to land on. The M4 row
+is re-read at 156/125/27.

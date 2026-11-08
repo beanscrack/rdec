@@ -102,6 +102,10 @@ nested_if_tree	O0	corpus\obj\nested_if_tree.O0.obj	967	2f943b6fdeb6ce04
 nested_if_tree	O1	corpus\obj\nested_if_tree.O1.obj	687	f0e930f460d76885
 nested_if_tree	O2	corpus\obj\nested_if_tree.O2.obj	687	f0e930f460d76885
 nested_if_tree	Oz	corpus\obj\nested_if_tree.Oz.obj	687	818aba69090993e5
+noreturn_call	O0	corpus\obj\noreturn_call.O0.obj	904	60e4b38ef95c4e3a
+noreturn_call	O1	corpus\obj\noreturn_call.O1.obj	896	75545662f10ea974
+noreturn_call	O2	corpus\obj\noreturn_call.O2.obj	896	75545662f10ea974
+noreturn_call	Oz	corpus\obj\noreturn_call.Oz.obj	896	06c372adf2ebaed4
 read_only_words	O0	corpus\obj\read_only_words.O0.obj	918	87b14a2c888da8d1
 read_only_words	O1	corpus\obj\read_only_words.O1.obj	672	c80a2604a8732221
 read_only_words	O2	corpus\obj\read_only_words.O2.obj	672	c80a2604a8732221
@@ -138,3 +142,11 @@ switch_sparse	O0	corpus\obj\switch_sparse.O0.obj	984	17d6eedf3caf9b84
 switch_sparse	O1	corpus\obj\switch_sparse.O1.obj	716	eee9823551ed3ecd
 switch_sparse	O2	corpus\obj\switch_sparse.O2.obj	716	eee9823551ed3ecd
 switch_sparse	Oz	corpus\obj\switch_sparse.Oz.obj	709	d3ad0b4ec9d6b8ac
+tailcall_external	O0	corpus\obj\tailcall_external.O0.obj	917	416914f48a5f8769
+tailcall_external	O1	corpus\obj\tailcall_external.O1.obj	695	6700043ff4b0867e
+tailcall_external	O2	corpus\obj\tailcall_external.O2.obj	695	6700043ff4b0867e
+tailcall_external	Oz	corpus\obj\tailcall_external.Oz.obj	695	0aff47ee6c058f9e
+tailcall_local	O0	corpus\obj\tailcall_local.O0.obj	986	4b2c2e3b49260a2c
+tailcall_local	O1	corpus\obj\tailcall_local.O1.obj	691	3de5ac390c0c065d
+tailcall_local	O2	corpus\obj\tailcall_local.O2.obj	691	3de5ac390c0c065d
+tailcall_local	Oz	corpus\obj\tailcall_local.Oz.obj	681	0cb2120df606e079

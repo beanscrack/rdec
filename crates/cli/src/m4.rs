@@ -469,6 +469,41 @@ pub fn lift_all_named_shapes(
         // address. Built per object, in the same per-object virtual space as
         // `names`, the plan, and `data_map_of`.
         let relocs = reloc_map_of(&obj, oi, &idx_of, &base_of);
+        // THE TERMINATION FAMILY IS A FRONT-END DECLARATION, and in a linked object
+        // the family states itself only as a NAME. `abort`, `exit`, `_exit`,
+        // `__stack_chk_fail`, `__fastfail`, `ExitProcess` are `U` in `llvm-nm`:
+        // imports, with no section, no size, no address, so they never reach
+        // `names` and the loop above never declares them — which is precisely the
+        // case M3's noreturn line was written for, because in a real binary the
+        // termination family IS imported, and a block that falls through a
+        // `call exit` sends CFG recovery into whatever code follows. So the
+        // declaration is made here, from the name the relocation carries, for
+        // IMPORTS ONLY (a defined symbol's entry above wins), and only for names
+        // the front end declares: an import named `weird` gets nothing and keeps
+        // the loud `Exit`. `tail_calls.rs` pins both directions — the table names
+        // the family and nothing else, and the anti-invention test reddens if a
+        // noreturn is inferred from IR shape instead of read from the name.
+        for rt in relocs.values() {
+            if rt.addr.is_some()
+                || sigs.contains_key(rt.sym.as_str())
+                || !rdec_arch_x86::lift::noreturn_symbol(rt.sym.as_str())
+            {
+                continue;
+            }
+            sigs.insert(
+                rt.sym.clone(),
+                CalleeSig {
+                    cname: name_of(oi, rt.sym.as_str()),
+                    noreturn: true,
+                    // `typed: false`, and the default ABI: an import has no
+                    // prototype in the object, so the call reads and clobbers the
+                    // six argument registers and DEFINES NOTHING. Declaring
+                    // noreturn is a statement about control, not about a return
+                    // type the object never gave.
+                    ..Default::default()
+                },
+            );
+        }
         let relocs_parsed = obj.reloc_census().parsed;
 
         for (k, &start) in plan.functions.iter().enumerate() {
@@ -564,22 +599,37 @@ pub fn calls_line(subjects: &[Subject]) -> String {
 /// sites are the work list), and the instructions the lifter did not lift
 /// because their block's own terminator had already left the function.
 ///
-/// All four are 0 over the C and C++ corpora, and that is the measurement, not
-/// an assumption: `llvm-objdump -d -r` over the corpus finds 65 `jmp` sites, none
-/// carrying a relocation that names a defined function (the relocated ones name
-/// `__guard_x86` and `_tail_call_i386`), and 31 call sites, none to the
-/// termination family. The model is therefore pinned by
+/// For the corpus's whole first life all four read 0, and that was the
+/// measurement, not an assumption: `llvm-objdump -d -r` over the objects found
+/// 65 `jmp` sites, none carrying a relocation naming a defined function, and 31
+/// call sites, none to the termination family. The model was pinned by
 /// `crates/arch-x86/tests/tail_calls.rs`, whose fixtures quote their own
-/// `llvm-objdump -d -r`, and a non-zero number here is the day a corpus witness
-/// appears.
-pub fn tail_line(subjects: &[Subject]) -> String {
+/// `llvm-objdump -d -r`. `tailcall_local`, `tailcall_external` and
+/// `noreturn_call` are the corpus witnesses that ended that era (2026-11-08),
+/// and `cmd_c` now FAILS if the counts return to 0 — an unexercised feature is
+/// an unmeasured one. The C++ corpus is still all-zero on this line: its
+/// functions are leaf arithmetic, and the demangler's noreturn knowledge has no
+/// corpus site to land on either.
+///
+/// The four tail-call/noreturn counters, in one place, so the census LINE and
+/// the gate's floor assertion cannot disagree about what they measured. A gate
+/// that re-derives a number it also prints is a gate that can print 3 and fail
+/// on 2.
+pub fn tail_counts(subjects: &[Subject]) -> (usize, usize, usize, usize) {
     let (mut t, mut un, mut nr, mut past) = (0usize, 0usize, 0usize, 0usize);
-    let mut sites: Vec<(u64, String)> = Vec::new();
     for s in subjects {
         t += s.rep.tail_calls;
         un += s.rep.tail_calls_unnamed;
         nr += s.rep.noreturn_calls;
         past += s.rep.bytes_past_ended_block;
+    }
+    (t, un, nr, past)
+}
+
+pub fn tail_line(subjects: &[Subject]) -> String {
+    let (t, un, nr, past) = tail_counts(subjects);
+    let mut sites: Vec<(u64, String)> = Vec::new();
+    for s in subjects {
         sites.extend(s.rep.noreturn_sites.iter().cloned());
     }
     let mut line = format!(
@@ -865,6 +915,50 @@ pub fn cmd_c(args: &[String]) -> Result<i32, String> {
         // the number of functions whose C clang accepts is a real measurement,
         // and returning early used to hide it.
         println!("FAIL: a pass broke SSA in {pass_broken} functions: {p}");
+        return Ok(1);
+    }
+    // THE EXERCISE FLOOR. A feature the corpus never reaches is a feature no
+    // gate measures, and an unmeasured feature rots: the tail-call and noreturn
+    // model shipped pinned by hand-built bytes, with `tail calls: 0 | noreturn
+    // calls: 0` on every floor since. This floor makes that state fail. The
+    // numbers come from `tail_counts`, the same function that produced the
+    // census line printed above, so the verdict and the print cannot disagree.
+    let (tail, tail_unnamed, noreturn, _past) = tail_counts(&subjects);
+    if tail + tail_unnamed == 0 {
+        println!(
+            "FAIL: exercise floor - the corpus contains {tail} modelled tail calls and {tail_unnamed} tail calls with no callable callee, so nothing in the corpus exercises the tail-call model."
+        );
+        println!("      A corpus snippet must really sibling-call: `return callee(a, b);` where the definition is visible and the callee is `__attribute__((noinline))`, which clang compiles to `jmp callee` with a relocation naming a DEFINED symbol, and one external target (`jmp` to a symbol the object does not define) for the refusal bucket.");
+        return Ok(1);
+    }
+    if noreturn == 0 {
+        println!(
+            "FAIL: exercise floor - the corpus contains {noreturn} noreturn calls, so nothing in the corpus exercises the noreturn CFG rule (a call whose callee is declared noreturn ends the block; without it, CFG recovery runs off the end of one function into the next)."
+        );
+        println!("      A corpus snippet must really call one: `if (x > 100) abort();` keeps the abort leg off the vectors the differential drives and puts the `call abort` + its relocation in every -O level.");
+        return Ok(1);
+    }
+    // THE ANTI-INVENTION FLOOR, at corpus level. `tail_calls.rs` pins that
+    // noreturn is READ from the callee's declared name and never inferred from
+    // IR shape — and a sabotage that declared EVERY import noreturn (the
+    // invention direction, the dangerous one) moved exactly one corpus function
+    // and passed every gate above this line. That is the hole this closes: every
+    // site the noreturn census names must be a name the front-end table
+    // declares. Naming a callee that does come back as one that does not ends a
+    // live block with `__builtin_unreachable()`, which is a silent miscompile —
+    // the one failure mode this pipeline refuses to have.
+    let mut invented: Vec<String> = subjects
+        .iter()
+        .flat_map(|s| s.rep.noreturn_sites.iter().map(|(_, sym)| sym.clone()))
+        .filter(|sym| !rdec_arch_x86::lift::noreturn_symbol(sym.as_str()))
+        .collect();
+    invented.sort();
+    invented.dedup();
+    if !invented.is_empty() {
+        println!(
+            "FAIL: anti-invention floor - the noreturn census names {invented:?}, and the front end does not declare those noreturn."
+        );
+        println!("      The declared family is `abort exit _exit __stack_chk_fail __fastfail ExitProcess` (lift::noreturn_symbol). Termination is READ from that declaration, never inferred from the bytes or from a block that happens to have no successor.");
         return Ok(1);
     }
     if refused > 0 {
