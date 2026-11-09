@@ -1355,7 +1355,7 @@ the date and the tree are in the heading: a row is a measurement with an expiry.
 | M4 C emitter | `rdec c --corpus` | **RED, by design** — 156 lifted / **129 emitted** / **27 refused** / 0 invalid after passes. 129/27 is a FRESH measurement on this tree **and** on `40d14e1` (measured directly, clean worktree, objects regenerated) — so the row's previous **125 emitted** was STALE, carried over from a 152-function tree, and the tell was its own arithmetic: 125 + 27 = 152 against 156 lifted. Commit `cca1aa4` published "125 → 129 after the folded-SExt fix", which is FALSE — the fix moved no emitted count; corrected here. clang -Werror OK. Classes (measured with `RDEC_C_CENSUS_ALL=1`, each site named): 8 call-clobber, 6 `lea` of an unnameable address, 6 `lea` naming `.rdata` (all six are `switch_dense`/`switch_fallthrough` at O1/O2/Oz — the jump-table base), **3 `tail call to 'ext'`** + **1 `call to 'ext'`** (the new `tailcall_external` witnesses, one per -O level: the honest answer is a refusal, a prototype for an unnamed callee would be invented), 2 live-in `Rsp`, 1 `shufps` (packed SIMD, M8). Counts moved 140 -> 156 lifted and 21 -> 27 refused because the corpus grew 16 functions, 4 of them refusal witnesses. The arithmetic classes stay gone: 10 `cdq`, 6 `imul`, 4 `div` landed 2026-11-08 (`acc_forms.rs`). Remaining named gaps: the 128-bit `rdx:rax` dividend of `div`/`idiv r/m64`, quotient overflow (`#DE`), CF/OF after a 32-bit `mul`/`imul` (declared undefined), and **frame activation** — the model has one frame per function, the machine one per activation, and a caller whose frame slots a callee clobbers while it is live is now REFUSED, class `frame slots alias the callee's` (section 18). **Re-measured 2026-11-08 on branch `frame-activation`** (base `arity-wip` `def1647`, which took the row's 129/27 to **137/19** by closing the 8 `opaque: clobbered by call` sites): **156 lifted / 135 emitted / 21 refused / 0 invalid**, clang -Werror OK; classes (each site named): 6 `lea` unnameable | 6 `lea` naming `.rdata` | 3 `tail call to 'ext'` | **2 `frame slots alias the callee's`** (`call_helper.O0::f` and the self-recursive `fib_rec.O0::f`) | 2 live-in `Rsp` | 1 `call to 'ext'` | 1 `shufps`; `opaque: clobbered by call` is GONE | **frame activation: model the frame as an implicit parameter so each activation gets distinct memory** (the refusal is the stop-gap; section 18), then refusals -> 0 with every gap named in between. **Re-measured 2026-11-08 on branch `frame2`** (base `ab64a4d`, this box's clang 22.1.8, objects regenerated): **156 lifted / 135 emitted / 21 refused / 0 invalid**, census byte-identical to the row above (6 `lea` unnameable | 6 `lea` `.rdata` | 3 `tail call to 'ext'` | **2 `frame slots alias the callee's`** | 2 live-in `Rsp` | 1 `call to 'ext'` | 1 `shufps`; sum 21 = refused), clang -Werror OK. The gate gained a **`frame traffic:`** line — **49 functions on named slots | 3 with unbounded (indexed) frame traffic (`o65_f`, `o66_f`, `o67_f` = `locals_addressed`, all leaves) | 104 with no frame traffic**, a partition of the 156 that the corpus gate asserts. What changed is the row's STATUS as a contract: 135/21 was a clang-version fact (the CI runner's clang 20.1.8 printed **136 emitted / 20 refused / 1 invalid** on the parent commit, because one frame refusal keyed on a frame address the 20.1.8 codegen spelled with an index register), and it is now a rule fact — an unbounded (frame-rooted, unresolvable) access counts as a whole-window touch on every codegen (section 18.1) |
 | T2 differential, C | `rdec t2 --corpus` | **GREEN as a sample** — 112 harnesses over 115 runnable functions (**2472** planned comparisons), compared **2452**, match **2452**, mismatch **0**, differing only above bit 31: **0**. The 20 not-compared runs are ALL machine-side `#DE` (`exit 0xc0000094`, STATUS_INTEGER_DIVIDE_BY_ZERO) on `div_unsigned`/`divmod_signed` at vectors 1 and 22 — the zero-divisor vectors, where the machine traps, the interpreter faults `Fault::DivZero`, and the emitted C answers 0. The harness names the faulting side and excludes them from the match count, so "2452/2452" is a claim about the division cases the machine survives. Memory axis **408/408**, IR leg **408/408** (unchanged: the new snippets are pure return-value shapes). The **+192 since the 2260 measurement earlier today** is exactly 8 functions x 24 vectors — `tailcall_local::f` at four -O levels (its emitted C answers with `return helper(a, b);`, compared against the machine's sibling-call answer) and `noreturn_call::f` at four (the `abort(); __builtin_unreachable();` leg present, never driven, the return leg compared). The earlier +464 is recorded in the M4 slice below. **Re-measured 2026-11-08 on branch `frame-activation`** (base `arity-wip` `def1647`, where the arity slice took the tuple RED to **2607 | 2580 | 27 mismatch | 21** — the 27 all in `call_helper` 21/96 + `fib_rec` 6/59): the frame-activation refusal takes the two aliasing functions out of the compared set and the tuple is **2560 | 2560 | mismatch 0 | 20 not-compared**, exit 0 — **the base 2452 is untouched** (2560 = 2452 + 72 `call_helper` + 36 `fib_rec`; the refused `call_helper.O0::f` costs its 24 vectors and the refused `fib_rec.O0::f` its 23), memory axis **408/408**, IR leg **408/408** | XMM0 class, more coverage, memory effects beyond the caller window. **Re-measured 2026-11-08 on branch `frame2`** (base `ab64a4d`): tuple **UNMOVED at 2560 | 2560 | mismatch 0 | 20 not-compared**, exit 0, memory **408 | 408 | 0**, IR leg **408 | 408 | 0**, and a line-by-line diff of the gate's own output against the pre-fix run is EMPTY except the build's timing line — no function stopped being compared, because the widened rule's three unbounded functions (`locals_addressed`, see the M4 row) are leaves with no callee to alias with. The 20 `not compared` stay the machine-side `#DE` pair on `div_unsigned`/`divmod_signed` (section 18.1) |
 | T2 differential, C++ | `rdec t2 --cpp` | **GREEN as a sample** (measured 2026-11-08, after this slice's emitter change) — compared **856**, match **856**, mismatch **0**, not-compared **0**, over 18 RAX-class + 16 window-class + 5 XMM0-class functions; 22 native drivers, 2 decompiled runners, 0 restarts after faults. Return value and XMM0 bit pattern; the window class compares the return, not memory. This row re-reads the gate because `SDiv`/`SRem` now read their operands with the op's signedness, and the C++ corpus is where signed `/` and `%` reach the emitter from C++ types — the change is green on 856 C++ machine runs, not only on the C corpus. | memory effects; the window class compares the return, not the window |
-| M8 step 0 demangler | `rdec demangle --cpp` | **GREEN** — 68/68 supported symbols agree with `llvm-nm`, 1 template unsupported (named) | closed for the corpus; templates open |
+| M8 step 0 demangler | `rdec demangle --cpp` | **GREEN** — 69/69 supported symbols agree with `llvm-nm`, 0 unsupported: the `??$` template NAME demangles (`??$tmax@H@@YAHHH@Z` -> `int tmax<int>(int, int)`, section 20, 2026-11-08), so the name the gate used to filter out is now inside the agreement. Refused, each with a key naming the real construct: a class/struct taken by value (`?AV`/`?AU` — the key said "template argument list" until today, section 20.2), non-type template arguments (integral/enum constants, `$$0` packs, `$$V`), a template used as an argument, and a class-template scope (`?$Box@H`) | closed for the corpus; the by-value type model is the next demangler gap |
 | M8 step 1-2 C++ through the pipeline | `rdec cpp --corpus` | **GREEN as a sample** (re-read 2026-11-08; the row said "RED by design — lifted 78, emitted 62, refused 16", which is a dated tree: the gate today prints **69 measured / 69 lifted / valid IR 69/69 / emitted C 64 / refused 5** and EXITS 0 with "the rest are named gaps"). Refusal classes: 4 `indirect call` (vtable dispatch, M8's next step), 1 call-clobber. This slice moved nothing here — measured: the C++ corpus imports no name in the noreturn family (`llvm-nm` over `corpus/cpp/*.obj`), and `corpus/cpp` is untouched by the slice, so the shared sig-table change cannot reach it. The row's old numbers are a corpus/gate history this table never recorded, which is what a dated row is for. | refusals -> 0 (4 vtable dispatches + 1) |
 | M8 step 3 C++ value-verified | `rdec t2 --cpp` | **GREEN as a sample** (row above) | — |
 | M8 remainder | — | **NOT DONE** — packed SIMD (refused by name: `paddd/paddq/psubd/pmuludq/pcmpeqd/shufps`, mask `andps/orps`, GPR `movd/movq`), vtable dispatch and virtual calls. Measured: this clang build names ZERO vftable symbols in `.obj`, so vtable identity needs `.rdata` + REL32 relocation recovery | relocation reader, then vtable identity, then `call [this+k]` |
@@ -3653,3 +3653,197 @@ accepts, and that filter is part of the decision.
 
 Nothing in the clang corpus floors moves from this; the 6 MSVC records and the 12 clang records
 stay in the census, loud, until the address space is chosen.
+
+## 20. M8 demangler: template NAMES demangle, and the census key that blamed a template for a class return (measured 2026-11-08, branch `demangle-template`, base `6523cdc`)
+
+Two changes in `crates/demangle`, one measurement of what they moved, and one coverage
+finding about the gate that is supposed to catch them.
+
+### 20.1 The gap that was real: `??$tmax@H@@YAHHH@Z` had no name
+
+`parse()` refused every `??$` identifier with `template argument list (name '{id}')`, so the
+corpus's instantiated template landed in `1 Unsupported` and in `12 under the integer model`.
+The ground truth, from the toolchain on this box:
+
+```text
+$ llvm-nm corpus/cpp/obj/template_gap.O0.obj
+00000000 T ??$tmax@H@@YAHHH@Z
+$ llvm-nm --demangle corpus/cpp/obj/template_gap.O0.obj
+00000000 T int __cdecl tmax<int>(int, int)
+```
+
+The encoding is `??$ <base> @ <args> @` and the args are **type encodings of exactly the kinds
+`parse_type` already read** — so the implementation is a base-name check plus a loop over
+`parse_type`, and the code field after the args is the ordinary signature. `template_arguments`
+stops at the first `@` a type did not consume, which is what makes the scope after the list
+behave identically to a plain `?name@scope@@` name. Reusing `parse_type` is the point: a
+template argument and a parameter can never disagree about what `H`, `PEA..`, `AE..`, `W4Kind@@`,
+`UWidget@@` or the `0`..`5` repeat digits mean.
+
+Supported (16 measured pairs in `MEASURED_TEMPLATES`, every one compiled with
+`clang++ -std=c++17 -O0 -target x86_64-pc-windows-msvc` and paired against
+`llvm-nm --defined-only -g [--demangle]`, encodings quoted from the plain leg):
+
+```text
+??$tmax@H@@YAHHH@Z                 ->  int __cdecl tmax<int>(int, int)              [the corpus witness]
+??$tmax@_J@@YA_J_J0@Z               ->  __int64 __cdecl tmax<__int64>(__int64, __int64)   [repeat digit inside the args]
+??$pick2@IH@@YAIIH@Z                ->  unsigned int __cdecl pick2<unsigned int, int>(unsigned int, int)
+??$idp@H@@YAPEAHPEAH@Z              ->  int * __cdecl idp<int>(int *)
+??$idr@H@@YAAEAHAEAH@Z              ->  int & __cdecl idr<int>(int &)
+??$ide@W4Kind@@@@YA?AW4Kind@@W40@@Z ->  enum Kind __cdecl ide<enum Kind>(enum Kind)
+??$uses@PEAUWidget@@@@YAH...        ->  int __cdecl uses<struct Widget *>(struct Widget *)
+??$tclamp@H@geo@@YAHH@Z             ->  int __cdecl geo::tclamp<int>(int)            [scope AFTER the args]
+??$tf@H@Plain@@QEAAHH@Z             ->  public: int __cdecl Plain::tf<int>(int)      [member template: kind carries the class]
+??$st@H@Pair@@SAHH@Z                ->  public: static int __cdecl Pair::st<int>(int)
+```
+
+The C++ gate prints names **without** the calling convention (it prints `int classify(int)` for
+`?classify@@YAHH@Z`), so the demangler renders `int tmax<int>(int, int)` and the llvm-nm leg
+normalizes the convention. The kind is `FreeFunction`/`MemberFunction{class, constness}`/
+`StaticMember` exactly as for a non-template function, because the code field is unchanged — M8
+pattern-matches on the kind, not the text.
+
+Still refused, each naming the construct (encodings quoted from `llvm-nm`'s plain leg, with what
+the demangled leg prints, so every refusal is a claim about a real shape):
+
+| encoding | llvm-nm says | refusal key |
+| --- | --- | --- |
+| `??$nontype@$04@@YAHH@Z` | `int __cdecl nontype<5>(int)` | `non-type template argument '$04': needs the value model (…)` |
+| `??$cn@$0A@@@YAHH@Z` | `int __cdecl cn<0>(int)` (scoped-enum constant) | `non-type template argument '$0A': …` |
+| `??$f@$$V@@YAHXZ` (SYNTHETIC) | — | `non-type template argument '$$V': …` (the `$$0` pack family) |
+| `??$ttf@UBox@@H@@YAHU?$Box@H@@@Z` | `int __cdecl ttf<struct Box, int>(struct Box<int>)` | `template in class scope` |
+| `??$nest@D@?$Outer@H@@QEAADD@Z` | `char __cdecl Outer<int>::nest<char>(char)` | `template in a class scope name ('?$...')` |
+| `?get@?$Box@H@@QEAAHXZ` | `public: int __cdecl Box<int>::get(void)` | `template in a class scope name ('?$...')` |
+| `??0?$Ctor@H@@QEAA@H@Z` | `public: __cdecl Ctor<int>::Ctor(int)` | `template in a class scope name ('?$...')` |
+| `??$?0H@W@@QEAA@H@Z` | `public: __cdecl W::W<int>(int)` | `member template name '??$?0H@W'` |
+| `??$idc@UWidget@@@@YA?AUWidget@@U0@@Z` | `struct Widget __cdecl idc<struct Widget>(struct Widget)` | the by-value key, 20.2 — the NAME parses, the class return is the gap |
+
+Two of those refusals used to lie. A `?$` scope segment contains `?`, so `Box<int>::get` refused
+as **"anonymous namespace or local-static label"**, and the glued ctor path never reached the
+scope code at all. Both now name the class template, and `parse_named_type`'s `?$` test runs
+BEFORE its `?` test for the same reason.
+
+### 20.2 The census key that blamed a template for a class return
+
+`crates/demangle/src/lib.rs:385` returned `"template argument list"` for a TYPE-position `?AV` /
+`?AU` — and `lib.rs:1287` asserted exactly that for `?f@@YA?AVWidget@@@Z`. That name contains no
+template: llvm-nm prints `class Widget __cdecl f(void)`, a function RETURNING a class by value,
+and the C++ leg's own IR gap for the same shape was already keyed honestly as
+`by-value struct argument (needs the type model)`. The key is now
+
+```text
+class/struct type in a signature ('?AV...'): needs the by-value type model
+class/struct type in a signature ('?AU...'): needs the by-value type model
+```
+
+(a refusal still — no invented type, no guessed layout; the letter is in the key so the two
+encodings do not merge). This is what the census-key rule looks like in practice: the old single
+key mixed a template-name gap with a class-type gap, so the `1 Unsupported` bucket pointed one
+reader at the template grammar and another at the type model, and both were right.
+
+### 20.3 The counts, before / after 1 / after 2 (this box, clang 22.1.8, `corpus/cpp` regenerated in-lane)
+
+| line | before (`6523cdc`) | after (1 + 2 land together) |
+| --- | --- | --- |
+| `census:` | `69 defined MSVC-decorated function symbols` | unchanged |
+| `kind census:` | `36 FreeFunction \| 2 StaticMember \| 13 MemberFunction \| 13 MemberFunction(virtual) \| 1 Constructor \| 3 Destructor \| 1 Unsupported` | `37 FreeFunction \| 2 StaticMember \| 13 MemberFunction \| 13 MemberFunction(virtual) \| 1 Constructor \| 3 Destructor` |
+| `unsupported by the demangler:` | `1 x template argument list (name '??$tmax')` | `none` |
+| `declared shape:` | `57 … ; 12 under the integer model` | `57 … ; 12 under the integer model` (unchanged — see below) |
+| `gap classes in the lifted IR:` | `5 indirect call: no signature model (virtual dispatch, thunk) \| 1 by-value struct argument (needs the type model)` | unchanged |
+| `named C++ gaps, counted: … template symbols` | `1` | `0` |
+| `name round-trip:` | `68 built from demangled text, 1 from the sanitized decoration` | `69 built from demangled text, 0 from the sanitized decoration` |
+| `compared \| lifted \| valid IR \| emitted C \| refused` | `69 \| 69 \| 69/69 \| 64 \| 5` | unchanged |
+| `rdec demangle --cpp` | exit 0, `supported by ours: 68, agreed: 68 … unsupported-by-mine: 1` | exit 0, `supported by ours: 69, agreed: 69 … unsupported-by-mine: 0` |
+
+Deliverable 2 moves NO cpp census count: the corpus contains no `?AV`/`?AU` symbol, so the only
+`unsupported` record was the template name, which deliverable 1 removed. The partition is what
+changed, and it is visible in the unit suite and in `??$idc@UWidget@@@@…`, which now refuses with
+the by-value key instead of the template key.
+
+`t2 --corpus` is `compared: 2560 | match: 2560 | mismatch: 0 | not compared: 20` (exit 0) and
+`c --corpus` is `156 lifted functions, 135 emitted C, 21 refused, 0 invalid after passes`
+(exit 1, the by-design red while refusals stand) — both byte-identical to the pre-change run.
+`rdec cpp --corpus` output is byte-identical before and after the two `m8.rs` text edits, and its
+floors needed NO re-pinning: `compared=69 lifted=69 valid IR=69 emitted C=64 refused=5
+this-in-RCX=30 ctors+dtors=4` against stated floors `60/40/25/12/2`, all floors are MINIMA and
+every one of them moved up or stayed. Nothing in the C++ leg's counts moved for any reason other
+than the demangler naming `tmax<int>`: the emitted C's name for that symbol went from the
+sanitized decoration `___tmax_H__YAHHH_Z` to `tmax_int_int_int`, clang still accepts the TU, and
+`use_template` refuses for the reason it already refused for (`opaque: clobbered by call @ 0x14`).
+
+`declared shape` staying at 57/12 is not a missed opportunity, it is the shape parser being
+honest: `sig_shape` reads the return type off the demangled head, and `int tmax<int>` is not a
+builtin integer spelling, so the subject keeps the integer model under a NEW, named key —
+`shape gap [1 x] return type \`int tmax<int>\` is not a builtin integer/float (the type model)`.
+That parser is `crates/cli/src/m8.rs`, the lane that owns `m4.rs` and the pass pipeline, so it is
+not touched here. It is the next name-typing slice: peel a `<...>` argument list off the head
+before reading the return type, and the pair `(shape_declared 58, shape_integer 11)` is the
+expected move, with `calls:`/`untypable` following it.
+
+The two `crates/cli` lines touched, both pure description strings (no code, no manifest effect,
+no compiled snippet change — the cpp corpus objects are byte-identical):
+
+* `crates/cli/src/m8.rs:14` — "the gaps (templates first among them)" → "(the by-value type model
+  first among them)", because the demangler's remaining gap list is now the by-value class model.
+* `crates/cli/src/m8.rs:201` — the `template_gap` fixture's description said "the loud-gap
+  fixture, must land in Unsupported", which is a claim about the demangler's own output and is
+  now false.
+
+### 20.4 Sabotage pairs, and the one the corpus gate cannot see
+
+* **Drop the argument rendering** (`tmax` for `tmax<int>`) — the gate that already exists,
+  `corpus_cpp_names_agree_with_llvm_nm`, goes red against the oracle (exit 101):
+
+  ```text
+  assertion `left == right` failed: …corpus/cpp/obj\template_gap.O0.obj: ??$tmax@H@@YAHHH@Z
+    mine: int tmax(int, int)
+    llvm: int __cdecl tmax<int>(int, int)
+    left: "inttmax(int,int)"
+   right: "inttmax<int>(int,int)"
+  ```
+
+* **Restore the old by-value key** (`"template argument list"` back on the `?AV`/`?AU` arm) — two
+  tests go red (exit 101), including the one that used to bless the old text:
+
+  ```text
+  tests::gaps_are_loud_with_specific_reasons --- FAILED
+    left: "template argument list"
+   right: "class/struct type in a signature ('?AV...'): needs the by-value type model"
+  tests::unmodelled_template_constructs_refuse_by_name --- FAILED
+    left: "template argument list"
+   right: "class/struct type in a signature ('?AU...'): needs the by-value type model"
+  ```
+
+* **Render the arguments in reverse** — and the corpus gate STAYS GREEN. `rdec demangle --cpp`
+  exits 0 with `agreed: 69`, `rdec cpp --corpus` exits 0, `corpus_cpp_names_agree_with_llvm_nm`
+  prints `69 compared … 0 unsupported` and passes. The corpus's only `??$` symbol carries ONE
+  template argument, so argument ORDER is not a claim that gate can make. What catches it is the
+  hermetic table (exit 101):
+
+  ```text
+  tests::template_names_agree_with_llvm_renderings --- FAILED
+    ??$pick2@IH@@YAIIH@Z: mine "unsigned int pick2<int, unsigned int>(unsigned int, int)"
+                          vs llvm "unsigned int __cdecl pick2<unsigned int, int>(unsigned int, int)"
+  ```
+
+  So: the corpus leg owns "the name agrees with llvm-nm on a real object", the measured table owns
+  "the argument list is rendered in order". Closing that in the corpus means a two-argument
+  template snippet, which moves every cpp baseline and is `crates/cli`'s to schedule.
+
+**Is the template name filtered out of the agreement?** `corpus_cpp_names_agree_with_llvm_nm` has
+exactly one filter — a symbol the demangler reports `Unsupported` is counted and `continue`d — so
+while `??$tmax@H@@YAHHH@Z` refused, it was never compared: the gate reported
+`68 compared, 68 supported, 1 unsupported (1 x template argument list (name '??$tmax'))`, and its
+"agreement" did not include the template name. Now that arm produces a `Name`, the same loop
+compares it: `69 compared, 69 supported, 0 unsupported`. The filter did not need removing; the
+demangler needed to stop refusing. `corpus_template_gap_is_loud` — which asserted the corpus
+template symbol MUST refuse, and so would have kept that name out of the comparison forever — is
+replaced by `corpus_template_name_agrees_with_llvm_nm`, which pins the exact text and the oracle
+pair for the same symbol.
+
+**Floors re-run on this box:** `rdec demangle --cpp` exit 0 (69/69 agreed); `rdec cpp --corpus`
+exit 0; `cargo test -p rdec-demangle` 15 unit + 3 integration pass (12 + 3 before; no test
+asserted the by-value key except the one rewritten here); `cargo test --no-fail-fast` exit 0;
+`cargo fmt --all --check` exit 0; `cargo clippy --all-targets -- -D warnings` exit 0;
+`bash scripts/unwrap_ratchet.sh` exit 0 (`crates/demangle 1 panic sites (= baseline)` — the new
+code adds none; the refusal paths index bytes `starts_with` has already proved exist).
