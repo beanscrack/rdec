@@ -3724,3 +3724,86 @@ The rule for the ledger: **a pass that breaks SSA is a bug in that pass, and a p
 verifies only at the end cannot name its own bug.** Verify after every pass, in the pipeline,
 with the pass names coming from the table the driver iterates. Transients are the pipeline's
 contract; surviving breakage is a record with a name in it.
+
+
+## 21. The named pass is `flag_elimination`, and the pass was innocent: the break was in the lifter's one-step phi placement (measured 2026-11-08, branch `flag-elim-ssa` from `c2123ee`)
+
+Section 20 scoped its claim: "the next CI run names the pass (or stays silent and the floor
+holds)." The next CI run named it. Run 42544451810, commit `c2123ee`, clang 20.1.8, verbatim:
+
+```
+pass-broke-ssa record: corpus\obj\locals_addressed.O2.obj :: f: after pass 1 'flag_elimination': %50 defined in bb2 is not available on the edge bb6 -> bb7; %52 defined in bb2 is not available on the edge bb6 -> bb7
+invalid record: corpus\obj\locals_addressed.O2.obj :: f: %50 defined in bb2 is not available on the edge bb6 -> bb7; %52 defined in bb2 is not available on the edge bb6 -> bb7
+emit-c: 156 lifted functions, 135 emitted C, 20 refused, 1 invalid after passes
+```
+
+The named mechanism is the third shape section 20's rule forces to be argued, not assumed:
+**the pass named by the verifier is the pass whose OUTPUT was broken, and this pass provably
+cannot introduce it.** `flag_elimination` (pass 1 of `PRE_EMIT_PASSES`, `crates/core/src/fuse.rs`)
+has no CFG surgery to its name: it writes `.op` fields (Flags nodes to their operand, GetFlag to
+the flag's source value) and inserts instructions WITHIN one block. No `.term` write, no
+`.blocks` write, no phi write, no def move - the entire edge-availability verdict of
+`verify_ssa` for an EXISTING value depends only on def placement, phi pairs, the CFG, and
+dominance, none of which the pass touches. The break is in the pass's INPUT: the lifter.
+
+The introducer, at `crates/arch-x86/src/lift.rs` (`ssa_registers`): the phi-placement gate was
+"the group is read at the head of this block, OR at the head of a SUCCESSOR" - a ONE-step
+approximation of liveness. When a register group is first read TWO blocks below a join, the
+join gets NO phi; the per-block transfer's `None` arm then sets the phi-less multi-pred block's
+out to the out of `preds[0]` - an arbitrary predecessor's value - and the pair keyed on it at
+the downstream join carries that value across an edge its defining block does not dominate.
+`locals_addressed.O2 :: f` is exactly that shape under clang 20 codegen.
+
+The proof is hand-built, no clang in the loop (`m3_ssa.rs::liveness_phi_placement_keeps_phi_pairs_available`,
+9 blocks from hand-assembled bytes): bb1 defines Rax/RSI and jumps to join bb5, bb3/bb4 bypass
+bb1 into bb5, the value is read two hops down. Red on base `c2123ee`, verbatim:
+
+```
+liveness placement: the raw lift breaks phi-pair availability: %13 defined in bb1 is not available on the edge bb5 -> bb6; %14 defined in bb1 is not available on the edge bb5 -> bb6
+```
+
+The CI message verbatim in form - two values, one def block, one edge. GREEN after the fix,
+with the same-program legs: raw lift verifies, phi_count 4 (the flow-through join now carries
+its phis), `clean_isolated` verified == ALL_VERIFIED (all 7 bits, no `pass-broke-ssa record:`
+line), flags eliminated, and the interpreter (the IR's ground truth, `Undef` = 0) answers
+3 / 2 / 0 on (ecx,edx) = (1,1) / (0,0) / (0,1) - pre-fix the bypass vector answers 3, which is
+the bug forwarding bb1's defs across the bypass, not the truth. A fix that merely stopped the
+passes cannot pass: the flag-elimination assertion and the mask pins would redden.
+
+The fix (mechanism A at the introducer): standard liveness to a fixed point (live-in = head
+reads, union of successor live-ins minus this block's writes), and a phi at every join (and
+back-edge header) where the group is LIVE-IN. Availability then holds by induction over exactly
+the cases `verify_ssa` enforces: a pair (v, P) is keyed on a unique predecessor (Cfg dedups),
+and v is the out of P - a writer block (def == P), a phi block (group live-in at P + P is a
+join/header, so the gate placed its phi: def == P), a chain of one-pred blocks back to a
+writer/phi/entry (def dominates P), or the entry `undef` (entry dominates everything reachable).
+This is a property of the placement rule, not a patch for the bb5 shape: the one-step gate was
+sound only when reads sat one hop from the join, and the hand-built fixture is the witness
+that the two-hop case existed. The pass named by CI is untouched: `fuse.rs` has no CFG surgery
+to fix, and section 20's rule ("a pass that breaks SSA is a bug in that pass") is honored -
+the per-pass verifier now sees a valid input, and pass 1 keeps all 7 bits.
+
+Local floors re-measured on this tree, byte-identical to the pre-slice contract (this box does
+NOT reproduce the CI break - local clang 21.1.8 does not emit the exposing shape; the floors
+pin that nothing else moved): `c --corpus` exit 1 with `emit-c: 156 lifted functions, 135
+emitted C, 21 refused, 0 invalid after passes`, `pass isolation: 7 passes verified on 135
+emitted functions`, `clang -Werror: OK`, and NO `pass-broke-ssa record:` line; `t2 --corpus`
+`compared: 2560 | match: 2560 | mismatch: 0 | not compared (one side faulted): 20`, memory
+408/408/0, IR leg 408/408/0; `lift --corpus`, `types --corpus`, and `types --corpus --baseline
+.gate/types-baseline` green; `msvc-gates OK: 132 objects, 134 code symbols` with `pass
+isolation: 7 passes verified on 125 emitted functions`; fmt/clippy/test-suite/unwrap-ratchet
+clean. The T2-C contract (2560/2560/0) and the M4 floors (156/135/21/0) did not move: the fix
+makes invalid IR valid where the one-step gate silently forwarded a non-dominating value, and
+no corpus function changed answers.
+
+Sabotages, both red then restored: (1) placement gate reverted to the one-step test - the
+fixture reddens with the CI-class record; (2) the driver made to skip pass 1 - the mask pin
+reddens (`verified 6 of 7 passes (bitmask 0b1111101)`) and the c2123ee pin
+`c_corpus_reports_every_pass_verified_and_stays_silent` reddens (`left: 6, right: 7`).
+Restored files verified: `passes.rs` byte-identical to HEAD (empty `git diff`), `lift.rs`
+content-identical and green.
+
+Scoped claim, same rule as section 20: this tree fixes the defect CLASS the named record
+belongs to, proven hand-built on base. The CI run of THIS commit is the confirmation for
+`locals_addressed.O2 :: f` on clang 20.1.8 - until that run is green, the row stays red with
+this reason attached.

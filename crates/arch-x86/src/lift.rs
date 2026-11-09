@@ -4117,14 +4117,74 @@ impl<'a> Lifter<'a> {
             .filter(|b| !unreach.contains(b))
             .collect();
 
-        for &g in GRPS.iter() {
-            // Where a phi is needed for this register.
-            let mut readers: HashSet<BbId> = HashSet::new();
-            for &(b, gg, _) in self.live_in.iter() {
-                if gg == g {
-                    readers.insert(b);
+        // Liveness to a fixed point: a register group is live-in at a block when
+        // the block reads it before writing (`live_in` records the head reads),
+        // or it is live-in at a successor and this block does not write it
+        // (standard liveness: the current block's writes kill).
+        //
+        // This REPLACED a two-clause gate ("read here, or at the head of a
+        // successor"): a ONE-step approximation of liveness. The measured
+        // defect (CI run 42544451810, commit c2123ee, clang 20.1.8 corpus):
+        // `pass-broke-ssa record: corpus\obj\locals_addressed.O2.obj :: f:
+        // after pass 1 'flag_elimination': %50 defined in bb2 is not available
+        // on the edge bb6 -> bb7; %52 ...` - and reproduced hermetically on
+        // hand-assembled bytes (`liveness_phi_placement_keeps_phi_pairs_available`,
+        // pre-fix raw lift: `%49 defined in bb2 is not available on the edge
+        // bb5 -> bb6`). The shape: a group is read two blocks below a join, so
+        // the one-step gate places NO phi at the join the value flows through;
+        // the transfer's `None` arm then gives that phi-less multi-pred block
+        // the out of `preds[0]` - an arbitrary predecessor's value - and the
+        // pair keyed on it at the downstream join carries that value across an
+        // edge its defining block does not dominate: the verifier's edge
+        // availability rule, broken. `flag_elimination` is pass 1 and the
+        // per-pass verifier's FIRST run (it changes no CFG, no phi, no def
+        // placement - fuse.rs writes `.op` fields and inserts instructions
+        // within one block only), so the pass is named, not the introducer.
+        //
+        // Full liveness placement closes the hole by induction: place a phi at
+        // every join (and back-edge header) where the group is live-in. Every
+        // pair (v, P) the solve can then write is available at the end of P:
+        // P writes the group (def == P); P has a phi (the group is live-in at
+        // P - liveness propagates backwards along the very pairs the solve
+        // writes - and P is a join/header, so the gate placed its phi: def ==
+        // P); P's chain of one-pred blocks back to a writer/phi/entry
+        // (def dominates P); or the entry `undef` (entry dominates everything
+        // reachable). That is exactly the rule `verify_ssa` enforces.
+        let mut live: HashMap<BbId, HashSet<Grp>> = HashMap::new();
+        for &(b, gg, _) in self.live_in.iter() {
+            live.entry(b).or_default().insert(gg);
+        }
+        loop {
+            let mut ch = false;
+            for b in &reachable {
+                let mut add: Vec<Grp> = Vec::new();
+                for &s in cfg.succs[*b as usize].iter() {
+                    if unreach.contains(&s) {
+                        continue;
+                    }
+                    if let Some(gs) = live.get(&s) {
+                        for g in gs.iter() {
+                            add.push(*g);
+                        }
+                    }
+                }
+                let kills = self.block_def.get(b);
+                let here = live.entry(*b).or_default();
+                for g in add {
+                    if kills.is_some_and(|d| d.contains(&g)) {
+                        continue;
+                    }
+                    if here.insert(g) {
+                        ch = true;
+                    }
                 }
             }
+            if !ch {
+                break;
+            }
+        }
+
+        for &g in GRPS.iter() {
             let mut phi_of: HashMap<BbId, VId> = HashMap::new();
             for b in &reachable {
                 let preds = cfg.preds[*b as usize].clone();
@@ -4136,15 +4196,8 @@ impl<'a> Lifter<'a> {
                 if preds.len() < 2 && !back {
                     continue;
                 }
-                // Only where the register is actually read at a start point:
-                // here, or at the start of a successor.
-                let needed = readers.contains(b)
-                    || first
-                        .preds
-                        .iter()
-                        .enumerate()
-                        .any(|(p, ps)| ps.contains(b) && readers.contains(&(p as BbId)));
-                if !needed {
+                // Only where the register is LIVE at the block's start point.
+                if !live.get(b).is_some_and(|s| s.contains(&g)) {
                     continue;
                 }
                 let undef = self.undef_val();
