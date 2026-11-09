@@ -81,14 +81,34 @@ fn the_frame_aliasing_sites_refuse_with_the_key_and_the_census_partitions_refuse
     //     lifted functions, 135 emitted C, 20 refused, 1 invalid after passes
     //     left: 1   right: 0
     // with this box at `135 emitted, 21 refused, 0 invalid` on the same commit.
-    // Same lifted, same emitted, a DIFFERENT BUCKET: the runner's clang (20.1.8,
-    // per `.github/workflows/ci.yml`; this box's is 22.1.8) built that function's
-    // frame store as an INDEXED access, the bounded-only check resolved no slot
-    // there, the refusal did not fire, the caller EMITTED, and the differential
-    // pass caught the emitted C as `invalid`. The `invalid` is the pipeline being
-    // honest about a miscompile; the fix is the rule, and this line is the floor
-    // that says the miscompile is not in the emitted set.
-    assert_eq!(invalid, 0, "`0 invalid` after passes: {emit_line}");
+    // Same lifted, same emitted, a DIFFERENT BUCKET on the runner's clang (20.1.8,
+    // per `.github/workflows/ci.yml`; this box's is 22.1.8). CORRECTION, dated
+    // 2026-11-08, after `frame2` (9876439) landed and CI printed the IDENTICAL
+    // `135 emitted, 20 refused, 1 invalid`: this line is NOT the frame-spelling
+    // hole, and `invalid` is NOT "the emitted C miscomputes". `invalid` is
+    // `verify_ssa` failing AFTER THE PASSES (m4.rs `pass_broken`). A frame-aliasing
+    // caller that escapes a refusal lands in `emitted` and is caught by `t2`, which
+    // was GREEN (2560/2560/0) on that same CI run - so the CI fact is a post-pass
+    // SSA break on 20.1.8 codegen, its own defect, still open, and its member is
+    // now named by the gate's `invalid record:` line (it named nothing before: the
+    // count line was all the CI log carried, and the FAIL line carrying the name is
+    // captured and discarded by this test - which is how two fixes got written
+    // against the wrong mechanism).
+    let named: Vec<&str> = text
+        .lines()
+        .filter(|l| l.starts_with("invalid record:") || l.starts_with("FAIL: a pass broke SSA"))
+        .collect();
+    assert_eq!(
+        invalid,
+        0,
+        "`0 invalid` after passes: post-pass verify_ssa failed; the gate's own records: \
+         {emit_line} | {}",
+        if named.is_empty() {
+            "<the gate named no member - that is the reporting bug of 2026-11-08>".to_string()
+        } else {
+            named.join(" | ")
+        }
+    );
     assert_eq!(
         lifted, 156,
         "the lift count is untouched by a pre-emit refusal: {emit_line}"

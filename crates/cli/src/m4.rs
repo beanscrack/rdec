@@ -1388,6 +1388,19 @@ pub fn cmd_c(args: &[String]) -> Result<i32, String> {
                 let dump = format!("{out_dir}/passbroken_{pass_broken}.ir");
                 let _ = std::fs::write(&dump, rdec_core::fmt_ir::format_function(&s.f));
             }
+            // UNCONDITIONAL, unlike the refusal records: the `invalid` bucket is
+            // expected to be EMPTY, so every member is a bug, and a count with no
+            // name is not a diagnosis. Measured 2026-11-08: CI printed `1 invalid`
+            // on two successive commits and named nothing - the name exists here
+            // (the `first_pass_break` string) but is printed only on the FAIL line
+            // at the end, which the corpus floor tests capture and discard. Two
+            // fixes were written to that count blind as a result.
+            println!(
+                "invalid record: {} :: {}: {}",
+                s.obj,
+                s.sym,
+                errs.join("; ")
+            );
             if first_pass_break.is_none() {
                 first_pass_break = Some(format!("{} :: {}: {}", s.obj, s.sym, errs.join("; ")));
             }

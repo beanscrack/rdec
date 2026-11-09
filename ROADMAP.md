@@ -3574,6 +3574,38 @@ deletion now reddens it.
 
 ---
 
+### 18.2 What `invalid` actually means: the correction 18.1 owed (measured 2026-11-08)
+
+`9876439` (the unbounded-frame rule) merged as `510c3e4`, and CI printed the IDENTICAL fact it was
+supposed to fix: `135 emitted C, 20 refused, 1 invalid` — same bucket, same count, the runner's
+clang unchanged. The frame-spelling hole and the CI failure are therefore NOT the same defect, and
+the reason two fixes were written against the wrong mechanism is a reporting gap. Both are recorded
+here rather than edited out of 18.1.
+
+- **`invalid` is `verify_ssa` FAILING AFTER THE PASSES** (`m4.rs`, the `pass_broken` counter): a
+  structural IR break. It is NOT "the emitted C miscomputes". A frame-aliasing caller that escapes
+  a refusal lands in `emitted`, and the gate that catches a wrong ANSWER is `t2` — which was GREEN
+  (`2560 | 2560 | 0`) on the very CI run whose `invalid` was read as a caught miscompile. 18.1's
+  "the differential pass caught the emitted C as `invalid`" is wrong, and the corpus floors' own
+  assertion text carried that sentence into CI's log; both now state what the counter counts.
+- **The name existed and was invisible.** `m4.rs` builds the `first_pass_break` string, prints it
+  only on the final `FAIL:` line, and the corpus floor tests capture stdout and discard it, so the
+  CI log carried a bare count. The gate now prints
+  `invalid record: <obj> :: <sym>: <verifier errors>` **unconditionally** — unconditionally, unlike
+  the refusal records behind `RDEC_C_CENSUS_ALL`, because a bucket that must be empty makes every
+  member a bug. Proven by injecting a synthetic verifier failure at the first subject:
+  `invalid record: corpus\obj\arith_basic.O0.obj :: f: SABOTAGE(synthetic): value %7 used before
+  def` alongside `emit-c: 156 lifted functions, 134 emitted C, 21 refused, 1 invalid`; the file was
+  restored byte-identical (sha256 `a0be65da…`). The two floors now splice those record lines into
+  the assertion message, so a red CI prints the function, not just the number.
+
+WHAT STANDS from 18.1: the frame-spelling hole is real — the hand-built fixture is red on
+bounded-only code (`the caller EMITTED ... refusal map: []`), the bounded/unbounded rule closes it,
+T2 is green, and the census partition (`49 named | 3 unbounded | 104 none` = 156 lifted) is on the
+gate's output. WHAT IS OPEN: the CI defect, a post-pass SSA break on clang 20.1.8 codegen, whose
+member the next CI run will name. A count you cannot name is not a diagnosis, on either side of the
+pipeline.
+
 ## 19. Data symbols: what the answer has to cover, measured on the MSVC leg (2026-11-08)
 
 The roadmap has carried "where do data symbols live in the per-object address space" as an

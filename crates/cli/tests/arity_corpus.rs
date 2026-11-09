@@ -80,15 +80,30 @@ fn the_named_clobbered_by_call_sites_are_gone_and_the_counts_move_by_eight() {
         .collect();
     assert_eq!(nums.len(), 4, "four counts in `{emit_line}`");
     let (lifted, emitted, refused, invalid) = (nums[0], nums[1], nums[2], nums[3]);
+    // WHAT `invalid` MEANS, because the first two fixes for this line assumed wrong:
+    // it is `verify_ssa` FAILING AFTER THE PASSES (`crates/cli/src/m4.rs`, the
+    // `pass_broken` counter) - a structural IR break. It is NOT the differential
+    // pass catching a miscompiled function, and it is NOT the refusal bucket
+    // (a frame-aliasing caller that escapes the refusal goes to `emitted`, and
+    // `t2` is the gate that would catch the wrong ANSWER). The CI divergence below
+    // is therefore a post-pass SSA break on clang 20.1.8's codegen, a different
+    // defect from the frame-spelling hole `frame2` closed - which is why that fix
+    // moved nothing here. The gate now prints `invalid record:` lines naming each
+    // member, so the message below carries the name, not just the count.
+    let named: Vec<&str> = text
+        .lines()
+        .filter(|l| l.starts_with("invalid record:") || l.starts_with("FAIL: a pass broke SSA"))
+        .collect();
     assert_eq!(
-        invalid, 0,
-        "`0 invalid` after passes, and `invalid` is the witness of the bug this lane fixes: \
-         the SAME commit on the CI runner (clang 20.1.8) printed `136 emitted, 20 refused, 1 \
-         invalid` while this tree (clang 22.1.8, `clang --version` measured here, the same \
-         version the corpus manifest records) printed `135 emitted, 21 refused, 0 invalid` - \
-         one frame refusal keyed on a spelling, so the function EMITTED and the emitted C \
-         computed a wrong answer. A non-zero `invalid` here means a frame-aliasing caller is \
-         back in the emitted set: {emit_line}"
+        invalid,
+        0,
+        "`0 invalid` after passes: post-pass verify_ssa failed; the gate's own records: \
+         {emit_line} | {}",
+        if named.is_empty() {
+            "<the gate named no member - that is the reporting bug of 2026-11-08>".to_string()
+        } else {
+            named.join(" | ")
+        }
     );
     // Floors moved 137/19 -> 135/21 on 2026-11-08 (branch `frame-activation`,
     // this tree): the frame-activation refusal took `call_helper.O0::f` and
