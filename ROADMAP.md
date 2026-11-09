@@ -4001,3 +4001,15 @@ Scoped claim, same rule as section 20: this tree fixes the defect CLASS the name
 belongs to, proven hand-built on base. The CI run of THIS commit is the confirmation for
 `locals_addressed.O2 :: f` on clang 20.1.8 - until that run is green, the row stays red with
 this reason attached.
+
+**CONFIRMED GREEN, 2026-11-08 (the promise above, kept).** `fc5deec`, run `42548844266`:
+`CI_EXIT=0` - `gates: success`, `release-parity: success`, `msvc: success`, `t1-full: skipped`
+(nightly). The `pass-broke-ssa record:` grep over the failed-step log returns NOTHING, and no
+`targets failed` line exists: the runner's clang 20.1.8 built the `locals_addressed.O2` shape that
+carried `%50/%52 defined in bb2 is not available on the edge bb6 -> bb7` through five commits, and
+the liveness-placement fix in the lifter removed it. **The `gates` job is green on master for the
+first time since `ab64a4d`**, and the three tests that carried the red (`arity_corpus`,
+`frame_activation`, `pass_isolation`) pass on the runner. The defect's honest size, restated because
+the class matters more than the record: on a two-hop read, the model forwarded a definition across a
+bypass edge and answered `3` where the machine answers `0` (fixture ground truth, `(ecx,edx) =
+(0,1)`) - a miscompile the 2560-vector T2 set on clang 21's corpus never reached.
