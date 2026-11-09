@@ -16,8 +16,203 @@ use crate::ty::{Sx, Ty, Width};
 // the pass pipeline
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// the pass table: THE source of truth for pass names and pass order
+// ---------------------------------------------------------------------------
+//
+// The names live here, as data, because a record that says "after pass 4
+// 'copy_prop'" must name the pass the product runs, not a parallel hardcoded
+// list a gate keeps by hand. `clean_isolated` iterates `PRE_EMIT_PASSES` in
+// order, and the pinning test on the gate's `pass isolation: K passes
+// verified` summary asserts K equals THIS table's length - so a driver that
+// iterates an empty table prints K=0 and the gate goes red, which is the
+// failure mode a loop over a pipeline can have.
+
+pub const NAME_FLAG_ELIMINATION: &str = "flag_elimination";
+pub const NAME_PRUNE_PHIS: &str = "prune_phis";
+pub const NAME_CONST_FOLD: &str = "const_fold";
+pub const NAME_COPY_PROP: &str = "copy_prop";
+pub const NAME_SIMPLIFY_BRANCHES: &str = "simplify_branches";
+pub const NAME_DEAD_STORE_ELIM: &str = "dead_store_elimination";
+pub const NAME_DEAD_CODE_ELIM: &str = "dead_code_elimination";
+pub const NAME_MERGE_BLOCKS: &str = "merge_blocks";
+pub const NAME_DEDUP_BLOCKS: &str = "dedup_blocks";
+
+/// One pass in the pre-emission pipeline, named.
+pub struct Pass {
+    pub name: &'static str,
+    pub run: fn(&mut Function) -> bool,
+}
+
+/// THE pre-emission pass pipeline, as data. The order IS the semantics of
+/// every emitted function (flag elimination first: `Ty::Flags` has no C
+/// spelling on purpose), so reordering this table reorders the product.
+pub const PRE_EMIT_PASSES: &[Pass] = &[
+    Pass {
+        name: NAME_FLAG_ELIMINATION,
+        run: crate::fuse::flag_elimination,
+    },
+    Pass {
+        name: NAME_PRUNE_PHIS,
+        run: prune_phis,
+    },
+    Pass {
+        name: NAME_CONST_FOLD,
+        run: const_fold,
+    },
+    Pass {
+        name: NAME_COPY_PROP,
+        run: copy_prop,
+    },
+    Pass {
+        name: NAME_SIMPLIFY_BRANCHES,
+        run: simplify_branches,
+    },
+    Pass {
+        name: NAME_DEAD_STORE_ELIM,
+        run: dead_store_elimination,
+    },
+    Pass {
+        name: NAME_DEAD_CODE_ELIM,
+        run: dead_code_elimination,
+    },
+];
+
+/// The first pass that left the function with invalid SSA: its 1-based index
+/// in the pipeline that ran it, the pass's name (from the table the driver
+/// iterated), the pipeline's own tag, and the verifier's verbatim errors.
+#[derive(Clone, Debug)]
+pub struct PassBreak {
+    pub index: usize,
+    pub name: &'static str,
+    pub pipeline: &'static str,
+    pub errors: Vec<String>,
+    /// 0-based table index the repair probe resumes this round at (`index`,
+    /// i.e. the pass AFTER the breaker). Internal plumbing, not print material.
+    pub(crate) resume: usize,
+}
+
+/// What an isolated run of the pipeline proved about one function.
+#[derive(Clone, Debug, Default)]
+pub struct Isolation {
+    /// Bit i set <=> `verify_ssa` ran after pass i (0-based). The anti-vacuity
+    /// witness: a driver that iterates nothing verifies nothing, prints
+    /// `0 passes verified`, and the pinning test on the table length reddens.
+    pub verified: u32,
+    /// The first pass that broke SSA and whose breakage the REST of the
+    /// pipeline could NOT repair. A pass whose breakage a later pass fixes is
+    /// a transient, not a defect to report: this pipeline's contract has
+    /// always verified at round boundaries (the lifter and passes lean on it -
+    /// `new_undef` appends the `undef` at the END of the entry block, which is
+    /// only SSA-complete once the fixpoint has run), and the corpus floors are
+    /// calibrated on the repaired IR being emitted. A transient is silent; a
+    /// breakage that survives to the end is a `pass-broke-ssa record:` line.
+    pub broke: Option<PassBreak>,
+}
+
+/// Run the pipeline over `f`, verifying SSA after every pass.
+///
+/// * `stop_at_break`: the first pass whose post-state fails `verify_ssa` ends
+///   the run, so `f` is exactly what that pass produced (evidence, not
+///   laundered by later passes). `resume` returns the 0-based table index to
+///   continue this round from.
+/// * `iso.verified` accumulates one bit per pass verified.
+pub(crate) fn run_rounds(
+    f: &mut Function,
+    iso: &mut Isolation,
+    stop_at_break: bool,
+    resume: &mut usize,
+) {
+    let mut start = *resume;
+    for _ in 0..16 {
+        let mut ch = false;
+        for (i, p) in PRE_EMIT_PASSES.iter().enumerate() {
+            if i < start {
+                // Resume mid-round: the passes before `start` already ran in
+                // this round, and the round already made a change (a pass that
+                // moves the verifier's answer HAS changed the IR).
+                ch = true;
+                continue;
+            }
+            start = 0;
+            ch |= (p.run)(f);
+            // Verify after EVERY pass in BOTH modes: the bits `iso.verified`
+            // reports are earned, in the stopping run and in the repair probe
+            // alike. The modes differ only in what a failure DOES.
+            iso.verified |= 1u32 << i;
+            if let Err(errs) = crate::verify::verify_ssa(f) {
+                if stop_at_break && iso.broke.is_none() {
+                    iso.broke = Some(PassBreak {
+                        index: i + 1,
+                        name: p.name,
+                        pipeline: "clean",
+                        errors: errs,
+                        resume: i + 1,
+                    });
+                    *resume = i + 1;
+                    return;
+                }
+            }
+        }
+        if !ch {
+            break;
+        }
+    }
+    *resume = usize::MAX; // the loop converged; there is nothing to resume
+}
+
+/// Run the pipeline, verifying SSA after EVERY pass, and name the first pass
+/// whose SSA breakage survives to the end of the pipeline. `clean` is this
+/// function with the report dropped; the gates consume the report (see
+/// `m4::clean`, `cmd_c`'s record lines).
+///
+/// The shape is a rule, not an optimization: **a pass that breaks SSA is a bug
+/// in that pass**, and a pipeline that verifies only at the end cannot name
+/// its own bug. When a pass leaves invalid IR, this driver STOPS there, then
+/// asks the rest of the pipeline (on a clone, resuming this round at the next
+/// pass) whether it repairs the breakage. Repairs - the pipeline's own
+/// round-boundary contract, which the corpus floors measure - are silent; a
+/// breakage that survives is reported naming its pass, and `f` stays frozen at
+/// the breakage point so the record and the `passbroken_N.ir` dump show what
+/// that pass produced, not what later passes cascaded over it. The resumed run
+/// continues the exact pass sequence the uninterrupted driver would have run,
+/// so a repaired function's emitted IR is byte-identical to the old driver's.
+///
+/// Measured cost on this repo's shapes: the corpus's biggest function is ~40
+/// blocks and `verify_ssa` is linear (measured 9.6 ms at 20k blocks, release);
+/// the repair clone runs only for functions a pass actually broke.
+pub fn clean_isolated(f: &mut Function) -> Isolation {
+    let mut iso = Isolation::default();
+    let mut resume = 0usize;
+    run_rounds(f, &mut iso, true, &mut resume);
+    if let Some(b) = iso.broke.take() {
+        // `f` is the IR `b.name` left behind. Ask the rest of the pipeline.
+        let mut repaired = f.clone();
+        let mut probe = Isolation::default();
+        let mut r = b.resume;
+        run_rounds(&mut repaired, &mut probe, false, &mut r);
+        iso.verified |= probe.verified;
+        match crate::verify::verify_ssa(&repaired) {
+            // Repaired: emit what the full pipeline produced, report nothing.
+            Ok(()) => *f = repaired,
+            // The breakage survives. `f` stays as the breaking pass left it;
+            // the gate's final `verify_ssa` names the function with these
+            // same errors on the `invalid record:` line.
+            Err(errs) => {
+                debug_assert_eq!(
+                    errs, b.errors,
+                    "the frozen IR must keep answering the breakage errors"
+                );
+                iso.broke = Some(b);
+            }
+        }
+    }
+    iso
+}
+
 /// THE pre-emission pass pipeline, run to a fixpoint (bounded, not to
-/// convergence: a pass that oscillates must stop and be reported, not spin).
+/// convergence: a pass that oscillates must stop and be reported, not spin),
+/// with SSA verified after every pass (`clean_isolated`).
 ///
 /// This is one function on purpose. Flag elimination has to run here because
 /// `Ty::Flags` has no C spelling, so the order of these passes IS the semantics
@@ -27,19 +222,7 @@ use crate::ty::{Sx, Ty, Width};
 /// here (`m4::clean` is a thin alias), so "the passes broke SSA" means the same
 /// thing in every one of them.
 pub fn clean(f: &mut Function) {
-    for _ in 0..16 {
-        let mut ch = false;
-        ch |= crate::fuse::flag_elimination(f);
-        ch |= prune_phis(f);
-        ch |= const_fold(f);
-        ch |= copy_prop(f);
-        ch |= simplify_branches(f);
-        ch |= dead_store_elimination(f);
-        ch |= dead_code_elimination(f);
-        if !ch {
-            break;
-        }
-    }
+    let _ = clean_isolated(f);
 }
 
 // ---------------------------------------------------------------------------
@@ -1140,17 +1323,97 @@ fn simplify_branches_sweep(f: &mut Function) -> bool {
         } = b.term
         {
             if then_bb == else_bb {
+                // One target named twice is ONE edge (`Cfg::build` records
+                // predecessors deduplicated per block), so this fold removes
+                // no edge and retires nothing. `both_arms_fold_keeps_ssa`
+                // pins that the retirement below stays off this path.
                 f.blocks[bi].term = Terminator::Jump(then_bb);
                 changed = true;
                 continue;
             }
             if let Some(Some(c)) = consts.get(cond as usize) {
-                f.blocks[bi].term = Terminator::Jump(if c & 1 == 1 { then_bb } else { else_bb });
+                let taken = if c & 1 == 1 { then_bb } else { else_bb };
+                let dropped = if c & 1 == 1 { else_bb } else { then_bb };
+                f.blocks[bi].term = Terminator::Jump(taken);
+                // The `dropped` arm's edge is gone: a phi pair keyed on
+                // `bi` there names a predecessor that no longer exists, and
+                // a `dropped` with no predecessors left holds live defs in
+                // an unreachable block. Both are SSA breaks nothing in the
+                // seven-pass pipeline repairs - measured on a hand-built
+                // fixture, the per-pass verifier named this pass:
+                // `pass-broke-ssa record: fixture :: f: after pass 5
+                // 'simplify_branches': ... %6 is defined in unreachable bb2`.
+                retire_edge(f, bi as BbId, dropped);
                 changed = true;
             }
         }
     }
     changed
+}
+
+/// Drop ONE phi pair keyed on `from` per phi in `blk`: the edge that pair
+/// describes no longer exists, and `verify_ssa` compares a phi's incoming
+/// blocks to the predecessor multiset. The dropped arm's pair VALUE was
+/// available on the removed edge; the surviving IR reaches `blk` only
+/// through the remaining predecessors, so the pair's uses reach it only
+/// through the remaining pairs (valid SSA routes a predecessor-local value
+/// into a join through that join's phi and nothing else).
+fn drop_phi_pair_keyed(f: &mut Function, blk: BbId, from: BbId) {
+    let bi = blk as usize;
+    if bi >= f.blocks.len() {
+        return;
+    }
+    for i in f.blocks[bi].instrs.iter_mut() {
+        if let Op::Phi(pairs) = &mut i.op {
+            if let Some(pos) = pairs.iter().position(|(_, p)| *p == from) {
+                let mut v: Vec<(VId, BbId)> = pairs.to_vec();
+                v.remove(pos);
+                *pairs = v.into_boxed_slice();
+            }
+        }
+    }
+}
+
+/// Predecessors of `target`, per the `Cfg::build` convention: a block
+/// counts once, self-edges included.
+fn pred_count(f: &Function, target: BbId) -> usize {
+    let mut s = Vec::new();
+    let mut n = 0usize;
+    for b in &f.blocks {
+        b.term.successors(&mut s);
+        if s.contains(&target) {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// The edge `from -> dead` no longer exists. Every phi at `dead` keyed on
+/// `from` loses that pair, and if `dead` now has NO predecessors it dies:
+/// its instructions are cleared and its terminator becomes `Unreachable`,
+/// because defs in an unreachable block are a hard, PERMANENT verifier
+/// error (nothing in the table may delete a def its own block's terminator
+/// reads). Its outgoing edges retire the same way, cascade included - a
+/// worklist, not recursion, because the chain of dying blocks is as long as
+/// the function's chain of joins.
+fn retire_edge(f: &mut Function, from: BbId, dead: BbId) {
+    let mut work = vec![(from, dead)];
+    while let Some((from, b)) = work.pop() {
+        drop_phi_pair_keyed(f, b, from);
+        if b == f.entry {
+            continue; // the entry is reachable by construction
+        }
+        if pred_count(f, b) == 0 {
+            let blk = &mut f.blocks[b as usize];
+            let mut succs = Vec::new();
+            blk.term.successors(&mut succs);
+            blk.instrs.clear();
+            blk.term = Terminator::Unreachable;
+            for s in succs {
+                work.push((b, s));
+            }
+        }
+    }
 }
 
 /// Merge `a -> b` when `b`'s only predecessor is `a` and `b` has no phis.

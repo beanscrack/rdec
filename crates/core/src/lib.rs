@@ -53,6 +53,13 @@ pub struct PipelineReport {
     /// pretend to answer - it is the number that scales with the function's
     /// structure, and `tests/pipeline_scaling.rs` prints it.
     pub pass_invocations: usize,
+    /// Per-pass SSA verification, from the same driver the callers run:
+    /// `verified` is the set of passes that ran and were verified, `broke`
+    /// names the FIRST pass that left invalid SSA. A pass that breaks SSA is a
+    /// bug in that pass, and this driver stops there (`passes_run` carries the
+    /// record and `not_converged` is true) so no later pass launders the
+    /// evidence.
+    pub iso: passes::Isolation,
 }
 
 /// The production outer budget. It is a liveness guard for pass interaction, not a
@@ -84,7 +91,7 @@ pub fn run_pipeline_with_budget(f: &mut Function, max_rounds: usize) -> Pipeline
         let mut changed = false;
         let mut stopped: Option<String> = None;
         macro_rules! run {
-            ($name:literal, $call:expr) => {{
+            ($name:expr, $call:expr) => {{
                 let mut ch;
                 let mut any = false;
                 let mut iters = 0;
@@ -109,20 +116,55 @@ pub fn run_pipeline_with_budget(f: &mut Function, max_rounds: usize) -> Pipeline
                 any
             }};
         }
-        changed |= run!("prune_phis", passes::prune_phis(f));
-        changed |= run!("flag_elimination", passes::flag_elimination(f));
-        changed |= run!("const_fold", passes::const_fold(f));
-        changed |= run!("copy_prop", passes::copy_prop(f));
-        changed |= run!("dead_code_elimination", passes::dead_code_elimination(f));
-        changed |= run!("simplify_branches", passes::simplify_branches(f));
-        changed |= run!("merge_blocks", {
+        // SSA after EVERY pass, on this driver's own pass list: a pass that
+        // breaks SSA is a bug in that pass, and the record names it (index in
+        // this driver's order, name from `passes::NAME_*`). A breakage is
+        // judged by the END of the pipeline (the round-boundary contract
+        // `clean_isolated` documents: a pass whose breakage a later pass
+        // repairs is a transient, and this driver must not change the IR the
+        // m0/tv/scaling tests measure); a breakage that survives to the end
+        // lands in `passes_run` naming its pass, with `not_converged` true.
+        macro_rules! iso {
+            ($idx:expr, $name:expr) => {{
+                rep.iso.verified |= 1u32 << $idx;
+                if rep.iso.broke.is_none() {
+                    if let Err(errs) = crate::verify::verify_ssa(f) {
+                        rep.iso.broke = Some(passes::PassBreak {
+                            index: $idx + 1,
+                            name: $name,
+                            pipeline: "run_pipeline",
+                            errors: errs,
+                            resume: usize::MAX,
+                        });
+                    }
+                }
+            }};
+        }
+        changed |= run!(passes::NAME_PRUNE_PHIS, passes::prune_phis(f));
+        iso!(0, passes::NAME_PRUNE_PHIS);
+        changed |= run!(passes::NAME_FLAG_ELIMINATION, passes::flag_elimination(f));
+        iso!(1, passes::NAME_FLAG_ELIMINATION);
+        changed |= run!(passes::NAME_CONST_FOLD, passes::const_fold(f));
+        iso!(2, passes::NAME_CONST_FOLD);
+        changed |= run!(passes::NAME_COPY_PROP, passes::copy_prop(f));
+        iso!(3, passes::NAME_COPY_PROP);
+        changed |= run!(
+            passes::NAME_DEAD_CODE_ELIM,
+            passes::dead_code_elimination(f)
+        );
+        iso!(4, passes::NAME_DEAD_CODE_ELIM);
+        changed |= run!(passes::NAME_SIMPLIFY_BRANCHES, passes::simplify_branches(f));
+        iso!(5, passes::NAME_SIMPLIFY_BRANCHES);
+        changed |= run!(passes::NAME_MERGE_BLOCKS, {
             // The counted form: its collapse sweeps are fixpoint iterations too, so
             // they belong in the invocation count.
             let (ch, sweeps, _bound_hit) = passes::merge_blocks_counted(f, bound);
             rep.pass_invocations += sweeps;
             ch
         });
-        changed |= run!("dedup_blocks", passes::dedup_blocks(f));
+        iso!(6, passes::NAME_MERGE_BLOCKS);
+        changed |= run!(passes::NAME_DEDUP_BLOCKS, passes::dedup_blocks(f));
+        iso!(7, passes::NAME_DEDUP_BLOCKS);
         if let Some(why) = stopped {
             rep.not_converged = true;
             rep.rounds = iter;
@@ -145,6 +187,31 @@ pub fn run_pipeline_with_budget(f: &mut Function, max_rounds: usize) -> Pipeline
                 "stopped: pass budget ({iter} rounds) exhausted, passes still changing"
             ));
             break;
+        }
+    }
+    if let Some(b) = rep.iso.broke.take() {
+        // The first failing pass is judged by the END of the pipeline (the
+        // round-boundary contract, as in `passes::clean_isolated`): a
+        // breakage a later pass repaired is a transient and stays silent; a
+        // breakage that survives names its pass in words a gate can grep.
+        if let Err(errs) = crate::verify::verify_ssa(f) {
+            let line = format!(
+                "pass-broke-ssa: after pass {} '{}' in the {} pipeline: {}",
+                b.index,
+                b.name,
+                b.pipeline,
+                errs.join("; ")
+            );
+            rep.not_converged = true;
+            rep.rounds = iter;
+            rep.passes_run.push(line);
+            rep.iso.broke = Some(passes::PassBreak {
+                index: b.index,
+                name: b.name,
+                pipeline: b.pipeline,
+                errors: errs,
+                resume: b.resume,
+            });
         }
     }
     rep.notes.extend(passes::notes(f));

@@ -789,6 +789,7 @@ fn msvc_census(files: &[String], emit_dir: &str) -> Result<(), String> {
     }
     let protos = crate::m4::protos_of(&subjects);
     let (mut seen, mut emitted, mut refused, mut broken, mut keyless) = (0, 0, 0, 0, 0);
+    let mut iso_bits: u32 = 0;
     let mut census: BTreeMap<String, usize> = BTreeMap::new();
     let mut first_refusal: Option<String> = None;
     let mut text = String::new();
@@ -798,6 +799,17 @@ fn msvc_census(files: &[String], emit_dir: &str) -> Result<(), String> {
 
     for s in &subjects {
         seen += 1;
+        iso_bits |= s.iso.verified;
+        if let Some(b) = &s.iso.broke {
+            println!(
+                "pass-broke-ssa record: {} :: {}: after pass {} '{}': {}",
+                s.obj,
+                s.sym,
+                b.index,
+                b.name,
+                b.errors.join("; ")
+            );
+        }
         if let Err(errs) = verify_ssa(&s.f) {
             broken += 1;
             if broken <= 3 {
@@ -834,6 +846,12 @@ fn msvc_census(files: &[String], emit_dir: &str) -> Result<(), String> {
     let records: usize = census.values().sum();
     println!(
         "emit-c: {seen} lifted functions, {emitted} emitted C, {refused} refused, {broken} invalid after passes"
+    );
+    // Same isolation summary as `rdec c --corpus` (see `cmd_c`): distinct
+    // passes that ran and were SSA-verified, on the emitted count.
+    println!(
+        "pass isolation: {} passes verified on {emitted} emitted functions",
+        iso_bits.count_ones()
     );
     println!("cookie shapes: MSVC leg runs /GS on at O2; the corpus emits no __security_cookie or __chkstk site (measured), so nothing is refused by those names");
     println!(

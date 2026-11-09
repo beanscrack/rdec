@@ -243,20 +243,15 @@ pub fn census_drift(reports: &[Report], text: &str) -> Option<String> {
 /// The pre-emission pipeline. Flag elimination first: `Ty::Flags` has no C
 /// spelling on purpose, so a surviving flags value is a refusal, and the pass
 /// that removes it is the thing that has to run.
-pub(crate) fn clean(f: &mut Function) {
-    for _ in 0..16 {
-        let mut ch = false;
-        ch |= rdec_core::fuse::flag_elimination(f);
-        ch |= rdec_core::passes::prune_phis(f);
-        ch |= rdec_core::passes::const_fold(f);
-        ch |= rdec_core::passes::copy_prop(f);
-        ch |= rdec_core::passes::simplify_branches(f);
-        ch |= rdec_core::passes::dead_store_elimination(f);
-        ch |= rdec_core::passes::dead_code_elimination(f);
-        if !ch {
-            break;
-        }
-    }
+///
+/// A thin alias for `rdec_core::passes::clean_isolated` (the one pass table),
+/// and it RETURNS the isolation report: SSA verified after every pass, with the
+/// FIRST breaking pass named (index, name, verifier errors). `cmd_c` prints a
+/// `pass-broke-ssa record:` line per broken function and a `pass isolation:`
+/// summary; a pass that breaks SSA is a bug in that pass, and a pipeline that
+/// verifies only at the end cannot name its own bug.
+pub(crate) fn clean(f: &mut Function) -> rdec_core::passes::Isolation {
+    rdec_core::passes::clean_isolated(f)
 }
 
 /// Cap a census key WITHOUT inventing an identifier. The census key is the map
@@ -351,6 +346,13 @@ pub struct Subject {
     /// Object-level, carried on every subject of the object; `relocs_line`
     /// de-duplicates by object path, so it is a census, not a per-function count.
     pub relocs_parsed: usize,
+    /// The per-pass SSA isolation report for this subject's `clean` run: the
+    /// set of passes verified after running, and the FIRST pass that broke SSA
+    /// (the pipeline stops there, so `f` is exactly what that pass produced).
+    /// `cmd_c` prints a `pass-broke-ssa record:` line for every broken subject
+    /// and a `pass isolation:` summary whose count is the union of these
+    /// `verified` sets.
+    pub iso: rdec_core::passes::Isolation,
 }
 
 /// Load, discover, lift and clean every function in `files`, named by
@@ -584,7 +586,7 @@ pub fn lift_all_named_shapes(
                     &name, rg.bytes, rg.base, start, end, &plan, &names, &abi, table, &relocs,
                     &tables,
                 );
-                clean(&mut f);
+                let iso = clean(&mut f);
                 v.push(Subject {
                     obj: file.clone(),
                     sym: raw,
@@ -595,6 +597,7 @@ pub fn lift_all_named_shapes(
                     f,
                     abi,
                     rep,
+                    iso,
                 });
             }
             v
@@ -1370,6 +1373,12 @@ pub fn cmd_c(args: &[String]) -> Result<i32, String> {
     let mut reports: Vec<Report> = Vec::new();
     let mut first_refusal: Option<String> = None;
     let mut first_pass_break: Option<String> = None;
+    // Union of the per-pass verification bits every subject's `clean` run
+    // proved (see `Subject::iso`). The `pass isolation:` summary prints its
+    // popcount, and a pinning test asserts that count equals the pipeline's
+    // own table length - a driver that iterated an empty table prints 0 and
+    // the test reddens, so the summary line cannot pass vacuously.
+    let mut iso_bits: u32 = 0;
     let mut all = String::new();
     // The per-function text carries its own includes (so a single emitted
     // function is a compilable translation unit on its own); the concatenated
@@ -1380,6 +1389,22 @@ pub fn cmd_c(args: &[String]) -> Result<i32, String> {
 
     for s in &subjects {
         seen += 1;
+        iso_bits |= s.iso.verified;
+        // Name the culprit, not just the victim: when a pass leaves the
+        // function with invalid SSA, say WHICH pass (index + name from the
+        // pipeline's own table). The `invalid record:` below names the
+        // function and reproduces these same errors, because the pipeline
+        // STOPS at the breaking pass and the IR is exactly what it produced.
+        if let Some(b) = &s.iso.broke {
+            println!(
+                "pass-broke-ssa record: {} :: {}: after pass {} '{}': {}",
+                s.obj,
+                s.sym,
+                b.index,
+                b.name,
+                b.errors.join("; ")
+            );
+        }
         if let Err(errs) = verify_ssa(&s.f) {
             pass_broken += 1;
             // The post-pass IR of a broken function is the only way to see
@@ -1515,6 +1540,17 @@ pub fn cmd_c(args: &[String]) -> Result<i32, String> {
     std::fs::write(&path, &all).map_err(|e| format!("{path}: {e}"))?;
 
     println!("emit-c: {seen} lifted functions, {emitted} emitted C, {refused} refused, {pass_broken} invalid after passes");
+    // The per-pass verification summary, the silent-path half of the isolation
+    // tool: when no pass breaks SSA this is the ONLY extra line (records print
+    // per broken function above). The count is the number of DISTINCT passes
+    // that ran AND were verified after running, from the driver's own
+    // iteration, and `crates/cli/tests/pass_isolation.rs` pins it against the
+    // pipeline's table length - the loop-that-iterates-nothing failure mode
+    // prints 0 and reddens that test.
+    println!(
+        "pass isolation: {} passes verified on {emitted} emitted functions",
+        iso_bits.count_ones()
+    );
     println!("{}", control_flow_line(&reports, emitted));
     println!("{}", readability_line(&all, emitted));
     println!("{}", readability_exchange_line(&reports));
@@ -1689,6 +1725,7 @@ mod frame_alias_tests {
             abi: FnAbi::integer(),
             rep: Report::default(),
             relocs_parsed: 0,
+            iso: Default::default(),
         }
     }
 
