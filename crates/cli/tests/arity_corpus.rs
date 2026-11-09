@@ -80,7 +80,16 @@ fn the_named_clobbered_by_call_sites_are_gone_and_the_counts_move_by_eight() {
         .collect();
     assert_eq!(nums.len(), 4, "four counts in `{emit_line}`");
     let (lifted, emitted, refused, invalid) = (nums[0], nums[1], nums[2], nums[3]);
-    assert_eq!(invalid, 0, "`0 invalid` after passes: {emit_line}");
+    assert_eq!(
+        invalid, 0,
+        "`0 invalid` after passes, and `invalid` is the witness of the bug this lane fixes: \
+         the SAME commit on the CI runner (clang 20.1.8) printed `136 emitted, 20 refused, 1 \
+         invalid` while this tree (clang 22.1.8, `clang --version` measured here, the same \
+         version the corpus manifest records) printed `135 emitted, 21 refused, 0 invalid` - \
+         one frame refusal keyed on a spelling, so the function EMITTED and the emitted C \
+         computed a wrong answer. A non-zero `invalid` here means a frame-aliasing caller is \
+         back in the emitted set: {emit_line}"
+    );
     // Floors moved 137/19 -> 135/21 on 2026-11-08 (branch `frame-activation`,
     // this tree): the frame-activation refusal took `call_helper.O0::f` and
     // `fib_rec.O0::f` OUT of the emitted set - their C computes a wrong
@@ -90,6 +99,13 @@ fn the_named_clobbered_by_call_sites_are_gone_and_the_counts_move_by_eight() {
     // witnesses, the census class and the t2 confirmation). The eight
     // clobber closures this row owns stay closed: the refusal class they
     // name stays gone, asserted below on the record dump.
+    //
+    // RE-MEASURED 2026-11-08 on branch `frame2` at 156/135/21/0 - UNMOVED: the
+    // unbounded-frame-traffic rule (indexed frame access = whole-window touch)
+    // adds no refusal on this box's clang, because the discovery that moved
+    // the numbers is a CI fact - the runner's clang 20.1.8 spells one frame
+    // store with an index register, the old bounded-only check saw no slot
+    // there, that leg emitted, and its `invalid` was 1.
     assert_eq!(emitted, 135, "137 - 2 frame refusals: {emit_line}");
     assert_eq!(refused, 21, "19 + 2 frame refusals: {emit_line}");
     assert_eq!(lifted, 156, "the lift count is untouched: {emit_line}");

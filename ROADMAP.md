@@ -1352,8 +1352,8 @@ the date and the tree are in the heading: a row is a measurement with an expiry.
 | M3 step 2 block splitting | `rdec lift --corpus` | **GREEN** — loops lift; Exits 64 -> 27, clean functions 63 -> 85 | closed |
 | M3 noreturn / tail calls / jump-table targets | census + three floors inside `rdec c --corpus` | **LANDED, corpus witnesses present** (2026-11-08; the row before this one said "NOT DONE — zero handling" on the evidence of a `grep -ric` that returned 0, where the live count in `lift.rs` is 53). Jump-table resolution closed M1. Census now: **`tail calls: 3 modelled | 3 with no callable callee | noreturn calls: 4`** (`0xf -> abort`, `0x12 -> abort` x3) from the `tailcall_local` / `tailcall_external` / `noreturn_call` snippets. `cmd_c` FAILS on `tail + tail_unnamed == 0`, on `noreturn == 0`, and on any census site whose name `noreturn_symbol` does not declare — floor 3 exists because a sabotage that declared EVERY import noreturn moved one corpus function into `__builtin_unreachable()` and passed every other gate. The fixture found the real hole: the noreturn arm needed a signature entry, imports have none (`U abort`: no section, no size, no address), and in a linked binary every name in the termination family IS an import — the declaration is now made from the relocation's name, for imports only, `typed: false`, defines nothing. The emitted C is `o100_abort(x0,x1,x2,x3); __builtin_unreachable();` under an `__attribute__((noreturn))` declaration. | C++ corpus sites (that corpus imports no family name — measured with `llvm-nm`), and the `jmp`-to-import refusal class growing past 3. The CALLS side's remaining gap is now named: **frame activation** — modelled calls carry arity and clobbers, but every function runs in ONE shared frame (entry RSP is the `STACK_BASE` constant), so the frame-activation refusal (section 18) is the stop-gap until the frame becomes an implicit parameter |
 | M3 stable IDs | (no gate exists yet) | **NOT DONE** — IR value numbers are per-function and not stable across passes, so cross-pass diffing is not available | needs a stable-id invariant pinned by a test |
-| M4 C emitter | `rdec c --corpus` | **RED, by design** — 156 lifted / **129 emitted** / **27 refused** / 0 invalid after passes. 129/27 is a FRESH measurement on this tree **and** on `40d14e1` (measured directly, clean worktree, objects regenerated) — so the row's previous **125 emitted** was STALE, carried over from a 152-function tree, and the tell was its own arithmetic: 125 + 27 = 152 against 156 lifted. Commit `cca1aa4` published "125 → 129 after the folded-SExt fix", which is FALSE — the fix moved no emitted count; corrected here. clang -Werror OK. Classes (measured with `RDEC_C_CENSUS_ALL=1`, each site named): 8 call-clobber, 6 `lea` of an unnameable address, 6 `lea` naming `.rdata` (all six are `switch_dense`/`switch_fallthrough` at O1/O2/Oz — the jump-table base), **3 `tail call to 'ext'`** + **1 `call to 'ext'`** (the new `tailcall_external` witnesses, one per -O level: the honest answer is a refusal, a prototype for an unnamed callee would be invented), 2 live-in `Rsp`, 1 `shufps` (packed SIMD, M8). Counts moved 140 -> 156 lifted and 21 -> 27 refused because the corpus grew 16 functions, 4 of them refusal witnesses. The arithmetic classes stay gone: 10 `cdq`, 6 `imul`, 4 `div` landed 2026-11-08 (`acc_forms.rs`). Remaining named gaps: the 128-bit `rdx:rax` dividend of `div`/`idiv r/m64`, quotient overflow (`#DE`), CF/OF after a 32-bit `mul`/`imul` (declared undefined), and **frame activation** — the model has one frame per function, the machine one per activation, and a caller whose frame slots a callee clobbers while it is live is now REFUSED, class `frame slots alias the callee's` (section 18). **Re-measured 2026-11-08 on branch `frame-activation`** (base `arity-wip` `def1647`, which took the row's 129/27 to **137/19** by closing the 8 `opaque: clobbered by call` sites): **156 lifted / 135 emitted / 21 refused / 0 invalid**, clang -Werror OK; classes (each site named): 6 `lea` unnameable | 6 `lea` naming `.rdata` | 3 `tail call to 'ext'` | **2 `frame slots alias the callee's`** (`call_helper.O0::f` and the self-recursive `fib_rec.O0::f`) | 2 live-in `Rsp` | 1 `call to 'ext'` | 1 `shufps`; `opaque: clobbered by call` is GONE | **frame activation: model the frame as an implicit parameter so each activation gets distinct memory** (the refusal is the stop-gap; section 18), then refusals -> 0 with every gap named in between |
-| T2 differential, C | `rdec t2 --corpus` | **GREEN as a sample** — 112 harnesses over 115 runnable functions (**2472** planned comparisons), compared **2452**, match **2452**, mismatch **0**, differing only above bit 31: **0**. The 20 not-compared runs are ALL machine-side `#DE` (`exit 0xc0000094`, STATUS_INTEGER_DIVIDE_BY_ZERO) on `div_unsigned`/`divmod_signed` at vectors 1 and 22 — the zero-divisor vectors, where the machine traps, the interpreter faults `Fault::DivZero`, and the emitted C answers 0. The harness names the faulting side and excludes them from the match count, so "2452/2452" is a claim about the division cases the machine survives. Memory axis **408/408**, IR leg **408/408** (unchanged: the new snippets are pure return-value shapes). The **+192 since the 2260 measurement earlier today** is exactly 8 functions x 24 vectors — `tailcall_local::f` at four -O levels (its emitted C answers with `return helper(a, b);`, compared against the machine's sibling-call answer) and `noreturn_call::f` at four (the `abort(); __builtin_unreachable();` leg present, never driven, the return leg compared). The earlier +464 is recorded in the M4 slice below. **Re-measured 2026-11-08 on branch `frame-activation`** (base `arity-wip` `def1647`, where the arity slice took the tuple RED to **2607 | 2580 | 27 mismatch | 21** — the 27 all in `call_helper` 21/96 + `fib_rec` 6/59): the frame-activation refusal takes the two aliasing functions out of the compared set and the tuple is **2560 | 2560 | mismatch 0 | 20 not-compared**, exit 0 — **the base 2452 is untouched** (2560 = 2452 + 72 `call_helper` + 36 `fib_rec`; the refused `call_helper.O0::f` costs its 24 vectors and the refused `fib_rec.O0::f` its 23), memory axis **408/408**, IR leg **408/408** | XMM0 class, more coverage, memory effects beyond the caller window |
+| M4 C emitter | `rdec c --corpus` | **RED, by design** — 156 lifted / **129 emitted** / **27 refused** / 0 invalid after passes. 129/27 is a FRESH measurement on this tree **and** on `40d14e1` (measured directly, clean worktree, objects regenerated) — so the row's previous **125 emitted** was STALE, carried over from a 152-function tree, and the tell was its own arithmetic: 125 + 27 = 152 against 156 lifted. Commit `cca1aa4` published "125 → 129 after the folded-SExt fix", which is FALSE — the fix moved no emitted count; corrected here. clang -Werror OK. Classes (measured with `RDEC_C_CENSUS_ALL=1`, each site named): 8 call-clobber, 6 `lea` of an unnameable address, 6 `lea` naming `.rdata` (all six are `switch_dense`/`switch_fallthrough` at O1/O2/Oz — the jump-table base), **3 `tail call to 'ext'`** + **1 `call to 'ext'`** (the new `tailcall_external` witnesses, one per -O level: the honest answer is a refusal, a prototype for an unnamed callee would be invented), 2 live-in `Rsp`, 1 `shufps` (packed SIMD, M8). Counts moved 140 -> 156 lifted and 21 -> 27 refused because the corpus grew 16 functions, 4 of them refusal witnesses. The arithmetic classes stay gone: 10 `cdq`, 6 `imul`, 4 `div` landed 2026-11-08 (`acc_forms.rs`). Remaining named gaps: the 128-bit `rdx:rax` dividend of `div`/`idiv r/m64`, quotient overflow (`#DE`), CF/OF after a 32-bit `mul`/`imul` (declared undefined), and **frame activation** — the model has one frame per function, the machine one per activation, and a caller whose frame slots a callee clobbers while it is live is now REFUSED, class `frame slots alias the callee's` (section 18). **Re-measured 2026-11-08 on branch `frame-activation`** (base `arity-wip` `def1647`, which took the row's 129/27 to **137/19** by closing the 8 `opaque: clobbered by call` sites): **156 lifted / 135 emitted / 21 refused / 0 invalid**, clang -Werror OK; classes (each site named): 6 `lea` unnameable | 6 `lea` naming `.rdata` | 3 `tail call to 'ext'` | **2 `frame slots alias the callee's`** (`call_helper.O0::f` and the self-recursive `fib_rec.O0::f`) | 2 live-in `Rsp` | 1 `call to 'ext'` | 1 `shufps`; `opaque: clobbered by call` is GONE | **frame activation: model the frame as an implicit parameter so each activation gets distinct memory** (the refusal is the stop-gap; section 18), then refusals -> 0 with every gap named in between. **Re-measured 2026-11-08 on branch `frame2`** (base `ab64a4d`, this box's clang 22.1.8, objects regenerated): **156 lifted / 135 emitted / 21 refused / 0 invalid**, census byte-identical to the row above (6 `lea` unnameable | 6 `lea` `.rdata` | 3 `tail call to 'ext'` | **2 `frame slots alias the callee's`** | 2 live-in `Rsp` | 1 `call to 'ext'` | 1 `shufps`; sum 21 = refused), clang -Werror OK. The gate gained a **`frame traffic:`** line — **49 functions on named slots | 3 with unbounded (indexed) frame traffic (`o65_f`, `o66_f`, `o67_f` = `locals_addressed`, all leaves) | 104 with no frame traffic**, a partition of the 156 that the corpus gate asserts. What changed is the row's STATUS as a contract: 135/21 was a clang-version fact (the CI runner's clang 20.1.8 printed **136 emitted / 20 refused / 1 invalid** on the parent commit, because one frame refusal keyed on a frame address the 20.1.8 codegen spelled with an index register), and it is now a rule fact — an unbounded (frame-rooted, unresolvable) access counts as a whole-window touch on every codegen (section 18.1) |
+| T2 differential, C | `rdec t2 --corpus` | **GREEN as a sample** — 112 harnesses over 115 runnable functions (**2472** planned comparisons), compared **2452**, match **2452**, mismatch **0**, differing only above bit 31: **0**. The 20 not-compared runs are ALL machine-side `#DE` (`exit 0xc0000094`, STATUS_INTEGER_DIVIDE_BY_ZERO) on `div_unsigned`/`divmod_signed` at vectors 1 and 22 — the zero-divisor vectors, where the machine traps, the interpreter faults `Fault::DivZero`, and the emitted C answers 0. The harness names the faulting side and excludes them from the match count, so "2452/2452" is a claim about the division cases the machine survives. Memory axis **408/408**, IR leg **408/408** (unchanged: the new snippets are pure return-value shapes). The **+192 since the 2260 measurement earlier today** is exactly 8 functions x 24 vectors — `tailcall_local::f` at four -O levels (its emitted C answers with `return helper(a, b);`, compared against the machine's sibling-call answer) and `noreturn_call::f` at four (the `abort(); __builtin_unreachable();` leg present, never driven, the return leg compared). The earlier +464 is recorded in the M4 slice below. **Re-measured 2026-11-08 on branch `frame-activation`** (base `arity-wip` `def1647`, where the arity slice took the tuple RED to **2607 | 2580 | 27 mismatch | 21** — the 27 all in `call_helper` 21/96 + `fib_rec` 6/59): the frame-activation refusal takes the two aliasing functions out of the compared set and the tuple is **2560 | 2560 | mismatch 0 | 20 not-compared**, exit 0 — **the base 2452 is untouched** (2560 = 2452 + 72 `call_helper` + 36 `fib_rec`; the refused `call_helper.O0::f` costs its 24 vectors and the refused `fib_rec.O0::f` its 23), memory axis **408/408**, IR leg **408/408** | XMM0 class, more coverage, memory effects beyond the caller window. **Re-measured 2026-11-08 on branch `frame2`** (base `ab64a4d`): tuple **UNMOVED at 2560 | 2560 | mismatch 0 | 20 not-compared**, exit 0, memory **408 | 408 | 0**, IR leg **408 | 408 | 0**, and a line-by-line diff of the gate's own output against the pre-fix run is EMPTY except the build's timing line — no function stopped being compared, because the widened rule's three unbounded functions (`locals_addressed`, see the M4 row) are leaves with no callee to alias with. The 20 `not compared` stay the machine-side `#DE` pair on `div_unsigned`/`divmod_signed` (section 18.1) |
 | T2 differential, C++ | `rdec t2 --cpp` | **GREEN as a sample** (measured 2026-11-08, after this slice's emitter change) — compared **856**, match **856**, mismatch **0**, not-compared **0**, over 18 RAX-class + 16 window-class + 5 XMM0-class functions; 22 native drivers, 2 decompiled runners, 0 restarts after faults. Return value and XMM0 bit pattern; the window class compares the return, not memory. This row re-reads the gate because `SDiv`/`SRem` now read their operands with the op's signedness, and the C++ corpus is where signed `/` and `%` reach the emitter from C++ types — the change is green on 856 C++ machine runs, not only on the C corpus. | memory effects; the window class compares the return, not the window |
 | M8 step 0 demangler | `rdec demangle --cpp` | **GREEN** — 68/68 supported symbols agree with `llvm-nm`, 1 template unsupported (named) | closed for the corpus; templates open |
 | M8 step 1-2 C++ through the pipeline | `rdec cpp --corpus` | **GREEN as a sample** (re-read 2026-11-08; the row said "RED by design — lifted 78, emitted 62, refused 16", which is a dated tree: the gate today prints **69 measured / 69 lifted / valid IR 69/69 / emitted C 64 / refused 5** and EXITS 0 with "the rest are named gaps"). Refusal classes: 4 `indirect call` (vtable dispatch, M8's next step), 1 call-clobber. This slice moved nothing here — measured: the C++ corpus imports no name in the noreturn family (`llvm-nm` over `corpus/cpp/*.obj`), and `corpus/cpp` is untouched by the slice, so the shared sig-table change cannot reach it. The row's old numbers are a corpus/gate history this table never recorded, which is what a dated row is for. | refusals -> 0 (4 vtable dispatches + 1) |
@@ -3483,6 +3483,94 @@ activation gets distinct memory and `call_helper.O0`/`fib_rec` EMIT and are
 compared again. The liveness rule is then subsumed: with per-activation
 frames the touched sets are disjoint by construction, and the refusal
 shrinks to zero on its own — which is the test that the model replaced it.
+
+### 18.1 The refusal moved with the compiler that built the inputs (measured 2026-11-08, branch `frame2`, base `ab64a4d`)
+
+**The divergence, verbatim.** The `gates` job on `ab64a4d` went red in two
+tests (`crates/cli/tests/arity_corpus.rs:83`,
+`crates/cli/tests/frame_activation.rs:78`) on ONE fact, the same
+`emit-c:` line read two ways:
+
+```
+CI   (windows-latest): emit-c: 156 lifted functions, 135 emitted C, 20 refused, 1 invalid after passes
+                       assertion `left == right` failed: 0 invalid … left: 1  right: 0
+this box (same commit): emit-c: 156 lifted functions, 135 emitted C, 21 refused, 0 invalid after passes
+```
+
+Same lifted, same emitted, a DIFFERENT BUCKET: on CI one of the two frame
+refusals did not fire, so that function EMITTED, and the differential pass
+then caught the emitted C as `invalid`. `.github/workflows/ci.yml`'s own
+`toolchain` step prints the runner's clang — **20.1.8** — where this box
+builds the corpus with **22.1.8** (the version the manifest header records).
+The corpus objects are generated per machine, so the two runs are not the
+same input: a 20.1.8 object spelled one frame store as
+`mov %edx, (%rsp,%rcx,4)` → `add 0x7fffc, mul(%rcx, 4)`, whose address
+`const_addr` cannot resolve, so the function recorded NO frame traffic,
+`inter.is_empty()` said "shares nothing", and the caller emitted.
+
+**`invalid` is the witness, not the bug.** The `1 invalid` is the pipeline
+being honest: the emitted C computed a wrong answer because the callee's
+activation overwrote a slot the caller reads back. Over-approximating on this
+defect is loud (a refusal: counted, censused, named); under-approximating is
+silent (a wrong answer, visible only if the vectors happen to cover it — the
+direction rule this repo has now been paid on twice, after the clobber list).
+**A refusal keyed on a compiler's spelling is not a refusal.**
+
+**The rule.** `frame_touch(f) -> FrameTouch { slots, unbounded }` — the
+resolvable in-window slots as before, PLUS `unbounded` when the function has a
+`Load`/`Store` whose address is FRAME-ROOTED and not constant-resolvable:
+frame-rooted means its operand tree contains an in-window `Const`, walking
+`Copy`/`Cast` every `Bin` arm (`Mul`, `Shl`, …), `Select` and `Phi` at
+`const_addr`'s own depth bound. A `Param`-rooted tree (the seeded
+caller-buffer shape `t2`'s memory comparison covers) contains no in-window
+constant and stays out, exactly as `const_addr`'s doc-comment promises.
+Sharing in `frame_alias_map`: an unbounded callee may write ANY window address,
+so it shares the caller's WHOLE known frame; an unbounded caller's live set IS
+the window, so it shares it with any callee that touches the frame at all
+(every frame-rooted load after the call is then a shared load — the wildcard
+widens WHICH load, never WHETHER liveness is required); both bounded is the
+literal intersection. Imports stay exempt, `Terminator::TailReturn` call sites
+stay exempt, self-calls keep the recursion wording, and the refusal text says
+WHICH side is unbounded.
+
+**Measured in this tree (clang 22.1.8, objects regenerated here).** `c
+--corpus`: **156 lifted / 135 emitted / 21 refused / 0 invalid** — UNMOVED,
+and that is the point: the widening costs no emission on this codegen. Its own
+line: `frame traffic: 49 functions on named slots | 3 with unbounded (indexed)
+frame traffic (3: o65_f, o66_f, o67_f) | 104 with no frame traffic` = 156, a
+partition of the lifted set asserted by the corpus gate (the buckets move with
+the compiler, the total does not). The three unbounded functions are all
+`locals_addressed` — `int *p = &a; … p = (p == &a) ? &b : &a;` — a moving
+pointer over two locals, and every one of them is a LEAF, which is why the
+refusal count did not move. `t2 --corpus` exit 0: **2560 | 2560 | mismatch 0 |
+20 not-compared**, memory **408/408/0**, IR leg **408/408/0**, and the
+gate-to-gate output diff against the pre-fix run names NO lost comparison.
+`lift --corpus` exit 0 (156/156 verify), `types --corpus` exit 0 with an
+unchanged census, `.gate/types-baseline` UNCHANGED (the ratchet is
+lie-family-keyed and the family counts did not move). MSVC leg,
+`RDEC_CL=… scripts/msvc-cl.cmd rdec msvc-gates --limit 40`: exit 0,
+`msvc-gates OK: 132 objects, 134 code symbols, census printed, nothing
+vacuous`, and its `c` leg prints **134 lifted / 125 emitted / 9 refused / 0
+invalid** over 4 census keys, none of them the frame class (the leg's census
+runs through `msvc_census`, which prints its own `emit-c:` line and no
+frame-traffic line); the generated `corpus/msvc/manifest.tsv` came back
+byte-identical to the committed one.
+
+**Fixtures, and one gap they found.** `m4::frame_alias_tests` gained (d) an
+indexed-callee refusal and (e) an unbounded-caller refusal, both HAND-BUILT IR
+with no compiler in the loop — (d) is the proof the rule does not depend on any
+one clang's spelling: it is the pre-fix bug reproduced with `Const`/`Param`/
+`Mul`/`Add` alone, red on `ab64a4d` (`the caller EMITTED: … refusal map: []`)
+and green on the rule; (f) pins the anti-over-fire side (a `Param`-rooted
+computed address is NOT frame-rooted); (g) pins that the wildcard does not
+delete liveness (an unbounded caller that reloads its frame cells before the
+call, plain and tail-call legs). Sabotages, each shown red: bounded-only
+(unbounded treated as touching nothing) reddens (d)+(e)+(g)'s liveness;
+"unbounded skips liveness" reddens (g); deleting the liveness gate for ALL
+sides reddens the pre-call-reload leg; and deleting the `TailReturn`
+exemption kept every pre-existing fixture GREEN — the exemption had NO witness
+on this base, so a leg was added for it (`tail_caller_post_load`) and the
+deletion now reddens it.
 
 ---
 

@@ -712,30 +712,113 @@ fn const_addr(f: &Function, v: VId, depth: u8) -> Option<u64> {
     }
 }
 
-/// The model addresses this function touches inside the frame window
-/// `[STACK_BASE - FRAME_WINDOW, STACK_BASE)`: the frame slots of its
-/// activation, every `Load`/`Store` whose address resolves to a constant in
-/// the window. Sorted and deduped on purpose: the shared address a refusal
-/// names is the LOWEST one, so the refusal text is deterministic for one
-/// input (the pipeline's determinism contract covers the census text too).
-pub fn frame_touched(f: &Function) -> Vec<u64> {
+/// Is `x` a frame-window address (the slots below the model's entry RSP)?
+fn in_window(x: u64) -> bool {
+    (STACK_BASE - FRAME_WINDOW..STACK_BASE).contains(&x)
+}
+
+/// Is the operand tree rooted at `v` FRAME-ROOTED: does it contain a constant
+/// inside the frame window, anywhere in the tree? This is the question the
+/// frame check has to ask of an address it CANNOT resolve, and it is deliberately
+/// wider than [`const_addr`]: it walks every `Bin` arm (`Mul`, `Shl`, `Add`, ...),
+/// `Copy`, `Cast`, `Phi` and `Select`, so the indexed-local shape clang spells
+/// as `mov %edx, (%rsp,%rcx,4)` ->
+/// `add 0x7fffc, mul(%rcx, 4)` IS frame-rooted, while the caller-buffer shape
+/// `add %param, 0x2008` is NOT: a `Param`-rooted tree carries no in-window
+/// constant, exactly as `const_addr`'s doc-comment promises about it. The
+/// depth bound is the same 8 as `const_addr`'s: beyond it the answer is "not
+/// frame-rooted", which is the CONSERVATIVE direction for over-fire only (a
+/// tree that deep is a refusal of nothing today and no corpus shape reaches it).
+fn frame_rooted(f: &Function, v: VId, depth: u8) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    let Some(ins) = f
+        .blocks
+        .iter()
+        .find_map(|b| b.instrs.iter().find(|i| i.dest == v))
+    else {
+        return false;
+    };
+    match &ins.op {
+        Op::Const(c) => in_window(*c),
+        Op::Copy(x) | Op::Cast(_, _, x) => frame_rooted(f, *x, depth + 1),
+        Op::Bin(_, a, b) => frame_rooted(f, *a, depth + 1) || frame_rooted(f, *b, depth + 1),
+        Op::Select(_, t, e) => frame_rooted(f, *t, depth + 1) || frame_rooted(f, *e, depth + 1),
+        Op::Phi(pairs) => pairs.iter().any(|(x, _)| frame_rooted(f, *x, depth + 1)),
+        _ => false,
+    }
+}
+
+/// One function's frame traffic, split by whether the model can NAME the
+/// addresses it touches.
+pub struct FrameTouch {
+    /// The constant-resolved in-window addresses it loads or stores, sorted
+    /// and deduped (the refusal names the LOWEST, so the text is deterministic).
+    pub slots: Vec<u64>,
+    /// At least one `Load`/`Store` has a FRAME-ROOTED address that is NOT
+    /// constant-resolvable - an indexed local, `add 0x7fffc, mul(%rcx, 4)`.
+    /// Such an access can reach EVERY address in the window (index 0 hits the
+    /// base itself), so the function's frame traffic is UNBOUNDED and the
+    /// check may not reason about it as a slot set. `Param`-rooted traffic (the
+    /// caller buffer) never sets this: it is not the function's frame.
+    pub unbounded: bool,
+}
+
+/// The frame traffic of `f`: which frame slots it provably touches, and
+/// whether it also has frame traffic the model cannot bound. See
+/// [`frame_rooted`] for what counts as the function's own frame and
+/// [`frame_alias_map`] for what the check does with the answer.
+pub fn frame_touch(f: &Function) -> FrameTouch {
     let mut v: Vec<u64> = Vec::new();
+    let mut unbounded = false;
     for b in &f.blocks {
         for ins in &b.instrs {
             let addr = match &ins.op {
                 Op::Load(_, a) | Op::Store(_, a, _) => *a,
                 _ => continue,
             };
-            if let Some(x) = const_addr(f, addr, 0) {
-                if (STACK_BASE - FRAME_WINDOW..STACK_BASE).contains(&x) {
-                    v.push(x);
-                }
+            match const_addr(f, addr, 0) {
+                Some(x) if in_window(x) => v.push(x),
+                // Unresolved (or resolved outside the window): frame-rooted
+                // traffic the model cannot name is the unbounded case.
+                _ => unbounded |= frame_rooted(f, addr, 0),
             }
         }
     }
     v.sort_unstable();
     v.dedup();
-    v
+    FrameTouch {
+        slots: v,
+        unbounded,
+    }
+}
+
+/// The model addresses this function touches inside the frame window
+/// `[STACK_BASE - FRAME_WINDOW, STACK_BASE)`: the frame slots of its
+/// activation, every `Load`/`Store` whose address resolves to a constant in
+/// the window. Sorted and deduped on purpose: the shared address a refusal
+/// names is the LOWEST one, so the refusal text is deterministic for one
+/// input (the pipeline's determinism contract covers the census text too).
+/// A thin wrapper over [`frame_touch`]: the slot set only, so a caller that
+/// cannot answer "what about the traffic you cannot name?" keeps compiling
+/// and stays honest about what it does not ask.
+pub fn frame_touched(f: &Function) -> Vec<u64> {
+    frame_touch(f).slots
+}
+
+/// Which side of a call cannot bound its own frame traffic. It decides both
+/// the shared set and the sentence, because the sentence has to say WHICH
+/// side the model is blind about.
+enum FrameSide {
+    /// Both sides are constant-bounded: the literal slot intersection.
+    Slots,
+    /// The callee's frame traffic is frame-rooted and unresolvable.
+    Callee,
+    /// The caller's is.
+    Caller,
+    /// Both are.
+    Both,
 }
 
 /// THE FRAME-ACTIVATION CHECK. The model gives every function ONE frame:
@@ -785,28 +868,63 @@ pub fn frame_touched(f: &Function) -> Vec<u64> {
 /// Keyed by `Subject::cname`, which embeds the object index (`o8_f`), so a
 /// callee name resolves within its own object by construction - the same
 /// global map `protos_of` uses, and `Op::Call` carries that same name.
+///
+/// UNBOUNDED FRAME TRAFFIC (2026-11-08, the CI red this commit fixes). The
+/// slot set above is an UNDER-APPROXIMATION: `const_addr` resolves a `Const`,
+/// a `Copy`, or `add`/`sub` over constants, so a frame access clang spells
+/// with an index register - `mov %edx, (%rsp,%rcx,4)` ->
+/// `add 0x7fffc, mul(%rcx, 4)` - resolves to nothing and the function records
+/// NO frame traffic. Measured: `c --corpus` on this commit printed `156
+/// lifted, 135 emitted, 21 refused, 0 invalid` on this box's clang 21.1.8 and
+/// `156 lifted, 136 emitted, 20 refused, 1 invalid` on the CI runner's clang
+/// 20.1.8 - same lifted, same emitted-for-the-same-reasons, and one frame
+/// refusal that did not fire because the object that triggers it was built by
+/// a different codegen. The `invalid` was the decompiled C computing the wrong
+/// answer: the callee's activation overwrote a slot the caller reads back. A
+/// refusal keyed on a compiler's SPELLING is not a refusal, and `invalid`
+/// catching it is the pipeline being honest, not the fix.
+///
+/// The rule, in the sound direction (over-approximating here REFUSES, which is
+/// loud, counted and named; under-approximating miscompiles in silence):
+/// [`frame_touch`] reports the resolvable slots AND an `unbounded` flag for
+/// frame-rooted traffic the model cannot name. A callee with `unbounded` may
+/// write ANY window address, so it shares the caller's WHOLE known frame; a
+/// caller with `unbounded` has a live set covering the whole window, so it
+/// shares it with any callee that touches the frame at all; both bounded is
+/// the literal intersection as before. Liveness is NOT relaxed by the
+/// wildcard - the refusal still requires a shared frame LOAD executing after
+/// the call, which is what keeps `tailcall_local.O0::f` emitting. Imports stay
+/// exempt (nothing is known about their frame, and over-refusing on imports
+/// punishes every function that calls `memcpy`), and `Terminator::TailReturn`
+/// calls stay exempt (the activation dies at the jump).
 pub fn frame_alias_map(subjects: &[Subject]) -> HashMap<String, Refusal> {
-    let touched: HashMap<&str, Vec<u64>> = subjects
+    let touch: HashMap<&str, FrameTouch> = subjects
         .iter()
-        .map(|s| (s.cname.as_str(), frame_touched(&s.f)))
+        .map(|s| (s.cname.as_str(), frame_touch(&s.f)))
         .collect();
     let mut out: HashMap<String, Refusal> = HashMap::new();
     for s in subjects {
-        let mine = &touched[s.cname.as_str()];
-        // No frame slots: nothing of this activation's can be aliased (the
-        // call_helper O1/O2/Oz legs - calls, no frame - keep emitting).
-        if mine.is_empty() {
+        let mine = &touch[s.cname.as_str()];
+        // No frame traffic at all: nothing of this activation's can be aliased
+        // (the call_helper O1/O2/Oz legs - calls, no frame - keep emitting).
+        if mine.slots.is_empty() && !mine.unbounded {
             continue;
         }
-        // Frame-address LOADS with their control position, and the block
-        // successor graph the "after the call" reachability runs on.
-        let mut loads: Vec<(usize, usize, u64)> = Vec::new();
+        // Frame-address LOADS with their control position. `Some(x)` is a
+        // resolved slot; `None` is a frame-rooted load the model cannot name -
+        // a candidate shared load only when the CALLER's traffic is unbounded
+        // (then its live set is the whole window), never a licence to skip
+        // liveness: see `live_load_after`.
+        let mut loads: Vec<(usize, usize, Option<u64>)> = Vec::new();
         for (bi, b) in s.f.blocks.iter().enumerate() {
             for (ii, ins) in b.instrs.iter().enumerate() {
                 if let Op::Load(_, a) = &ins.op {
-                    if let Some(x) = const_addr(&s.f, *a, 0) {
-                        if (STACK_BASE - FRAME_WINDOW..STACK_BASE).contains(&x) {
-                            loads.push((bi, ii, x));
+                    match const_addr(&s.f, *a, 0) {
+                        Some(x) if in_window(x) => loads.push((bi, ii, Some(x))),
+                        _ => {
+                            if frame_rooted(&s.f, *a, 0) {
+                                loads.push((bi, ii, None));
+                            }
                         }
                     }
                 }
@@ -841,44 +959,104 @@ pub fn frame_alias_map(subjects: &[Subject]) -> HashMap<String, Refusal> {
                     continue;
                 }
                 // Shared slots: self-recursion shares EVERY slot the
-                // function touches (one frame, two activations); an
-                // ordinary callee shares the intersection; an import (no
-                // lifted body) shares NOTHING - the model knows no frame
-                // for it, and over-refusing on imports would punish every
-                // function that calls `memcpy` (the anti-over-fire case).
+                // function touches (one frame, two activations); an ordinary
+                // callee shares the intersection, WIDENED to a whole-window
+                // wildcard on whichever side cannot bound its own frame
+                // traffic; an import (no lifted body) shares NOTHING - the
+                // model knows no frame for it, and over-refusing on imports
+                // would punish every function that calls `memcpy` (the
+                // anti-over-fire case).
                 let self_call = sym == &s.cname;
-                match touched.get(sym.as_str()) {
+                match touch.get(sym.as_str()) {
                     Some(theirs) => {
-                        let inter: Vec<u64> = mine
-                            .iter()
-                            .filter(|a| theirs.contains(a))
-                            .copied()
-                            .collect();
-                        if inter.is_empty() {
+                        let (shared, wildcard, side) = match (mine.unbounded, theirs.unbounded) {
+                            (false, false) => {
+                                let inter: Vec<u64> = mine
+                                    .slots
+                                    .iter()
+                                    .filter(|a| theirs.slots.contains(a))
+                                    .copied()
+                                    .collect();
+                                if inter.is_empty() {
+                                    continue;
+                                }
+                                (inter, false, FrameSide::Slots)
+                            }
+                            // An unbounded callee may write ANY window address,
+                            // so it shares the caller's whole known frame -
+                            // non-empty by construction: a caller with no slots
+                            // here has no live set for the callee to clobber.
+                            (false, true) => {
+                                if mine.slots.is_empty() {
+                                    continue;
+                                }
+                                (mine.slots.clone(), false, FrameSide::Callee)
+                            }
+                            // An unbounded caller's live set IS the whole
+                            // window, so it shares it with any callee that
+                            // touches the frame at all.
+                            (true, false) => {
+                                if theirs.slots.is_empty() {
+                                    continue;
+                                }
+                                (theirs.slots.clone(), true, FrameSide::Caller)
+                            }
+                            (true, true) => (Vec::new(), true, FrameSide::Both),
+                        };
+                        if !live_load_after(&loads, &succ, bi, ii, &shared, wildcard) {
                             continue;
                         }
-                        let low = inter[0];
-                        if !live_load_after(&loads, &succ, bi, ii, &inter) {
-                            continue;
-                        }
+                        let at = shared
+                            .first()
+                            .map(|a| format!("{a:#x}"))
+                            .unwrap_or_else(|| {
+                                "the whole frame window, unbounded (indexed access)".to_string()
+                            });
                         // A self-call is in this arm too (the subject's own
                         // body is keyed by its own cname) - it gets the
                         // recursion text, which names the self-call.
                         let reason = if self_call {
                             format!(
                                 "frame slots alias the callee's: {cname} calls itself and both \
-                                 frames use {low:#x} - the model has one frame per function, \
-                                 the machine has one per activation (recursion: activation 2 \
+                                 frames use {at} - the model has one frame per function, the \
+                                 machine has one per activation (recursion: activation 2 \
                                  overwrites activation 1's slots)",
                                 cname = s.cname,
                             )
                         } else {
-                            format!(
-                                "frame slots alias the callee's: {} and {} both use {low:#x} - \
-                                 the model has one frame per function, the machine has one per \
-                                 activation",
-                                s.cname, sym,
-                            )
+                            match side {
+                                FrameSide::Slots => format!(
+                                    "frame slots alias the callee's: {} and {} both use {at} - \
+                                     the model has one frame per function, the machine has one \
+                                     per activation",
+                                    s.cname, sym,
+                                ),
+                                FrameSide::Callee => format!(
+                                    "frame slots alias the callee's: {} and {} share the frame: \
+                                     the callee's frame traffic is unbounded - not \
+                                     constant-bounded (indexed access) - so it may write any slot \
+                                     the caller lives across (its lowest is {at}) - the model has \
+                                     one frame per function, the machine has one per activation",
+                                    s.cname, sym,
+                                ),
+                                FrameSide::Caller => format!(
+                                    "frame slots alias the callee's: {} and {} share the frame: \
+                                     the caller's frame traffic is unbounded - not \
+                                     constant-bounded (indexed access) - so its live set covers \
+                                     the whole window and the callee writes {at} in it - the \
+                                     model has one frame per function, the machine has one per \
+                                     activation",
+                                    s.cname, sym,
+                                ),
+                                FrameSide::Both => format!(
+                                    "frame slots alias the callee's: {} and {} share the frame: \
+                                     both sides' frame traffic is unbounded - not \
+                                     constant-bounded (indexed access) - so both cover the whole \
+                                     window - the model has one frame per function, the machine \
+                                     has one per activation",
+                                    s.cname, sym,
+                                ),
+                            }
                         };
                         out.entry(s.cname.clone()).or_insert(Refusal {
                             at: ins.addr,
@@ -893,19 +1071,20 @@ pub fn frame_alias_map(subjects: &[Subject]) -> HashMap<String, Refusal> {
                         // Recursion: the second activation's frame IS the
                         // first one. Same liveness bound: the recursive
                         // call's spills overwrite the slots the caller reads
-                        // back on the way (the fib_rec shape).
-                        if !live_load_after(&loads, &succ, bi, ii, mine) {
+                        // back on the way (the fib_rec shape), and the same
+                        // wildcard when the function's own traffic is indexed.
+                        if !live_load_after(&loads, &succ, bi, ii, &mine.slots, mine.unbounded) {
                             continue;
                         }
                         out.entry(s.cname.clone()).or_insert(Refusal {
                             at: ins.addr,
                             reason: format!(
                                 "frame slots alias the callee's: {cname} calls itself and both \
-                                 frames use {addr:#x} - the model has one frame per function, \
-                                 the machine has one per activation (recursion: activation 2 \
+                                 frames use {at:#x} - the model has one frame per function, the \
+                                 machine has one per activation (recursion: activation 2 \
                                  overwrites activation 1's slots)",
                                 cname = s.cname,
-                                addr = mine[0],
+                                at = mine.slots[0],
                             ),
                         });
                         break 'calls;
@@ -925,12 +1104,20 @@ pub fn frame_alias_map(subjects: &[Subject]) -> HashMap<String, Refusal> {
 /// which is the sound direction for a refusal), and the within-block bound
 /// is what keeps `tailcall_local.O0::f` - all its loads before the call,
 /// no successor blocks - out of the refusal.
+///
+/// `wildcard` is the UNBOUNDED CALLER: its live set covers the whole window,
+/// so a frame-rooted load the model cannot name (`None`) is a shared load.
+/// It widens WHICH load counts, never WHETHER liveness is required: a
+/// function that reloads its frame cells before the call and then tail-jumps
+/// keeps emitting with `wildcard` set, which is what the `pre_load_caller`
+/// and `tail_call_leg` fixtures pin against the sabotage.
 fn live_load_after(
-    loads: &[(usize, usize, u64)],
+    loads: &[(usize, usize, Option<u64>)],
     succ: &[Vec<rdec_core::ir::BbId>],
     bi: usize,
     ii: usize,
     shared: &[u64],
+    wildcard: bool,
 ) -> bool {
     let mut reach: Vec<bool> = vec![false; succ.len()];
     let mut stack: Vec<rdec_core::ir::BbId> = succ.get(bi).cloned().unwrap_or_default();
@@ -942,7 +1129,12 @@ fn live_load_after(
         }
     }
     loads.iter().any(|(lb, li, a)| {
-        shared.contains(a)
+        // Every entry is a frame-rooted load (a resolved window slot, or an
+        // address rooted in one that the model cannot name). With `wildcard`
+        // the caller's live set IS the window, so any of them is shared;
+        // without it, only the addresses on the shared list are.
+        let is_shared = wildcard || matches!(a, Some(x) if shared.contains(x));
+        is_shared
             && ((lb == &bi && li > &ii) || (lb != &bi && reach.get(*lb).copied().unwrap_or(false)))
     })
 }
@@ -1012,6 +1204,45 @@ pub fn tail_line(subjects: &[Subject]) -> String {
         line.push_str(&format!(" | {a:#x} -> {sym}"));
     }
     line
+}
+
+/// The frame-traffic census, on the same footing as `calls_line`: how many
+/// lifted functions carry frame traffic the model can NAME (constant slots),
+/// how many carry frame-rooted traffic it CANNOT name (indexed access), and
+/// how many touch no frame at all. `c --corpus` prints it, because the middle
+/// number is the quantity the frame-activation refusal is calibrated on: it is
+/// the count that MOVES with the compiler that built the objects (this box's
+/// clang 21.1.8 and the CI runner's 20.1.8 build the same sources into
+/// different spellings), and a refusal keyed on a spelling is only catchable
+/// where the spelling is visible. `frame_touched` is the bounded arm's question
+/// and `frame_touch`'s flag the wildcard arm's, so both are computed here.
+pub fn frame_traffic_line(subjects: &[Subject]) -> String {
+    let (mut named, mut unbounded, mut none) = (0usize, 0usize, 0usize);
+    let mut who: Vec<&str> = Vec::new();
+    for s in subjects {
+        let slots = frame_touched(&s.f);
+        let t = frame_touch(&s.f);
+        if t.unbounded {
+            unbounded += 1;
+            who.push(&s.cname);
+        } else if !slots.is_empty() {
+            named += 1;
+        } else {
+            none += 1;
+        }
+    }
+    // The record dump names WHICH functions: the middle number is a census, and
+    // on the machine whose clang spells a frame access with an index register it
+    // is the list that tells you which leg the refusal has to stop.
+    let names = if std::env::var_os("RDEC_C_CENSUS_ALL").is_some() {
+        format!(" ({}: {})", who.len(), who.join(", "))
+    } else {
+        String::new()
+    };
+    format!(
+        "frame traffic: {named} functions on named slots | {unbounded} with unbounded (indexed) \
+         frame traffic{names} | {none} with no frame traffic"
+    )
 }
 
 /// The relocation census, on the same footing as `calls_line`: N is what the
@@ -1119,6 +1350,7 @@ pub fn cmd_c(args: &[String]) -> Result<i32, String> {
     let frame_alias = frame_alias_map(&subjects);
     println!("{}", calls_line(&subjects));
     println!("{}", tail_line(&subjects));
+    println!("{}", frame_traffic_line(&subjects));
     println!("{}", relocs_line(&subjects));
     // The callee shapes of the whole translation unit, built once, before the
     // first function is emitted: a call to a sibling needs a prototype that
@@ -1421,10 +1653,10 @@ pub fn sse_line(sse: &std::collections::BTreeMap<String, u32>, zeroing: usize) -
 
 #[cfg(test)]
 mod frame_alias_tests {
-    use super::{frame_alias_map, frame_touched, key, Subject};
+    use super::{frame_alias_map, frame_touch, frame_touched, key, Subject};
     use rdec_arch_x86::lift::{FnAbi, Report, STACK_BASE};
     use rdec_core::emit_c::Refusal;
-    use rdec_core::ir::{Callee, Function, Op, Terminator};
+    use rdec_core::ir::{BinOp, Callee, Function, Op, Terminator};
     use rdec_core::ty::Ty;
     use std::collections::HashMap;
 
@@ -1643,6 +1875,20 @@ mod frame_alias_tests {
             !frame_alias_map(&pre_load).contains_key("o7_h"),
             "a shared slot the caller reads only BEFORE the call is not a live clobber"
         );
+        // The TailReturn exemption's own leg: a frame load whose INDEX follows
+        // a modelled tail call. The liveness gate is index-based and would
+        // refuse it; the exemption - the activation is dead at the `jmp` - is
+        // what keeps the emission standing. Deleting the exemption was measured
+        // to leave every other leg green, so this one exists.
+        let tail_post = vec![
+            subject("o7_j", tail_caller_post_load("o7_j", SLOT_A, "o7_k")),
+            subject("o7_k", leaf("o7_k", &[SLOT_A])),
+        ];
+        assert!(
+            !frame_alias_map(&tail_post).contains_key("o7_j"),
+            "a frame load whose index follows a TAIL call is not live across it: the \
+             TailReturn exemption is what keeps this function emitting"
+        );
     }
 
     /// (c) The recursion leg: `f` calling `f` with frame slots shares one
@@ -1679,6 +1925,277 @@ mod frame_alias_tests {
             !m2.contains_key("o9_g"),
             "recursion without frame slots aliases no slot: {m2:?}"
         );
+    }
+
+    /// A callee whose ONLY frame traffic is a COMPUTED (indexed) address -
+    /// the machine shape of an indexed local, `mov %edx, (%rsp,%rcx,4)`,
+    /// which lifts to `store %addr = %p` with
+    /// `%addr = add 0x7fffc, mul(%param, 4)`. The base constant is inside the
+    /// frame window; the address is NOT constant-resolvable, so the model
+    /// cannot name the slot the callee writes. Hand-built IR, no compiler:
+    /// this is the shape that made the CI `c --corpus` leg print `1 invalid`
+    /// (see `crates/cli/tests/frame_activation.rs`), and it is deliberately
+    /// spelled with only `Const`/`Param`/`Mul`/`Add` so no one clang version's
+    /// lowering is load-bearing.
+    fn indexed_leaf(cname: &str, slot: u64) -> Function {
+        let mut f = Function::new(cname, 0x2000);
+        f.ret_ty = Ty::u64();
+        let bb = f.entry;
+        let p = f.emit(bb, Op::Param, Ty::u64(), 0x2000);
+        f.params.push(p);
+        f.param_tys.push(Ty::u64());
+        // The index register (a register value; a Param is what a lifted
+        // register read is after SSA construction).
+        let k = f.emit(bb, Op::Param, Ty::u64(), 0x2001);
+        f.params.push(k);
+        f.param_tys.push(Ty::u64());
+        let scale = f.emit(bb, Op::Const(4), Ty::u64(), 0x2002);
+        let off = f.emit(bb, Op::Bin(BinOp::Mul, k, scale), Ty::u64(), 0x2003);
+        let base = f.emit(bb, Op::Const(slot), Ty::u64(), 0x2004);
+        let addr = f.emit(bb, Op::Bin(BinOp::Add, base, off), Ty::u64(), 0x2005);
+        f.emit_void(bb, Op::Store(Ty::u64(), addr, p), 0x2006);
+        f.block_mut(bb).term = Terminator::Return(p);
+        f
+    }
+
+    /// The `Terminator::TailReturn` exemption's OWN witness: a modelled tail
+    /// call whose block ALSO contains a frame load at a LATER index than the
+    /// call. The machine cannot have one (the block ends in `jmp callee`, so
+    /// such a load is dead by construction), and the liveness gate is
+    /// index-based, so this is precisely the shape the exemption exists for.
+    /// It is pinned because DELETING the exemption was measured (this commit)
+    /// to leave every other fixture green: an unexercised guard is a guard no
+    /// test can miss.
+    fn tail_caller_post_load(cname: &str, slot: u64, callee: &str) -> Function {
+        let mut f = tail_caller(cname, slot, callee);
+        let bb = f.entry;
+        let c = match f.block_mut(bb).term {
+            Terminator::TailReturn(c) => c,
+            _ => panic!("tail_caller builds a TailReturn"),
+        };
+        let a = f.emit(bb, Op::Const(slot), Ty::u64(), 0x1020);
+        f.emit(bb, Op::Load(Ty::u64(), a), Ty::u64(), 0x1021);
+        f.block_mut(bb).term = Terminator::TailReturn(c);
+        f
+    }
+
+    /// (d) THE COMPILER-INDEPENDENT DIRECTION. The caller spills a constant
+    /// displacement (`0x7fffc`) and READS IT BACK AFTER the call - the exact
+    /// liveness the rule needs - and its callee's only frame store is the
+    /// indexed address above. The callee may write the caller's slot (index 0
+    /// writes `0x7fffc` itself); the model cannot bound where it writes, so
+    /// the caller must be REFUSED and must not emit. Under-approximating here
+    /// is the silent direction: the caller emits, the callee's activation
+    /// overwrites the caller's slot, the answer is wrong, and only a
+    /// differential pass with the luck of a covering vector sees it.
+    #[test]
+    fn a_callee_whose_only_frame_store_is_an_indexed_address_refuses_its_caller() {
+        let subjects = vec![
+            subject("o6_f", caller("o6_f", SLOT_A, &["o6_h"])),
+            subject("o6_h", indexed_leaf("o6_h", SLOT_A)),
+        ];
+        let m = frame_alias_map(&subjects);
+        let r: &Refusal = m.get("o6_f").unwrap_or_else(|| {
+            panic!(
+                "the caller EMITTED: its callee's ONLY frame store is an indexed address \
+                 (add {SLOT_A:#x}, mul(param, 4)), which the model cannot resolve, so it must \
+                 count as a whole-window touch. refusal map: {:?}",
+                m.keys().collect::<Vec<_>>()
+            )
+        });
+        assert_eq!(key(r), "frame slots alias the callee's");
+        assert!(
+            r.reason.contains("o6_f and o6_h"),
+            "the refusal names caller and callee: {}",
+            r.reason
+        );
+        assert!(
+            r.reason.contains("unbounded"),
+            "the refusal must say WHICH side is unbounded: {}",
+            r.reason
+        );
+        // The traffic the rule reads: the callee names NO slot and is flagged
+        // unbounded; the caller keeps its one resolved slot and stays bounded.
+        let callee_touch = frame_touch(&subjects[1].f);
+        assert!(
+            callee_touch.slots.is_empty() && callee_touch.unbounded,
+            "the indexed store names no slot and must set the unbounded flag: {:?} {}",
+            callee_touch.slots,
+            callee_touch.unbounded
+        );
+        let caller_touch = frame_touch(&subjects[0].f);
+        assert!(
+            caller_touch.slots == vec![SLOT_A] && !caller_touch.unbounded,
+            "a constant-disp caller stays bounded: {:?} {}",
+            caller_touch.slots,
+            caller_touch.unbounded
+        );
+        // The callee itself calls nothing: not refused for being aliased into.
+        assert!(!m.contains_key("o6_h"));
+    }
+
+    /// (e) The same unbounded traffic on the CALLER side: its live set covers
+    /// the whole window, so a callee that touches the frame at all shares it.
+    /// The callee's store is a constant slot the caller's indexed access can
+    /// name no address for - the intersection is empty and yet the clobber is
+    /// real, so the caller (which reads a frame cell back after the call) is
+    /// refused naming the CALLER as the unbounded side.
+    #[test]
+    fn a_caller_with_an_indexed_frame_access_is_refused_by_any_frame_touching_callee() {
+        let mut caller = Function::new("o6_k", 0x1000);
+        caller.ret_ty = Ty::u64();
+        let bb = caller.entry;
+        let p = caller.emit(bb, Op::Param, Ty::u64(), 0x1000);
+        caller.params.push(p);
+        caller.param_tys.push(Ty::u64());
+        let k = caller.emit(bb, Op::Param, Ty::u64(), 0x1001);
+        caller.params.push(k);
+        caller.param_tys.push(Ty::u64());
+        // store into the indexed slot (unbounded frame traffic)
+        let scale = caller.emit(bb, Op::Const(4), Ty::u64(), 0x1002);
+        let off = caller.emit(bb, Op::Bin(BinOp::Mul, k, scale), Ty::u64(), 0x1003);
+        let base = caller.emit(bb, Op::Const(SLOT_B), Ty::u64(), 0x1004);
+        let addr = caller.emit(bb, Op::Bin(BinOp::Add, base, off), Ty::u64(), 0x1005);
+        caller.emit_void(bb, Op::Store(Ty::u64(), addr, p), 0x1006);
+        // the call, then a load of a CONSTANT slot in a slot the callee does
+        // not touch - the intersection is empty; the wildcard is the caller.
+        let c = caller.emit(
+            bb,
+            Op::Call {
+                callee: Callee::Symbol("o6_l".to_string()),
+                ret_ty: Ty::u64(),
+                args: Box::new([p]),
+                pure: false,
+            },
+            Ty::u64(),
+            0x1010,
+        );
+        let a2 = caller.emit(bb, Op::Const(SLOT_A), Ty::u64(), 0x1020);
+        let v = caller.emit(bb, Op::Load(Ty::u64(), a2), Ty::u64(), 0x1021);
+        let _ = c;
+        caller.block_mut(bb).term = Terminator::Return(v);
+        let subjects = vec![
+            subject("o6_k", caller),
+            subject("o6_l", leaf("o6_l", &[SLOT_B])),
+        ];
+        let m = frame_alias_map(&subjects);
+        let r: &Refusal = m.get("o6_k").expect(
+            "a caller whose live set covers the whole window shares it with any callee \
+             that touches the frame at all",
+        );
+        assert_eq!(key(r), "frame slots alias the callee's");
+        assert!(
+            r.reason.contains("o6_k and o6_l") && r.reason.contains("caller's"),
+            "the refusal names both sides and says the CALLER is the unbounded one: {}",
+            r.reason
+        );
+    }
+
+    /// (f) The anti-over-fire direction for the new rule: a Param-rooted
+    /// computed address - the seeded caller-buffer shape `t2`'s memory
+    /// comparison covers - is NOT frame-rooted. A callee whose only memory
+    /// traffic is `store [param + 8] = p` touches no frame, so its caller
+    /// keeps emitting; make frame-rooted fire on a Param base and the
+    /// caller-buffer legs die here first.
+    #[test]
+    fn a_param_rooted_computed_address_is_not_frame_rooted() {
+        let mut callee = Function::new("o4_m", 0x2000);
+        callee.ret_ty = Ty::u64();
+        let bb = callee.entry;
+        let p = callee.emit(bb, Op::Param, Ty::u64(), 0x2000);
+        callee.params.push(p);
+        callee.param_tys.push(Ty::u64());
+        let buf = callee.emit(bb, Op::Param, Ty::u64(), 0x2001);
+        callee.params.push(buf);
+        callee.param_tys.push(Ty::u64());
+        // buf + 0x2008: the caller buffer's own cell (STACK_BASE + 0x8 is the
+        // window `t2` seeds at param 0). Out of the frame window by geometry.
+        let off = callee.emit(bb, Op::Const(0x2008), Ty::u64(), 0x2002);
+        let addr = callee.emit(bb, Op::Bin(BinOp::Add, buf, off), Ty::u64(), 0x2003);
+        callee.emit_void(bb, Op::Store(Ty::u64(), addr, p), 0x2004);
+        callee.block_mut(bb).term = Terminator::Return(p);
+        let subjects = vec![
+            subject("o4_f", caller("o4_f", SLOT_A, &["o4_m"])),
+            subject("o4_m", callee),
+        ];
+        let m = frame_alias_map(&subjects);
+        assert!(
+            !m.contains_key("o4_f"),
+            "a Param-rooted computed address is not frame traffic: {:?}",
+            m.keys().collect::<Vec<_>>()
+        );
+        assert!(frame_touched(&subjects[1].f).is_empty());
+        assert!(
+            !frame_touch(&subjects[1].f).unbounded,
+            "a caller-buffer store is not unbounded FRAME traffic"
+        );
+    }
+
+    /// (g) The wildcard is not a licence to skip LIVENESS. An UNBOUNDED caller
+    /// (indexed frame store) that reloads its frame cell BEFORE the call and
+    /// then makes a plain call, and the same shape as a modelled TAIL CALL,
+    /// must both keep emitting: the callee's clobber is unobservable, exactly
+    /// as in `tailcall_local.O0::f` - the reach rule is a measured bound, not
+    /// caution. Make the unbounded side refuse on ANY frame-rooted access and
+    /// these two legs go red; the `unbounded` assertions below are what prove
+    /// the legs are live (a fixture leg that never exercises the rule agrees
+    /// with any bug).
+    #[test]
+    fn an_unbounded_caller_that_reads_its_frame_only_before_the_call_keeps_emitting() {
+        for tail in [false, true] {
+            let mut f = Function::new("o6_p", 0x1000);
+            f.ret_ty = Ty::u64();
+            let bb = f.entry;
+            let p = f.emit(bb, Op::Param, Ty::u64(), 0x1000);
+            f.params.push(p);
+            f.param_tys.push(Ty::u64());
+            let k = f.emit(bb, Op::Param, Ty::u64(), 0x1001);
+            f.params.push(k);
+            f.param_tys.push(Ty::u64());
+            // indexed frame store: the caller's frame traffic is unbounded
+            let scale = f.emit(bb, Op::Const(4), Ty::u64(), 0x1002);
+            let off = f.emit(bb, Op::Bin(BinOp::Mul, k, scale), Ty::u64(), 0x1003);
+            let base = f.emit(bb, Op::Const(SLOT_B), Ty::u64(), 0x1004);
+            let addr = f.emit(bb, Op::Bin(BinOp::Add, base, off), Ty::u64(), 0x1005);
+            f.emit_void(bb, Op::Store(Ty::u64(), addr, p), 0x1006);
+            // the reload, BEFORE the call (the measured tailcall_local leg)
+            let a2 = f.emit(bb, Op::Const(SLOT_A), Ty::u64(), 0x1007);
+            let v = f.emit(bb, Op::Load(Ty::u64(), a2), Ty::u64(), 0x1008);
+            let c = f.emit(
+                bb,
+                Op::Call {
+                    callee: Callee::Symbol("o6_q".to_string()),
+                    ret_ty: Ty::u64(),
+                    args: Box::new([p]),
+                    pure: false,
+                },
+                Ty::u64(),
+                0x1010,
+            );
+            f.block_mut(bb).term = if tail {
+                Terminator::TailReturn(c)
+            } else {
+                Terminator::Return(v)
+            };
+            let touch = frame_touch(&f);
+            assert!(
+                touch.unbounded,
+                "the leg must exercise the wildcard: the caller's own frame traffic is bounded"
+            );
+            let subjects = vec![
+                subject("o6_p", f),
+                subject("o6_q", leaf("o6_q", &[SLOT_A, SLOT_B])),
+            ];
+            let m = frame_alias_map(&subjects);
+            assert!(
+                !m.contains_key("o6_p"),
+                "an unbounded caller with no frame read AFTER the call ({}, {}) is refused: {:?} - \
+                 the wildcard widens WHICH load is shared, it does not delete the liveness bound",
+                if tail { "tail call" } else { "plain call" },
+                SLOT_A,
+                m.get("o6_p").map(|r| r.reason.clone()),
+            );
+        }
     }
 }
 
