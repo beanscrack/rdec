@@ -3483,3 +3483,53 @@ activation gets distinct memory and `call_helper.O0`/`fib_rec` EMIT and are
 compared again. The liveness rule is then subsumed: with per-activation
 frames the touched sets are disjoint by construction, and the refusal
 shrinks to zero on its own — which is the test that the model replaced it.
+
+---
+
+## 19. Data symbols: what the answer has to cover, measured on the MSVC leg (2026-11-08)
+
+The roadmap has carried "where do data symbols live in the per-object address space" as an
+open scoping call for the clang leg's `lea` records. Today it acquired an MSVC-leg witness, a
+measurement of what a naive answer misses, and the tool the decision has to be made with.
+
+`rdec msvc-gates --limit 40` (my tree, HEAD ab64a4d, exit 0): `134 lifted functions, 125 emitted
+C, 9 refused, 0 invalid`, census `3 flag setting against a cell whose relocation names no
+address | 3 tail call to 'ext' | 2 lea of an address we cannot name | 1 call to 'ext'` (sums to
+9). The 3 + 2 + 1 = 6 records naming a data target are this decision; the 3 + 1 'ext' records are
+the extern-prototype blessing, a separate decision.
+
+The mechanism, at the instruction, because the census key says it and the bytes confirm it. The
+first record is `corpus/msvc/obj/array_walk.O2.obj :: f @ 0x2f`, whose instruction is
+`cmpl $0x2, (%rip)` — a comparison against a `.data` static. Its relocation, read from the COFF
+tables (`python scripts/coff-relocs.py corpus/msvc/obj/array_walk.O2.obj --at 0x20 0x45`):
+
+    .text rva=0x0031 DIR32 sym='J' -> section .debug$S value=0xa
+
+and `lift.rs`'s own comment at the refusal site records the same fact from the Rust side: "the
+leg's relocation map places CODE sections, so a compare against a static in `.data`/`.bss` has a
+target with no address." The lifter's refusal text — "a cell whose relocation names no address" —
+is accurate, and it is an address-space decision, not a lifter gap. My first reading of this site
+("the cell must be a stack slot, widen the rule to frame slots") was WRONG, and the refusal text
+is what corrected it: the census key is the ledger telling you which component owns the work.
+
+Two things the decision must now cover, both measured today:
+
+1. The clang leg (the original ask): 12 records, `6 lea of an address we cannot name` + `6 ...
+   naming .rdata`. A relocation-directory walk (PE format) settles the clang objects.
+2. The MSVC leg (new): an MSVC global reference is a **DIR32 relocation against a symbol whose
+   section is `.debug$S`** — the corpus is built `/nologo /c /Gw- /O2 /GS` with no `/Z7`, yet the
+   symbol table is CodeView-shaped, so naming an MSVC data symbol is a **COFF symbol-table +
+   string-table walk, not a relocation-directory walk**. An answer scoped to "the PE `.reloc`
+   directory" closes the clang records and leaves all 3 MSVC records standing. Say the scope out
+   loud when making the call.
+
+Inspection tool added with this row: `scripts/coff-relocs.py` (`--at LO HI`, `--summary`). It
+exists because **`objdump -r` prints NOTHING for an MSVC x64 object** — binutils refuses the file
+(`objdump -d` on it is empty too), so until today there was no way to read an MSVC object's
+relocations from this repo, and the 3 records could not be inspected at all. It prints target
+sections and marks CodeView relocations, because CodeView's own relocations live in the same
+array as the data references — anything that names an address has to say which target sections it
+accepts, and that filter is part of the decision.
+
+Nothing in the clang corpus floors moves from this; the 6 MSVC records and the 12 clang records
+stay in the census, loud, until the address space is chosen.
