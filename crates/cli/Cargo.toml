@@ -14,3 +14,9 @@ rdec-core = { workspace = true }
 rdec-arch-x86 = { workspace = true }
 rdec-verify = { workspace = true }
 rdec-demangle = { workspace = true }
+
+[dev-dependencies]
+# The pass-isolation pinning test asserts the printed pass count against the
+# pipeline's own table (`rdec_core::passes::PRE_EMIT_PASSES`) - one source of
+# truth, no parallel hardcoded 7.
+rdec-core = { workspace = true }

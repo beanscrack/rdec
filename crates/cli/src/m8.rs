@@ -1374,6 +1374,10 @@ pub fn cmd_cpp(args: &[String]) -> Result<i32, String> {
     let mut pass_broken = 0usize;
     let mut emitted = 0usize;
     let mut refused = 0usize;
+    // Union of the per-pass verification bits from every subject's `clean`
+    // run (`Subject::iso`); the `pass isolation:` summary prints its popcount,
+    // the same silent-path line `rdec c --corpus` prints.
+    let mut iso_bits: u32 = 0;
     let mut keys: BTreeMap<String, usize> = BTreeMap::new();
     let mut gap: BTreeMap<String, usize> = BTreeMap::new();
     let mut first_refusal: Option<String> = None;
@@ -1407,6 +1411,17 @@ pub fn cmd_cpp(args: &[String]) -> Result<i32, String> {
 
     for s in &subjects {
         lifted += 1;
+        iso_bits |= s.iso.verified;
+        if let Some(b) = &s.iso.broke {
+            println!(
+                "pass-broke-ssa record: {} :: {}: after pass {} '{}': {}",
+                s.obj,
+                s.sym,
+                b.index,
+                b.name,
+                b.errors.join("; ")
+            );
+        }
         scan_gaps(&s.f, &mut gap);
         let dem = dem_of.get(&s.sym);
         let kind_line = match dem {
@@ -1690,6 +1705,10 @@ pub fn cmd_cpp(args: &[String]) -> Result<i32, String> {
         );
     }
     println!("compared: {compared} | lifted: {lifted} | valid IR: {}/{lifted} | emitted C: {emitted} | refused: {refused}", lifted - pass_broken);
+    println!(
+        "pass isolation: {} passes verified on {emitted} emitted functions",
+        iso_bits.count_ones()
+    );
     println!(
         "this-in-RCX: {this_lifted} member/ctor/dtor functions lifted with the class pointer modelled as parameter 0; {this_emitted} of them emitted C"
     );

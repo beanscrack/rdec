@@ -1055,6 +1055,17 @@ pub fn cmd_t2(args: &[String]) -> Result<i32, String> {
                 .or_default()
                 .push(tag.clone());
         };
+        if let Some(b) = &s.iso.broke {
+            // Name the pass, not just the bucket (same record as `rdec c`).
+            println!(
+                "pass-broke-ssa record: {} :: {}: after pass {} '{}': {}",
+                s.obj,
+                s.sym,
+                b.index,
+                b.name,
+                b.errors.join("; ")
+            );
+        }
         if rdec_core::verify::verify_ssa(&s.f).is_err() {
             broken += 1;
             continue;
@@ -3244,6 +3255,17 @@ pub(crate) fn t2_cpp_run(
     for (si, s) in p.subjects.iter().enumerate() {
         rep.lifted += 1;
         let tag = format!("{} :: {}", s.obj, s.sym);
+        if let Some(b) = &s.iso.broke {
+            // Name the pass, not just the bucket (same record as `rdec c`).
+            println!(
+                "pass-broke-ssa record: {} :: {}: after pass {} '{}': {}",
+                s.obj,
+                s.sym,
+                b.index,
+                b.name,
+                b.errors.join("; ")
+            );
+        }
         if rdec_core::verify::verify_ssa(&s.f).is_err() {
             bucket(&mut rep, &tag, "broken (passes)");
             rep.broken += 1;

@@ -3653,3 +3653,74 @@ accepts, and that filter is part of the decision.
 
 Nothing in the clang corpus floors moves from this; the 6 MSVC records and the 12 clang records
 stay in the census, loud, until the address space is chosen.
+
+## 20. Pass isolation: the pipeline can now name its own SSA break, and the pass it named first (measured 2026-11-08, branch `ssa-bisect` from `6523cdc`)
+
+The CI record this closes (runs 42541539697, 42541851785, red since `ab64a4d`, verbatim):
+
+```
+invalid record: corpus\obj\locals_addressed.O2.obj :: f: %50 defined in bb2 is not available on the edge bb6 -> bb7; %52 defined in bb2 is not available on the edge bb6 -> bb7
+emit-c: 156 lifted functions, 135 emitted C, 20 refused, 1 invalid after passes
+```
+
+`invalid` is `verify_ssa` failing AFTER the passes. It is a structural break, not a wrong answer:
+`t2 --corpus` was GREEN on the same run (2560/2560/0). This box does not reproduce it - local
+clang is 21.1.8 and the runner is 20.1.8, and clang 20's codegen for `locals_addressed.c` at -O2
+is the shape that exposes it. That is fine: **the bug is in a pass** (clang 20 only supplies a
+shape), and a pass that breaks SSA is a bug in that pass.
+
+The reason four commits and two fixes could only say `1 invalid`: the pipeline ran passes
+back-to-back and verified ONCE at the end. A pipeline that verifies only at the end cannot name
+its own bug. So the gate was made to name it, compiler-independently:
+
+- `passes::PRE_EMIT_PASSES` is now the single list `clean` runs - seven `Pass`es (fuse, prune,
+  fold, prop, simplify, dse, dce), names from `NAME_*` constants, table length never hardcoded.
+- The driver verifies SSA after EVERY pass. The first pass whose post-state fails stops the
+  pipeline for that function, and the record names function, pass index, pass name, and the
+  verifier's verbatim errors:
+  `pass-broke-ssa record: <obj> :: <sym>: after pass <N> '<name>': <errors>`
+- Anti-vacuity is structural, not vibes: `Isolation::verified` is a bitmask with bit `i` earned
+  ONLY by running pass `i` AND verifying its output (an early `return` on a break burns only
+  that bit). A driver iterating an empty table prints `pass isolation: 0 passes verified`.
+  `rdec c --corpus` prints `pass isolation: 7 passes verified on 135 emitted functions`, and
+  `crates/cli/tests/pass_isolation.rs` pins K against `PRE_EMIT_PASSES.len()` and 135;
+  `crates/core/tests/pass_isolation_fixtures.rs` pins the mask per function plus a compile-time
+  floor (`assert!(PRE_EMIT_PASSES.len() >= 7)`) so an emptied table cannot pass vacuously.
+- Round-boundary contract: a pass that breaks SSA is a bug in that pass, and a breakage a LATER
+  pass repairs is a transient the corpus floors measure - it stays silent (a repair probe runs
+  the remaining passes so they still earn their bits). Only breakage that survives to the end
+  prints. `run_pipeline` instruments the same way (record, continue, judge at final verify) so
+  both pipeline entries name their passes.
+
+What the tool bisected, hand-built, no clang in the loop (`pass_isolation_fixtures.rs`, red
+first): a valid-SSA function whose dead arm is a join consuming an entry local through a phi,
+fed to the real pipeline. Red text, verbatim:
+
+```
+dead-arm fold: a pass broke SSA and the pipeline could not repair it. gate line: pass-broke-ssa record: fixture :: f: after pass 5 'simplify_branches': %4 defined in bb0 does not dominate use in bb2; %4 defined in bb0 does not dominate use in bb2; %6 is defined in unreachable bb2
+```
+
+The named pass: **`simplify_branches`, pass 5 of 7.** Mechanism: folding a constant-condition
+`br` to `jmp taken` deletes the edge `P -> dropped` and retires NOTHING - a phi at `dropped`
+keyed on `P` keeps a pair naming a predecessor that no longer exists, and a `dropped` with no
+predecessors left holds live defs in an unreachable block. Nothing in the seven-pass pipeline
+repairs that class (DCE cannot delete a def its own block's terminator reads), so the breakage
+survives the fixpoint - the surviving-defect class the CI record belongs to. The fix: the fold
+now retires the edge - drops one phi pair keyed on the removed edge per phi (pair values of a
+valid join are keyed per UNIQUE predecessor, so a pair keyed on the removed edge can only be
+read through that edge), and clears + `Unreachable`s blocks that lost their last predecessor,
+cascading via worklist. `dead_arm_fold_keeps_ssa` is GREEN with the fix; `both_arms_fold_keeps_ssa`
+pins the safe fold (Cfg dedups preds, so a `then == else` fold removes no edge and must retire
+nothing - the over-retirement twin of the bug).
+
+Scoping, said out loud: this box has NO reproducer for the exact `locals_addressed` edge-
+availability record, so the claim for THAT record is scoped: **the next CI run names the pass**
+(or stays silent and the floor holds). What is proven locally, hand-built: the tool names the
+pass on the defect class, the named pass is fixed, the corpus floors are unchanged by the fix
+(156/135/21/0), and the pinning tests cannot pass vacuously (a skipped pass reddens the mask, an
+emptied table fails to compile, a disabled verify loses the naming fixture).
+
+The rule for the ledger: **a pass that breaks SSA is a bug in that pass, and a pipeline that
+verifies only at the end cannot name its own bug.** Verify after every pass, in the pipeline,
+with the pass names coming from the table the driver iterates. Transients are the pipeline's
+contract; surviving breakage is a record with a name in it.
