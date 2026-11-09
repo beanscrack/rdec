@@ -24,8 +24,13 @@
 //!
 //! Everything outside the supported subset returns
 //! `Unsupported { raw, reason }` with a specific reason. A name that demangles
-//! to plausible garbage is worse than one that says "template argument list":
-//! the decompiler must see the gap, not inherit it as a fake function name.
+//! to plausible garbage is worse than one that says "needs the by-value type
+//! model": the decompiler must see the gap, not inherit it as a fake function
+//! name. A refusal key therefore names the construct that is actually missing
+//! — which is why a class returned by value stopped being reported as a
+//! "template argument list" on 2026-11-08, and why a template-name gap, a
+//! by-value class, a non-type argument, and a class-template scope are four
+//! keys and not one.
 
 /// `const`-ness of a member function, from the this-adjustment code letter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -263,6 +268,18 @@ impl<'a> Parser<'a> {
                 return Err("empty scope segment".to_string());
             }
             self.pos += 1; // the '@'
+                           // A `?$` segment is an instantiated CLASS template (`?$Box@H` =
+                           // `Box<int>`), measured: `?get@?$Box@H@@QEAAHXZ` is
+                           // `Box<int>::get(void) const` to llvm-nm. Naming it needs the
+                           // template-argument model on the class side, and the label is NOT
+                           // "anonymous namespace", which is what the `?` test below used to
+                           // claim for it.
+            if seg.starts_with("?$") {
+                return Err(
+                    "template in a class scope name ('?$...'): the class-template argument model"
+                        .to_string(),
+                );
+            }
             if seg.contains('?') {
                 return Err("anonymous namespace or local-static label".to_string());
             }
@@ -376,20 +393,38 @@ impl<'a> Parser<'a> {
             return self.repeat_ref(d, "argument position");
         }
         // `?A`/`?B` prefix. On an enum/builtin/pointer it is the unnamed-type
-        // wrapper (measured: `?AW4Kind@@` is `enum Kind`); on a class name it
-        // is a template argument (`?AVWidget@@`), which is M8-gap territory.
+        // wrapper (measured: `?AW4Kind@@` is `enum Kind`). On a class name it
+        // is a class taken BY VALUE: `?f@@YA?AVWidget@@@Z` is
+        // `class Widget __cdecl f(void)` to llvm-nm — a function RETURNING a
+        // class, with no template anywhere in it. Until 2026-11-08 this arm
+        // refused with the key "template argument list", which blamed a
+        // template for a class return and merged the two unrelated gaps into
+        // one census bucket. The real shortage is the by-value type model (the
+        // class's layout, size, and hidden return register are not modelled),
+        // which is what the C++ leg's IR gap for the same shape already says.
         if c == b'?' {
             if self.starts_with(b"?A") || self.starts_with(b"?B") {
+                // `starts_with` proved `pos + 1` exists; the letter goes into
+                // the refusal so the census key names the encoding it refuses.
+                let lead = self.s[self.pos + 1] as char;
                 self.pos += 2;
-                if matches!(self.peek(), Some(b'V') | Some(b'U')) {
-                    return Err("template argument list".to_string());
+                if let Some(k) = self.peek() {
+                    if matches!(k, b'V' | b'U') {
+                        return Err(format!(
+                        "class/struct type in a signature ('?{lead}{}...'): needs the by-value type model",
+                        k as char
+                    ));
+                    }
                 }
                 // The ?A wrapper is not a complete type of its own - the
                 // wrapped type (W41@, builtins) is what MSVC counts.
                 return self.parse_type_inner();
             }
             if self.starts_with(b"?$") {
-                return Err("template argument list".to_string());
+                return Err(
+                    "nested template type ('?$...'): a template as an argument (the template-argument model)"
+                        .to_string(),
+                );
             }
             return Err(format!(
                 "anonymous type encoding '?{}'",
@@ -537,11 +572,15 @@ impl<'a> Parser<'a> {
         }
         let mut segs: Vec<String> = Vec::new();
         {
-            if seg.contains('?') {
-                return Err("anonymous namespace in a type name".to_string());
-            }
+            // The `?$` test runs BEFORE the `?` test: an instantiated class
+            // template (`?$Box@H`) contains a '?', and claiming
+            // "anonymous namespace in a type name" for it is the same lie the
+            // scope path used to tell (`U?$Box@H@@` is `Box<int>`, measured).
             if seg.starts_with("?$") {
                 return Err("template in class scope".to_string());
+            }
+            if seg.contains('?') {
+                return Err("anonymous namespace in a type name".to_string());
             }
             segs.push(seg.to_string());
         }
@@ -603,14 +642,38 @@ fn parse(sym: &str) -> Result<Demangled, String> {
     let mut ctor_dtor: Option<bool> = None; // Some(true) = ctor, Some(false) = dtor
     let mut table: Option<TableKind> = None;
     let mut glued_class = String::new();
+    // The name an instantiated template function renders to (`tmax<int>`);
+    // `None` for every other identifier, which renders the identifier itself.
+    let mut template_name: Option<String> = None;
     if let Some(rest) = id.strip_prefix("??0") {
         ctor_dtor = Some(true);
         glued_class = rest.to_string();
     } else if let Some(rest) = id.strip_prefix("??1") {
         ctor_dtor = Some(false);
         glued_class = rest.to_string();
-    } else if id.starts_with("??$") {
-        return Err(format!("template argument list (name '{id}')"));
+    } else if let Some(enc) = id.strip_prefix("??$") {
+        // ---- an instantiated template function: `??$ <name> @ <args> @` ----
+        // The identifier is the template's BASE name and the arguments are type
+        // encodings of exactly the kinds `parse_type` already reads, so
+        // `??$tmax@H@@YAHHH@Z` is `tmax<int>` with the ordinary signature after
+        // it. The pair, from the corpus object and its oracle:
+        //
+        // ```text
+        // ??$tmax@H@@YAHHH@Z  ->  int __cdecl tmax<int>(int, int)
+        // ```
+        //
+        // The argument list closes with a single '@' and the scope follows in
+        // its usual form, which is why `??$tf@H@Plain@@QEAAHH@Z` is
+        // `Plain::tf<int>(int)` and `??$tclamp@H@geo@@YAHH@Z` is
+        // `geo::tclamp<int>(int)` (both measured against llvm-nm). What the
+        // grammar cannot carry - a non-type argument, a pack, a template used
+        // as an argument, a `?0`-style ctor template - refuses by naming that
+        // construct in `template_base_name` / `template_arguments`.
+        let base = template_base_name(enc)?;
+        template_name = Some(format!(
+            "{base}<{}>",
+            template_arguments(&mut p)?.join(", ")
+        ));
     } else if let Some(rest) = id.strip_prefix("??_") {
         let Some((tag, glued)) = rest.split_at_checked(1) else {
             return Err(if rest.is_empty() {
@@ -632,6 +695,16 @@ fn parse(sym: &str) -> Result<Demangled, String> {
     } else if id.starts_with('?') || id == "0" {
         return Err("static local symbol / anonymous name".to_string());
     }
+    // A ctor/dtor/vtable identifier can glue a CLASS TEMPLATE as its class
+    // (`??0?$Ctor@H@@QEAA@H@Z` = `Ctor<int>::Ctor(int)`, measured). The glued
+    // form never reaches `scope_segments`, so the `?$` refusal needs its own
+    // look here; naming the construct is the whole point of the key.
+    if glued_class.starts_with("?$") {
+        return Err(
+            "template in a class scope name ('?$...'): the class-template argument model"
+                .to_string(),
+        );
+    }
 
     let mut scope: Vec<String> = p.scope_segments()?.into_iter().map(String::from).collect();
     scope.reverse(); // encoded innermost-first; display order is outer::inner
@@ -642,7 +715,7 @@ fn parse(sym: &str) -> Result<Demangled, String> {
     } else {
         format!("{}::{glued_class}", scope.join("::"))
     };
-    let name = id.clone();
+    let name = template_name.unwrap_or_else(|| id.clone());
 
     // ---- the code field ----------------------------------------------------
     let Some(c0) = p.peek() else {
@@ -858,6 +931,82 @@ fn parse(sym: &str) -> Result<Demangled, String> {
         )
     };
     Ok(Demangled::Name { text, kind })
+}
+
+/// The template's own name, out of a `??$` identifier (the bytes after `??$`,
+/// up to the `@` that opens the argument list).
+///
+/// A plain identifier is the only form rendered; everything else refuses and
+/// says which construct it is. A guessed name here is the sin the file header
+/// names: `??$?0H@Widget@@QEAA@H@Z` is a CONSTRUCTOR template (measured:
+/// `W::W<int>(int)`), and printing it as `?0H<int>` would hand the decompiler
+/// a function name that exists in no source file.
+fn template_base_name(enc: &str) -> Result<String, PErr> {
+    if enc.is_empty() {
+        return Err("template name with no identifier ('??$' followed by nothing)".to_string());
+    }
+    if enc.starts_with("?$") {
+        return Err(format!(
+            "template in a class scope name ('?${enc}...'): the class-template argument model"
+        ));
+    }
+    if enc.starts_with('$') {
+        return Err(format!(
+            "template template parameter name '??${enc}': the template-parameter model"
+        ));
+    }
+    if enc.starts_with('?') {
+        return Err(format!(
+            "member template name '??${enc}': a constructor/destructor/operator template (the member-template grammar)"
+        ));
+    }
+    Ok(enc.to_string())
+}
+
+/// The `@`-closed argument list of a `??$` name, read with the SAME type
+/// parser the signature uses — that reuse is the deliverable: `H`/`I`/`M`/`N`/
+/// `_J`/`_N` builtins, `PEA..` pointers, `AEA..` references, `W4Kind@@` enums,
+/// `UWidget@@` classes and the `0`..`5` repeat digits all arrive through
+/// `parse_type`, so a template argument and a parameter can never disagree
+/// about what the same bytes mean.
+///
+/// The list is separated from the scope by ONE '@' (`??$tmax@H@@YA...` is
+/// args `H` + the closing '@' + the global scope's '@'), so the loop stops at
+/// the first '@' it does not consume as part of a type and hands the rest to
+/// `scope_segments`, exactly as a plain `?name@scope@@` name does.
+fn template_arguments(p: &mut Parser) -> Result<Vec<String>, PErr> {
+    let mut args: Vec<String> = Vec::new();
+    loop {
+        if p.eof() {
+            return Err(
+                "truncated decoration (template argument list not closed by '@')".to_string(),
+            );
+        }
+        if p.eat(b'@') {
+            return Ok(args); // the '@' that closes the argument list
+        }
+        if p.starts_with(b"?$") {
+            // A template used AS an argument (`?$Box@H@@`): naming it means
+            // rendering a nested argument list, which is the model this
+            // demangler does not have. Loud, by name, per the file header.
+            return Err(
+                "nested template type ('?$...'): a template as an argument (the template-argument model)"
+                    .to_string(),
+            );
+        }
+        if p.peek() == Some(b'$') {
+            // A VALUE, not a type. Measured encodings, all refused: `$04` and
+            // `$0BB` are integral constants (`nontype<5>`, `ni<17>`), `$0A@` is
+            // a scoped enum constant (`cn<0>`), and `$$0`/`$$V` are the pack
+            // and template-template forms. The integer/enum-value model does
+            // not exist here, so nothing is guessed.
+            return Err(format!(
+                "non-type template argument '{}': needs the value model (integral and enum constants, packs, template template arguments)",
+                p.rest().chars().take(3).collect::<String>()
+            ));
+        }
+        args.push(p.parse_type()?);
+    }
 }
 
 /// Calling-convention letter after `Y`/`S`/`R`/`T`, including the near/far
@@ -1103,6 +1252,225 @@ mod tests {
         }
     }
 
+    /// Instantiated TEMPLATE names: every pair measured on 2026-11-08 by
+    /// compiling with `clang++ -std=c++17 -O0 -target x86_64-pc-windows-msvc`
+    /// and pairing `llvm-nm --defined-only -g` with the same command plus
+    /// `--demangle` (the same oracle `rdec demangle --cpp` runs). The first
+    /// line is the corpus witness: `corpus/cpp/obj/template_gap.O0.obj`, whose
+    /// plain leg prints `??$tmax@H@@YAHHH@Z` and whose demangled leg prints
+    /// `int __cdecl tmax<int>(int, int)`.
+    const MEASURED_TEMPLATES: &[(&str, &str)] = &[
+        ("??$tmax@H@@YAHHH@Z", "int __cdecl tmax<int>(int, int)"),
+        (
+            "??$tmax@_J@@YA_J_J0@Z",
+            "__int64 __cdecl tmax<__int64>(__int64, __int64)",
+        ),
+        (
+            "??$tmax@_N@@YA_N_N0@Z",
+            "bool __cdecl tmax<bool>(bool, bool)",
+        ),
+        (
+            "??$tmax@M@@YAMMM@Z",
+            "float __cdecl tmax<float>(float, float)",
+        ),
+        ("??$uses_int@D@@YADD@Z", "char __cdecl uses_int<char>(char)"),
+        (
+            "??$pick2@IH@@YAIIH@Z",
+            "unsigned int __cdecl pick2<unsigned int, int>(unsigned int, int)",
+        ),
+        ("??$idp@H@@YAPEAHPEAH@Z", "int * __cdecl idp<int>(int *)"),
+        ("??$idr@H@@YAAEAHAEAH@Z", "int & __cdecl idr<int>(int &)"),
+        (
+            "??$ide@W4Kind@@@@YA?AW4Kind@@W40@@Z",
+            "enum Kind __cdecl ide<enum Kind>(enum Kind)",
+        ),
+        (
+            "??$uses@PEAUWidget@@@@YAHPEAUWidget@@@Z",
+            "int __cdecl uses<struct Widget *>(struct Widget *)",
+        ),
+        (
+            "??$uses@W4Color@@@@YAHW4Color@@@Z",
+            "int __cdecl uses<enum Color>(enum Color)",
+        ),
+        (
+            "??$pack@HH@@YAHHH@Z",
+            "int __cdecl pack<int, int>(int, int)",
+        ),
+        (
+            "??$tclamp@H@geo@@YAHH@Z",
+            "int __cdecl geo::tclamp<int>(int)",
+        ),
+        (
+            "??$tf@H@Plain@@QEAAHH@Z",
+            "public: int __cdecl Plain::tf<int>(int)",
+        ),
+        (
+            "??$m@H@Member@@QEAAHH@Z",
+            "public: int __cdecl Member::m<int>(int)",
+        ),
+        (
+            "??$st@H@Pair@@SAHH@Z",
+            "public: static int __cdecl Pair::st<int>(int)",
+        ),
+    ];
+
+    #[test]
+    fn template_names_agree_with_llvm_renderings() {
+        for (m, llvm_text) in MEASURED_TEMPLATES {
+            let d = demangle(m);
+            let Demangled::Name { text, .. } = &d else {
+                panic!("{m}: unsupported: {d:?}");
+            };
+            assert_eq!(
+                canonical(text),
+                canonical(llvm_text),
+                "{m}: mine {text:?} vs llvm {llvm_text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn template_names_render_their_arguments_and_keep_their_kind() {
+        // The C++ gate prints names WITHOUT the calling convention (it prints
+        // `int classify(int)` for `?classify@@YAHH@Z`), so the exact text is
+        // pinned here; `llvm-nm` normalizes the convention on the gate's side.
+        let (text, kind) = name("??$tmax@H@@YAHHH@Z");
+        assert_eq!(text, "int tmax<int>(int, int)");
+        assert_eq!(kind, SymKind::FreeFunction, "a global-scope template");
+        assert_eq!(
+            name("??$pick2@IH@@YAIIH@Z").0,
+            "unsigned int pick2<unsigned int, int>(unsigned int, int)"
+        );
+        assert_eq!(name("??$idp@H@@YAPEAHPEAH@Z").0, "int * idp<int>(int *)");
+        assert_eq!(
+            name("??$tclamp@H@geo@@YAHH@Z").0,
+            "int geo::tclamp<int>(int)",
+            "the scope follows the argument list"
+        );
+        assert_eq!(
+            name("??$ide@W4Kind@@@@YA?AW4Kind@@W40@@Z").0,
+            "enum Kind ide<enum Kind>(enum Kind)"
+        );
+        // A member template: the code field is an ordinary member code, so the
+        // kind carries the class and constness exactly as a non-template member
+        // does — M8 pattern-matches on the kind, not on the text.
+        assert_eq!(
+            name("??$tf@H@Plain@@QEAAHH@Z").1,
+            SymKind::MemberFunction {
+                class: "Plain".into(),
+                constness: Constness::NonConst,
+                virtual_fn: false,
+                thunk: false
+            }
+        );
+        assert_eq!(
+            name("??$st@H@Pair@@SAHH@Z").1,
+            SymKind::StaticMember {
+                class: "Pair".into()
+            }
+        );
+    }
+
+    /// Every template construct this demangler does NOT model, refused, with
+    /// the refusal naming the construct. The encodings are clang's (quoted from
+    /// `llvm-nm`'s plain leg) and the comment quotes what llvm-nm's demangled
+    /// leg prints, so each refusal is a claim about a real shape and not about
+    /// a made-up byte string. The three marked SYNTHETIC have no compiler
+    /// witness here — they are grammar guards, and say so.
+    #[test]
+    fn unmodelled_template_constructs_refuse_by_name() {
+        // `int __cdecl nontype<5>(int)` - an integral constant argument.
+        assert!(
+            reason("??$nontype@$04@@YAHH@Z").starts_with("non-type template argument '$04'"),
+            "{}",
+            reason("??$nontype@$04@@YAHH@Z")
+        );
+        // `int __cdecl cn<0>(int)` where the argument is `Color::Red`, an
+        // enum-class constant (`$$0A`-style scoped-enum encoding family).
+        assert!(
+            reason("??$cn@$0A@@@YAHH@Z").starts_with("non-type template argument '$0A'"),
+            "{}",
+            reason("??$cn@$0A@@@YAHH@Z")
+        );
+        // `int __cdecl ttf<struct Box, int>(struct Box<int>)` - a template used
+        // as an argument, reaching us as a class-template instantiation in the
+        // parameter list.
+        assert!(
+            reason("??$ttf@UBox@@H@@YAHU?$Box@H@@@Z").contains("template in class scope"),
+            "{}",
+            reason("??$ttf@UBox@@H@@YAHU?$Box@H@@@Z")
+        );
+        // `char __cdecl Outer<int>::nest<char>(char)` - a member template of a
+        // class template: the SCOPE names an instantiation.
+        assert!(
+            reason("??$nest@D@?$Outer@H@@QEAADD@Z").starts_with("template in a class scope name"),
+            "{}",
+            reason("??$nest@D@?$Outer@H@@QEAADD@Z")
+        );
+        // `public: int __cdecl Box<int>::get(void)` - a member of a class
+        // template, with no `??$` name at all. It used to refuse as
+        // "anonymous namespace or local-static label", which is a different
+        // construct entirely.
+        assert!(
+            reason("?get@?$Box@H@@QEAAHXZ").starts_with("template in a class scope name"),
+            "{}",
+            reason("?get@?$Box@H@@QEAAHXZ")
+        );
+        // `public: __cdecl Ctor<int>::Ctor(int)` - the ctor of a class
+        // template: the class is glued to the identifier, so the `?$` needs the
+        // refusal on that path too.
+        assert!(
+            reason("??0?$Ctor@H@@QEAA@H@Z").starts_with("template in a class scope name"),
+            "{}",
+            reason("??0?$Ctor@H@@QEAA@H@Z")
+        );
+        // `public: __cdecl W::W<int>(int)` - a constructor TEMPLATE: the base
+        // name is `?0`, not an identifier.
+        assert!(
+            reason("??$?0H@W@@QEAA@H@Z").starts_with("member template name"),
+            "{}",
+            reason("??$?0H@W@@QEAA@H@Z")
+        );
+        // `struct Widget __cdecl idc<struct Widget>(struct Widget)` - the
+        // TEMPLATE NAME parses fine here; what is refused is the class taken by
+        // value, and the key says exactly that (it does not say "template").
+        assert_eq!(
+            reason("??$idc@UWidget@@@@YA?AUWidget@@U0@@Z"),
+            "class/struct type in a signature ('?AU...'): needs the by-value type model"
+        );
+        // `void __cdecl pack<int>(int, int, int, ...)` - the `Z` after the
+        // arguments is the ellipsis: trailing bytes, counted, not guessed.
+        assert!(
+            reason("??$pack@H@@YAXHHHZZ").starts_with("trailing bytes after the signature"),
+            "{}",
+            reason("??$pack@H@@YAXHHHZZ")
+        );
+        // SYNTHETIC: a `??$` identifier with no base name at all.
+        assert!(
+            reason("??$@YAHH@Z").starts_with("template name with no identifier"),
+            "{}",
+            reason("??$@YAHH@Z")
+        );
+        // SYNTHETIC: the `$$V` template-template / void-pack marker in argument
+        // position, and the `$$0` pack-expansion family.
+        assert!(
+            reason("??$f@$$V@@YAHXZ").starts_with("non-type template argument '$$V'"),
+            "{}",
+            reason("??$f@$$V@@YAHXZ")
+        );
+        // SYNTHETIC: truncated names must not render a partial template.
+        assert!(
+            reason("??$f@H").starts_with("truncated decoration (template argument list"),
+            "{}",
+            reason("??$f@H")
+        );
+        assert!(
+            reason("??$f@H@").starts_with("truncated decoration (scope"),
+            "{}",
+            reason("??$f@H@")
+        );
+    }
+
     #[test]
     fn ctor_and_dtor_are_classified_by_kind_not_text() {
         // M8 pattern-matches on the kind; a text match would rot the moment
@@ -1266,7 +1634,6 @@ mod tests {
 
     #[test]
     fn gaps_are_loud_with_specific_reasons() {
-        assert!(reason("??$tmax@H@@YAHHH@Z").starts_with("template argument list"));
         assert_eq!(reason("?f@@YAH$$QH@Z"), "rvalue reference");
         assert_eq!(reason("?f@@YAHYAH$02@Z"), "array type");
         assert_eq!(
@@ -1284,7 +1651,19 @@ mod tests {
             "anonymous namespace or local-static label"
         );
         assert_eq!(reason("??2@YAPAXI@Z"), "operator name '??2'");
-        assert!(reason("?f@@YA?AVWidget@@@Z").starts_with("template argument list"));
+        // A class returned BY VALUE, not a template: `?f@@YA?AVWidget@@@Z` is
+        // `class Widget __cdecl f(void)` to llvm-nm, and the name carries no
+        // template at all. The key used to read "template argument list" — a
+        // census key that blamed a template for a class return, and shared a
+        // bucket with the genuine `??$` name gap.
+        assert_eq!(
+            reason("?f@@YA?AVWidget@@@Z"),
+            "class/struct type in a signature ('?AV...'): needs the by-value type model"
+        );
+        assert_eq!(
+            reason("?f@@YAH?AUWidget@@@Z"),
+            "class/struct type in a signature ('?AU...'): needs the by-value type model"
+        );
         assert!(reason("?f@@YAH?0@Z").starts_with("anonymous type encoding"));
         // A truncated name must not demangle to a plausible prefix.
         assert!(reason("?f@@YAHH").starts_with("truncated decoration"));

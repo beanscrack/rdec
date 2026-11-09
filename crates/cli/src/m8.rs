@@ -11,8 +11,8 @@
 //! it refuses, mirroring the M1 rule that a gate which checked nothing has
 //! proven nothing: any disagreement, zero compared symbols, and a supported
 //! count below the stated floor. `Unsupported` demangles are NOT failures —
-//! they are reported, grouped by reason, so the gaps (templates first among
-//! them) stay visible between milestones.
+//! they are reported, grouped by reason, so the gaps (the by-value type model
+//! first among them) stay visible between milestones.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -198,7 +198,7 @@ int classify(int v) { return v > 0 ? 1 : 0; }
     ),
     (
         "template_gap",
-        "instantiated template function: the loud-gap fixture, must land in Unsupported",
+        "instantiated template function: the `??$` name fixture, demangled to `tmax<int>`; the loud gap is its CALLER, whose shape the template name does not type",
         "template <typename T> T tmax(T a, T b) { return a > b ? a : b; }
 int use_template(int a, int b) { return tmax(a, b) + tmax(a * 2, b * 2); }
 ",

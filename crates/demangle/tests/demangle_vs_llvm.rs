@@ -185,26 +185,69 @@ fn corpus_kinds_are_classified() {
     );
 }
 
+/// The corpus's instantiated-template symbol is now IN SCOPE for the llvm-nm
+/// comparison, not filtered out of it. Before 2026-11-08 this file asserted the
+/// opposite (`corpus_template_gap_is_loud`: every `??$` symbol had to land in
+/// `Unsupported` with reason "template argument list"), and the main gate
+/// skipped it as a consequence: `corpus_cpp_names_agree_with_llvm_nm` compares
+/// only what the demangler SUPPORTS, so a name that refuses is silently outside
+/// the agreement — the template name was never compared while it refused.
+/// Both directions are pinned here: the supported name must agree with the
+/// oracle, and the refusals this demangler still has must name the construct
+/// (see `unmodelled_template_constructs_refuse_by_name` in the crate's unit
+/// tests for the shapes the corpus does not contain).
 #[test]
-fn corpus_template_gap_is_loud() {
+fn corpus_template_name_agrees_with_llvm_nm() {
     let root = repo_root();
     let obj = root.join("corpus/cpp/obj/template_gap.O0.obj");
     let object = rdec_arch_x86::loader::load(&obj).expect("template object loads");
-    let gap: Vec<String> = object
+    let names: Vec<(String, String)> = object
         .symbols
         .iter()
         .filter(|s| s.name.starts_with("??$"))
         .map(|s| match demangle(&s.name) {
-            Demangled::Unsupported { reason, .. } => reason,
-            Demangled::Name { text, .. } => panic!("template demangled to {text}: {}", s.name),
+            Demangled::Name { text, .. } => (s.name.clone(), text),
+            Demangled::Unsupported { reason, .. } => {
+                panic!("{}: template name refused: {reason}", s.name)
+            }
         })
         .collect();
     assert!(
-        !gap.is_empty(),
+        !names.is_empty(),
         "template_gap.cpp must produce a ??$ symbol"
     );
     assert!(
-        gap.iter().all(|r| r.starts_with("template argument list")),
-        "{gap:?}"
+        names
+            .iter()
+            .any(|(s, t)| { s == "??$tmax@H@@YAHHH@Z" && t == "int tmax<int>(int, int)" }),
+        "the corpus witness is `int tmax<int>(int, int)`: {names:?}"
     );
+    // The oracle, not the unit table: llvm-nm's plain leg names the symbol and
+    // its `--demangle` leg names the same address/type pair. A missing oracle
+    // skips LOUDLY, exactly as the main gate does — the enforcing artifact is
+    // `rdec demangle --cpp`, which exits non-zero without llvm-nm.
+    let Some(nm) = nm_path() else {
+        eprintln!(
+            "SKIP: llvm-nm not found (set RDEC_NM) - the demangled-name assertion above still ran"
+        );
+        return;
+    };
+    let plain = nm_lines(&nm, &obj, false);
+    let dem = nm_lines(&nm, &obj, true);
+    let oracle: BTreeMap<String, String> = plain
+        .iter()
+        .zip(dem.iter())
+        .map(|((_, _, m), (_, _, d))| (m.clone(), d.clone()))
+        .collect();
+    for (sym, text) in &names {
+        let theirs = oracle
+            .get(sym)
+            .unwrap_or_else(|| panic!("llvm-nm has no demangled text for {sym}"));
+        assert_eq!(
+            canonical(text),
+            canonical(theirs),
+            "{}: {sym}\n  mine: {text}\n  llvm: {theirs}",
+            obj.display()
+        );
+    }
 }
