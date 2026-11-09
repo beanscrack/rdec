@@ -75,6 +75,19 @@ fn the_frame_aliasing_sites_refuse_with_the_key_and_the_census_partitions_refuse
         .collect();
     assert_eq!(nums.len(), 4, "four counts in `{emit_line}`");
     let (lifted, emitted, refused, invalid) = (nums[0], nums[1], nums[2], nums[3]);
+    // THE `0 invalid` ASSERTION IS THE POINT OF THIS FILE. 2026-11-08, CI run of
+    // `ab64a4d`, `gates` job, verbatim:
+    //     assertion `left == right` failed: `0 invalid` after passes: emit-c: 156
+    //     lifted functions, 135 emitted C, 20 refused, 1 invalid after passes
+    //     left: 1   right: 0
+    // with this box at `135 emitted, 21 refused, 0 invalid` on the same commit.
+    // Same lifted, same emitted, a DIFFERENT BUCKET: the runner's clang (20.1.8,
+    // per `.github/workflows/ci.yml`; this box's is 22.1.8) built that function's
+    // frame store as an INDEXED access, the bounded-only check resolved no slot
+    // there, the refusal did not fire, the caller EMITTED, and the differential
+    // pass caught the emitted C as `invalid`. The `invalid` is the pipeline being
+    // honest about a miscompile; the fix is the rule, and this line is the floor
+    // that says the miscompile is not in the emitted set.
     assert_eq!(invalid, 0, "`0 invalid` after passes: {emit_line}");
     assert_eq!(
         lifted, 156,
@@ -87,9 +100,18 @@ fn the_frame_aliasing_sites_refuse_with_the_key_and_the_census_partitions_refuse
     // O1/O2/Oz legs (calls, no live read of a shared slot after the call)
     // and tailcall_local.O0::f (all frame loads before the call) emitting,
     // and t2 confirms: 2560 compared = the base 2452 + 72 + 36, all matching.
+    //
+    // RE-MEASURED 2026-11-08 on branch `frame2` (unbounded frame traffic =
+    // whole-window touch): 156 lifted / 135 emitted / 21 refused / 0 invalid,
+    // UNMOVED on this box's clang 22.1.8. The rule fires on 3 corpus functions
+    // (`frame traffic:` line below: 49 named / 3 indexed / 104 none, all three
+    // `locals_addressed`, which calls nothing), so the widening costs no
+    // emission here - what it buys is that the refusal no longer depends on
+    // which compiler built the objects, which is exactly what the CI numbers
+    // above measured.
     assert_eq!(
         emitted, 135,
-        "measured floor, branch frame-activation: {emit_line}"
+        "measured floor, branch frame2 (clang-version-independent rule): {emit_line}"
     );
 
     // The class-sum == refused-count invariant, on the gate's OWN lines: one
@@ -181,16 +203,47 @@ fn the_frame_aliasing_sites_refuse_with_the_key_and_the_census_partitions_refuse
         }
     }
 
-    // Every frame-class record carries the shared-address sentence: the census
-    // class cannot be reached by a text that does not name the evidence.
+    // Every frame-class record carries the evidence sentence: the census class
+    // cannot be reached by a text that does not name the shared frame - a
+    // window address when both sides are constant-bounded, the word `unbounded`
+    // when one side's frame traffic is indexed and the model cannot name one.
     for l in &records {
         if l.contains(KEY) {
             assert!(
-                l.contains("0x7ff") || l.contains("0x7f"),
-                "a frame-key record must name a frame-window address: {l}"
+                l.contains("0x7ff") || l.contains("0x7f") || l.contains("unbounded"),
+                "a frame-key record must name a frame-window address or say unbounded: {l}"
             );
         }
     }
+    // The frame-traffic census PARTITIONS the lifted set. The buckets move with
+    // the compiler that built the objects (this box's clang 22.1.8: 49 named
+    // slots / 3 unbounded / 104 none; an indexed-spelling codegen moves the
+    // middle number up), the TOTAL does not, and the refusal rule reads all
+    // three buckets - so this is the version-independent half of the floor: the
+    // day a corpus rebuild shifts traffic between buckets, this line says the
+    // census still accounts for every function.
+    let traffic = text
+        .lines()
+        .find(|l| l.starts_with("frame traffic:"))
+        .expect("the gate prints its `frame traffic:` census");
+    let buckets: Vec<usize> = traffic
+        .split_whitespace()
+        .filter_map(|w| w.parse::<usize>().ok())
+        .collect();
+    assert_eq!(
+        buckets.len(),
+        3,
+        "three buckets in `{traffic}` (named / unbounded / no frame traffic)"
+    );
+    assert_eq!(
+        buckets.iter().sum::<usize>(),
+        lifted,
+        "frame traffic must account for every lifted function: `{traffic}` vs `{emit_line}`"
+    );
+    assert!(
+        buckets[0] + buckets[1] > 0,
+        "no function touches the frame at all, so the frame check is measuring nothing: {traffic}"
+    );
     // The refused count moves by exactly the frame class: 19 (measured at
     // def1647) + frame_count, one source for both numbers.
     assert_eq!(
